@@ -58,6 +58,9 @@
  *   EMBEDDING_DIMENSIONS:  Vector dimensions — must match the model (default depends on
  *                          provider; required for lmstudio).
  *   EMBEDDING_CONTEXT_LENGTH: Override context window in tokens (auto-detected for known models).
+ *   EMBEDDING_QUERY_PREFIX:    Task prefix prepended to queries (default "search_query: ").
+ *   EMBEDDING_DOCUMENT_PREFIX: Task prefix prepended to documents (default "search_document: ").
+ *                              Both must match the model — see queryPrefix() below.
  */
 
 import { logger } from "./logger.js";
@@ -141,6 +144,45 @@ const MODEL_CONTEXT_LENGTHS: Record<string, number> = {
 function guessContextLength(model: string): number {
   const base = model.replace(/:.*$/, ""); // strip :tag
   return MODEL_CONTEXT_LENGTHS[base] ?? 0;
+}
+
+// ── Task prefixes ─────────────────────────────────────────────────────────
+
+/**
+ * Defaults for the task prefixes prepended to text before embedding.
+ *
+ * Embedding models disagree about these — some want a prefix, some want a
+ * different one, some want none:
+ * - nomic-embed-text:            `search_query: ` / `search_document: ` (these defaults)
+ * - intfloat/multilingual-e5-*:  `query: ` / `passage: `
+ * - cl-nagoya/ruri-v3-*:         `検索クエリ: ` / `検索文書: `
+ * - BAAI/bge-m3:                 no prefix at all
+ *
+ * Sending the wrong prefix measurably hurts retrieval quality, so both sides
+ * are configurable. The defaults reproduce the previous nomic-embed-text
+ * behaviour, so an index built before these variables existed stays valid.
+ */
+const DEFAULT_QUERY_PREFIX = "search_query: ";
+const DEFAULT_DOCUMENT_PREFIX = "search_document: ";
+
+/**
+ * Task prefix for queries, from `EMBEDDING_QUERY_PREFIX`.
+ *
+ * `??`, not `||`: an explicit empty string is a meaningful value ("no prefix",
+ * which bge-m3 requires) and `||` would silently replace it with the default.
+ * Read lazily so tests can toggle it via `vi.stubEnv`.
+ */
+export function queryPrefix(): string {
+  return process.env.EMBEDDING_QUERY_PREFIX ?? DEFAULT_QUERY_PREFIX;
+}
+
+/**
+ * Task prefix for documents, from `EMBEDDING_DOCUMENT_PREFIX`. Change it only
+ * together with {@link queryPrefix} — an asymmetric pair ranks badly — and
+ * re-index from scratch afterwards, since existing vectors encode the old one.
+ */
+export function documentPrefix(): string {
+  return process.env.EMBEDDING_DOCUMENT_PREFIX ?? DEFAULT_DOCUMENT_PREFIX;
 }
 
 // ── Singleton ─────────────────────────────────────────────────────────────
@@ -254,6 +296,15 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
 
   const contextLengthEnv = process.env.EMBEDDING_CONTEXT_LENGTH;
 
+  // ── Task prefixes ───────────────────────────────────────────────────
+  // Resolved here, rather than only at the point of use, so that the values are
+  // logged where a misconfiguration can be spotted — inside a tool call, where
+  // the message reaches the host.
+  const resolvedQueryPrefix = queryPrefix();
+  const resolvedDocumentPrefix = documentPrefix();
+  const querySet = process.env.EMBEDDING_QUERY_PREFIX !== undefined;
+  const documentSet = process.env.EMBEDDING_DOCUMENT_PREFIX !== undefined;
+
   _config = {
     embeddingProvider,
     ollamaMode,
@@ -294,6 +345,8 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
     embeddingModel: _config.embeddingModel,
     embeddingDimensions: _config.embeddingDimensions,
     embeddingContextLength: _config.embeddingContextLength || "auto",
+    queryPrefix: resolvedQueryPrefix,
+    documentPrefix: resolvedDocumentPrefix,
     hasApiKey: !!(embeddingProvider === "ollama"
       ? _config.ollamaApiKey
       : embeddingProvider === "openai"
@@ -306,6 +359,16 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
               ? process.env.LITELLM_API_KEY
               : undefined),
   });
+
+  // The query and document encoders have to agree, so moving one prefix
+  // without the other degrades ranking silently. Say so rather than let the
+  // results quietly get worse.
+  if (querySet !== documentSet) {
+    logger.warn(
+      "Only one side of the embedding task prefixes is set: EMBEDDING_QUERY_PREFIX and EMBEDDING_DOCUMENT_PREFIX should be set together, and changing the document prefix requires a full re-index (codebase_remove, then codebase_index).",
+      { queryPrefixSet: querySet, documentPrefixSet: documentSet },
+    );
+  }
 
   return _config;
 }

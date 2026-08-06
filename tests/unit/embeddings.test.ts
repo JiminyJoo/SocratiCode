@@ -19,6 +19,20 @@ vi.mock("../../src/services/embedding-provider.js", async (importOriginal) => {
 // Import the mocked version for type-safe access
 import { getEmbeddingProvider } from "../../src/services/embedding-provider.js";
 
+// ── Ambient env isolation ────────────────────────────────────────────────────
+// These cases assert the default task prefixes, so a prefix exported in the
+// developer's shell — to run a model such as bge-m3 — would otherwise decide
+// what they see. Clear the two variables for every case here;
+// tests/unit/embedding-prefix.test.ts is the place that varies them on purpose.
+beforeEach(() => {
+  vi.stubEnv("EMBEDDING_QUERY_PREFIX", undefined);
+  vi.stubEnv("EMBEDDING_DOCUMENT_PREFIX", undefined);
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 // ── Helper ───────────────────────────────────────────────────────────────────
 
 /** Build a fake provider whose embed() returns predictable unit vectors. */

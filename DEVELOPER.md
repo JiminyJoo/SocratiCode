@@ -373,7 +373,7 @@ When `codebase_index` is called:
 
 5. BATCHED EMBEDDING + UPSERT (50 files per batch)
    For each batch of files:
-   ├── Prepare text: "search_document: {relativePath}\n{content}"
+   ├── Prepare text: "search_document: {relativePath}\n{content}" (default prefix; see EMBEDDING_DOCUMENT_PREFIX)
    ├── Generate embeddings via configured provider (further batched internally)
    ├── Upsert to Qdrant with dense vector + BM25 text + payload
    ├── Update in-memory file hashes
@@ -394,7 +394,7 @@ When `codebase_search` is called:
 
 ```
 1. Generate query embedding
-   ├── Prepare text: "search_query: {query}"
+   ├── Prepare text: "search_query: {query}" (default; see EMBEDDING_QUERY_PREFIX)
    └── Send to configured embedding provider → provider-dependent vector (768 / 1536 / 3072 dims)
 
 2. HYBRID SEARCH (dense + BM25, RRF-fused)
@@ -416,6 +416,8 @@ The `nomic-embed-text` model uses task-specific prefixes for asymmetric retrieva
 - **Queries** are prefixed with `search_query: ` — this tells the model to encode as a search query.
 
 This asymmetric encoding significantly improves retrieval quality.
+
+These are the defaults, kept for backward compatibility. Override them with `EMBEDDING_QUERY_PREFIX` / `EMBEDDING_DOCUMENT_PREFIX` to match a different model's expected prefixes (e.g. `query: ` / `passage: ` for `multilingual-e5-*`, none for `bge-m3`). See the README's environment variable table for the full details.
 
 ---
 
@@ -778,9 +780,9 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings with `search_document:` prefix |
-| `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding with `search_query:` prefix |
-| `prepareDocumentText` | `(content, filePath) → string` | Prepare text with relative path prefix |
+| `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings for the texts as given — batching and retries only, no prefixing (callers pass text from `prepareDocumentText`) |
+| `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding, prefixed with `search_query: ` (default; env-configurable via `EMBEDDING_QUERY_PREFIX`) |
+| `prepareDocumentText` | `(content, filePath) → string` | Build the text to embed: `search_document: ` prefix, then the relative path, then the content (prefix env-configurable via `EMBEDDING_DOCUMENT_PREFIX`) |
 
 ### indexer.ts
 
