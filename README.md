@@ -706,7 +706,37 @@ or when you want a Mac/Windows-friendly desktop UI for managing GGUF models).
 > fails fast if either is missing.
 >
 > Optional: `LMSTUDIO_URL` (default `http://localhost:1234/v1`) for non-default ports;
-> `LMSTUDIO_API_KEY` if you've enabled API key auth in LM Studio.
+> `LMSTUDIO_API_KEY` if you've enabled API key auth in LM Studio;
+> `LMSTUDIO_ALLOW_MISSING_MODEL_LISTING=true` for OpenAI-compatible servers that have no
+> `/v1/models` endpoint (see below).
+
+This provider also drives any other server that speaks the OpenAI embeddings API.
+Single-model servers such as [HuggingFace Text Embeddings Inference](https://github.com/huggingface/text-embeddings-inference)
+(TEI) fix the model at startup and answer `/v1/models` with a 404, so readiness needs
+`LMSTUDIO_ALLOW_MISSING_MODEL_LISTING=true` to fall back to probing `/v1/embeddings`:
+
+```json
+{
+  "mcpServers": {
+    "socraticode": {
+      "command": "node",
+      "args": ["/absolute/path/to/socraticode/dist/index.js"],
+      "env": {
+        "EMBEDDING_PROVIDER": "lmstudio",
+        "LMSTUDIO_URL": "http://localhost:8080/v1",
+        "EMBEDDING_MODEL": "BAAI/bge-m3",
+        "EMBEDDING_DIMENSIONS": "1024",
+        "LMSTUDIO_ALLOW_MISSING_MODEL_LISTING": "true"
+      }
+    }
+  }
+}
+```
+
+> `EMBEDDING_MODEL` is whatever the server was started with (TEI's `--model-id`) and
+> `EMBEDDING_DIMENSIONS` must match that model's output width — the probe checks it and
+> fails fast on a mismatch, since without `/v1/models` there is nothing else to verify
+> against.
 
 #### LiteLLM (proxy gateway, 100+ providers)
 
@@ -1207,6 +1237,7 @@ The rest of this section documents the variables themselves. Pass them using whi
 |----------|---------|-------------|
 | `LMSTUDIO_URL` | `http://localhost:1234/v1` | Full base URL of LM Studio's OpenAI-compatible Local Server. Override when the server runs on a non-default port or a remote machine (e.g. `http://gpu-rig.local:5678/v1`). Must include the `/v1` suffix. |
 | `LMSTUDIO_API_KEY` | *(none)* | Optional. LM Studio's Local Server has no auth by default; set this only if you've enabled API key auth in the LM Studio UI. |
+| `LMSTUDIO_ALLOW_MISSING_MODEL_LISTING` | `false` | Accept an OpenAI-compatible server that has no `/v1/models` endpoint. Single-model servers such as HuggingFace Text Embeddings Inference (TEI) fix the model at startup and return 404 for the listing, while `/v1/embeddings` works normally. When enabled (`true` / `1` / `yes`), readiness and health checks fall back to probing `/v1/embeddings` with one throwaway input, and the probe's vector width is checked against `EMBEDDING_DIMENSIONS`. Only a 404 or 405 from the listing triggers the fallback — a refused connection, a 401, or a 5xx still reports the LM Studio diagnostics. Accepts `false` / `0` / `no` as well; any other non-empty value is rejected at startup rather than silently read as `false`. |
 
 ### LiteLLM Configuration (when `EMBEDDING_PROVIDER=litellm`)
 

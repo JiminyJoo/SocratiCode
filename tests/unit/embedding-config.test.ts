@@ -25,6 +25,7 @@ describe("embedding-config", () => {
     delete process.env.GOOGLE_API_KEY;
     delete process.env.LMSTUDIO_URL;
     delete process.env.LMSTUDIO_API_KEY;
+    delete process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING;
     delete process.env.LITELLM_URL;
     delete process.env.LITELLM_API_KEY;
     delete process.env.LITELLM_SEND_DIMENSIONS;
@@ -211,6 +212,7 @@ describe("embedding-config", () => {
         ollamaUrl: "http://remote-gpu:11434",
         lmstudioUrl: "http://localhost:1234/v1",
         litellmUrl: "http://localhost:4000/v1",
+        allowMissingModelListing: false,
         embeddingModel: "mxbai-embed-large",
         embeddingDimensions: 1024,
         embeddingContextLength: 512,
@@ -358,6 +360,68 @@ describe("embedding-config", () => {
 
       const config = loadEmbeddingConfig();
       expect(config.embeddingContextLength).toBe(32768);
+    });
+  });
+
+  describe("LMSTUDIO_ALLOW_MISSING_MODEL_LISTING", () => {
+    /** The lmstudio provider needs a model and a dimension before anything else loads. */
+    function lmstudioEnv(): void {
+      process.env.EMBEDDING_PROVIDER = "lmstudio";
+      process.env.EMBEDDING_MODEL = "nomic-embed-text-v1.5";
+      process.env.EMBEDDING_DIMENSIONS = "768";
+    }
+
+    it("defaults to false when unset", () => {
+      lmstudioEnv();
+      expect(loadEmbeddingConfig().allowMissingModelListing).toBe(false);
+    });
+
+    it.each(["true", "TRUE", "True", " true ", "1", "yes"])(
+      "reads %j as enabled",
+      (value) => {
+        lmstudioEnv();
+        process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING = value;
+        expect(loadEmbeddingConfig().allowMissingModelListing).toBe(true);
+      },
+    );
+
+    it.each(["false", "FALSE", "0", "no", "", "  "])(
+      "reads %j as disabled",
+      (value) => {
+        lmstudioEnv();
+        process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING = value;
+        expect(loadEmbeddingConfig().allowMissingModelListing).toBe(false);
+      },
+    );
+
+    // A typo is a request for the flag to be on. Reading it as off used to leave the
+    // operator debugging the behaviour they believed they had turned on.
+    it.each(["ture", "tru", "on", "off", "enabled", "y", "n", "2"])(
+      "rejects %j instead of reading it as disabled",
+      (value) => {
+        lmstudioEnv();
+        process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING = value;
+        expect(() => loadEmbeddingConfig()).toThrow(
+          /Invalid LMSTUDIO_ALLOW_MISSING_MODEL_LISTING/,
+        );
+      },
+    );
+
+    it("names both the variable and the offending value in the error", () => {
+      lmstudioEnv();
+      process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING = "ture";
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /Invalid LMSTUDIO_ALLOW_MISSING_MODEL_LISTING: "ture"/,
+      );
+    });
+
+    // The flag belongs to the lmstudio provider, but it is read unconditionally,
+    // so a stray value must not pass unnoticed under another provider either.
+    it("rejects an unrecognised value under a provider that ignores the flag", () => {
+      process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING = "ture";
+      expect(() => loadEmbeddingConfig()).toThrow(
+        /Invalid LMSTUDIO_ALLOW_MISSING_MODEL_LISTING/,
+      );
     });
   });
 
