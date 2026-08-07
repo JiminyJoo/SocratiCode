@@ -237,10 +237,10 @@ All constants are defined in `src/constants.ts`:
 | `SEARCH_DEFAULT_LIMIT` | `10` | Default search results per query (env-configurable, 1-50) |
 | `SEARCH_MIN_SCORE` | `0.10` | Minimum RRF score threshold (env-configurable, 0-1) |
 | `CHUNK_SIZE` | `100` | Lines per chunk |
-| `CHUNK_OVERLAP` | `10` | Overlapping lines between adjacent chunks |
+| `CHUNK_OVERLAP` | `10` | Overlapping lines between chunks cut by line count — adjacent AST declaration chunks do not overlap |
 | `MAX_FILE_BYTES` | `5 MB` | Max file size before skipping (env-configurable via `MAX_FILE_SIZE_MB`) |
 | `MAX_AVG_LINE_LENGTH` | `500` | Avg line length above which character-based chunking is used (minified files) |
-| `MAX_CHUNK_CHARS` | `2000` | Hard character limit per chunk (provider-level safety net) |
+| `MAX_CHUNK_CHARS` | `2000` | Hard character limit per chunk (provider-level safety net, env-configurable via `MAX_CHUNK_CHARS`) |
 | `QDRANT_PORT` | `16333` | Qdrant HTTP API port (host-side) |
 | `QDRANT_GRPC_PORT` | `16334` | Qdrant gRPC port (host-side) |
 | `QDRANT_CONTAINER_NAME` | `socraticode-qdrant` | Docker container name |
@@ -367,7 +367,7 @@ When `codebase_index` is called:
    │   │   ├── Small declarations merged, large ones sub-chunked
    │   │   └── Preamble (imports) and epilogue handled separately
    │   └── Line-based fallback: 100-line segments with 10-line overlap
-   ├── Hard character cap (2000 chars) applied to all chunks
+   ├── Hard character cap (`MAX_CHUNK_CHARS`, default 2000 chars) applied to all chunks
    ├── Generate chunk ID: SHA-256 of "filePath:startLine" formatted as UUID
    └── Detect language from file extension
 
