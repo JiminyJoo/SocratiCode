@@ -75,7 +75,11 @@ export function qdrantClientBreaksOnThisNode(
 ): boolean {
   if (!Number.isFinite(nodeMajor) || nodeMajor < 26) return false;
   if (clientVersion === null) return true;
-  const match = clientVersion.match(/^(\d+)\.(\d+)\./);
+  // Full semver shape required (prerelease/build tags allowed): a partial
+  // match like `1.19.not-a-version` is NOT a version the registry could
+  // have served, so it fails closed with every other unparseable string
+  // rather than being half-read as a 1.19.
+  const match = clientVersion.match(/^(\d+)\.(\d+)\.\d+(?:[-+].*)?$/);
   if (!match) return true;
   const major = Number.parseInt(match[1], 10);
   const minor = Number.parseInt(match[2], 10);

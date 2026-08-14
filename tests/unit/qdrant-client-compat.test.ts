@@ -61,6 +61,15 @@ describe("qdrant-client-compat", () => {
       // UND_ERR_INVALID_ARG at the first qdrant call.
       expect(qdrantClientBreaksOnThisNode(26, null)).toBe(true);
       expect(qdrantClientBreaksOnThisNode(26, "not-a-version")).toBe(true);
+      // A half-valid string must not be half-read as its leading 1.19.
+      expect(qdrantClientBreaksOnThisNode(26, "1.19.not-a-version")).toBe(true);
+    });
+
+    it("reads prerelease and build-metadata versions normally", () => {
+      // The strict shape must not reject the tagged versions the registry
+      // legitimately serves.
+      expect(qdrantClientBreaksOnThisNode(26, "1.19.0-rc.1")).toBe(false);
+      expect(qdrantClientBreaksOnThisNode(26, "1.18.2+build.5")).toBe(true);
     });
 
     it("treats a non-finite node major as not breaking", () => {
