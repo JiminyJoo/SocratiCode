@@ -9,9 +9,9 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/) a
 ### Bug Fixes
 
 * **graph:** reject backslashes in package: URI paths ([e550edc](https://github.com/giancarloerra/socraticode/commit/e550edc2e0e5f1bd585aad779e4426a7c710fecc))
-* **graph:** resolve Dart package: imports through pubspec-derived package roots ([ca7e277](https://github.com/giancarloerra/socraticode/commit/ca7e27723243fe4c13674e3e08e0fa23dd6d500f)), closes [#82](https://github.com/giancarloerra/socraticode/issues/82)
+* **graph:** resolve Dart package: imports through pubspec-derived package roots ([ca7e277](https://github.com/giancarloerra/socraticode/commit/ca7e27723243fe4c13674e3e08e0fa23dd6d500f)), closes [#106](https://github.com/giancarloerra/socraticode/issues/106)
 * **index:** add .dart_tool to the default ignore patterns ([06180d3](https://github.com/giancarloerra/socraticode/commit/06180d3362aee310a0c324a9c6d5fa73b3f8fc92))
-* **startup:** refuse Node 26 only when the installed qdrant client breaks there ([39b1d2c](https://github.com/giancarloerra/socraticode/commit/39b1d2c8b527f15078ded86165957cf88e53c374)), closes [#87](https://github.com/giancarloerra/socraticode/issues/87)
+* **startup:** refuse Node 26 only when the installed qdrant client breaks there ([39b1d2c](https://github.com/giancarloerra/socraticode/commit/39b1d2c8b527f15078ded86165957cf88e53c374))
 * **startup:** require a full semver shape before trusting the client version ([9ab7b2e](https://github.com/giancarloerra/socraticode/commit/9ab7b2eb0e77a522d046f944dbb06af1637f3579))
 
 ### Tests
