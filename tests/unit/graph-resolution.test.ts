@@ -801,6 +801,25 @@ describe("graph-resolution", () => {
       expect(dartResolve("package:my_app/./main.dart", "lib/main.dart", project, map)).toBeNull();
     });
 
+    it("rejects backslashes instead of resolving them as path or name", () => {
+      // win32 path.resolve treats a backslash as a separator, so without
+      // the explicit guard `..\\secret.dart` traverses out of lib/ there.
+      // On POSIX that effect is unobservable: toForwardSlash inside
+      // resolveRelativePath textually rewrites the backslash and the lookup
+      // misses regardless, so this test pins the CONTRACT (backslash URIs
+      // never resolve, decoy file present or not) rather than the guard
+      // alone — it fails only if both defenses are removed, and the guard
+      // is what defends the win32 path this suite cannot execute.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+        "lib/..\\secret.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      expect(dartResolve("package:my_app/..\\secret.dart", "lib/main.dart", project, map)).toBeNull();
+    });
+
     it("returns null for a bare package:name with no path", () => {
       // `package:my_app` names a package, not a file; slicing it as if a
       // path followed would resolve lib/ itself or throw.

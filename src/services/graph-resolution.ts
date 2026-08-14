@@ -903,9 +903,12 @@ export function resolveImport(
         // resolveRelativePath would resolve the bare lib target onto a decoy
         // `lib.dart` or `lib/index.dart` — a wrong edge, not a missing one.
         if (packagePath === "") return null;
-        // No valid package URI carries dot segments; path.posix.join would
-        // normalize them and could escape lib/ onto an unrelated in-project
-        // file, drawing an edge the code never expresses.
+        // No valid package URI carries dot segments or backslashes;
+        // path.posix.join would normalize dot segments (and win32
+        // path.resolve treats a backslash as a separator), either of which
+        // could escape lib/ onto an unrelated in-project file, drawing an
+        // edge the code never expresses.
+        if (packagePath.includes("\\")) return null;
         if (packagePath.split("/").some((segment) => segment === "." || segment === "..")) {
           return null;
         }
