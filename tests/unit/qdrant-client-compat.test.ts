@@ -61,8 +61,10 @@ describe("qdrant-client-compat", () => {
       // UND_ERR_INVALID_ARG at the first qdrant call.
       expect(qdrantClientBreaksOnThisNode(26, null)).toBe(true);
       expect(qdrantClientBreaksOnThisNode(26, "not-a-version")).toBe(true);
-      // A half-valid string must not be half-read as its leading 1.19.
+      // A half-valid string must not be half-read as its leading 1.19,
+      // whether the garbage starts at the patch or trails after it.
       expect(qdrantClientBreaksOnThisNode(26, "1.19.not-a-version")).toBe(true);
+      expect(qdrantClientBreaksOnThisNode(26, "1.19.0garbage")).toBe(true);
     });
 
     it("reads prerelease and build-metadata versions normally", () => {
