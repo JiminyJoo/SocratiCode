@@ -138,12 +138,12 @@ export function buildCsNamespaceMap(
  * `node_modules/`, `.git/` or any gitignored or `.socraticodeignore`d path is
  * skipped — matching what the graphable walk would do.
  *
- * `vendor/` is additionally skipped unconditionally. It is absent from
- * DEFAULT_IGNORE_PATTERNS, and a Composer path repository symlinks
- * `vendor/<pkg>` back to the in-repo source, so a manifest read through it
- * would register a second directory for a prefix the in-repo manifest already
- * declared — pointing at a path whose files were indexed under their real
- * location.
+ * `vendor/` is additionally skipped unconditionally. DEFAULT_IGNORE_PATTERNS
+ * already lists it, but a `.socraticodeignore` negation (`!vendor/`) can
+ * re-include it, and a Composer path repository symlinks `vendor/<pkg>` back
+ * to the in-repo source, so a manifest read through it would register a
+ * second directory for a prefix the in-repo manifest already declared —
+ * pointing at a path whose files were indexed under their real location.
  */
 function findComposerManifests(projectPath: string): string[] {
   const ig = createIgnoreFilter(projectPath);
@@ -455,6 +455,111 @@ function findGoModFiles(projectPath: string): string[] {
 }
 
 /**
+ * Discover every `pubspec.yaml` under `projectPath`, project-relative and
+ * forward-slash-normalized.
+ *
+ * `pubspec.yaml` is not a graphable file (no AST grammar, not an extra
+ * extension), so it is never in the set returned by `getGraphableFiles` —
+ * this walk is independent of that set, exactly like {@link findGoModFiles}
+ * (the fileSet-scan trap from issue #82 applies here identically). The same
+ * ignore filter (`createIgnoreFilter` / `shouldIgnore`) `getGraphableFiles`
+ * uses is applied, with the same trailing-slash convention for directories,
+ * so a manifest under `node_modules/`, `.git/`, or a gitignored path is
+ * skipped.
+ *
+ * `.dart_tool/` is additionally skipped unconditionally. DEFAULT_IGNORE_PATTERNS
+ * already lists it, but a `.socraticodeignore` negation (`!.dart_tool/`) can
+ * re-include it, and Flutter code generation writes a `flutter_gen/pubspec.yaml`
+ * inside it whose `name:` would register a package root pointing at generated
+ * files.
+ */
+function findPubspecFiles(projectPath: string): string[] {
+  const ig = createIgnoreFilter(projectPath);
+  const results: string[] = [];
+  const walk = (dir: string): void => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const relPath = toForwardSlash(path.relative(projectPath, path.join(dir, entry.name)));
+      if (shouldIgnore(ig, entry.isDirectory() ? `${relPath}/` : relPath)) continue;
+      if (entry.isDirectory()) {
+        if (entry.name === ".dart_tool") continue;
+        walk(path.join(dir, entry.name));
+      } else if (entry.name === "pubspec.yaml") {
+        // Mirrors findGoModFiles: readdirSync Dirents do not follow symlinks,
+        // so a symlinked manifest reports isFile()===false and would be missed.
+        let isFile = entry.isFile();
+        if (!isFile && entry.isSymbolicLink()) {
+          try {
+            isFile = statSync(path.join(dir, entry.name)).isFile();
+          } catch {
+            continue;
+          }
+        }
+        if (isFile) results.push(relPath);
+      }
+    }
+  };
+  walk(projectPath);
+  // Sorted so duplicate package names across manifests resolve to the same
+  // root on every machine — buildDartPackageMap is first-wins in this order.
+  return results.sort();
+}
+
+/**
+ * Map every in-repo Dart package name to its package root directory
+ * (project-relative, forward-slash; `"."` for a root-level `pubspec.yaml`).
+ *
+ * Dart/Flutter code imports intra-project files by package URI almost
+ * exclusively — `import 'package:my_app/src/service.dart';` is the layout
+ * convention pub itself generates — and a package URI carries no path
+ * information: `package:<name>/<rest>` maps to `<package_root>/lib/<rest>`
+ * only because `<name>`'s pubspec lives at `<package_root>`. Without this
+ * map every such import resolved to null (issue #106), so Flutter projects
+ * lost nearly all file-graph edges and impact analysis reported "no callers"
+ * for files with many consumers. Nested manifests are read too, which is what
+ * resolves cross-package `package:<sibling>/...` imports in pub-workspace and
+ * melos monorepos.
+ *
+ * The `name:` field is matched only at column 0: pubspec is YAML, so a
+ * nested `name:` key legitimately appears indented inside dependency blocks
+ * (`dependencies: { foo: { hosted: { name: ... } } }`), and an unanchored
+ * match could map a dependency's name to the wrong root. Pub package names
+ * are lowercase identifiers (`[a-z0-9_]`); the optional quote accepts the
+ * YAML-quoted spelling of the same name. A manifest without a matching
+ * `name:` contributes nothing; the first manifest (in sorted path order) to
+ * declare a name wins, mirroring `buildJvmSuffixMap`'s first-wins
+ * determinism.
+ *
+ * Call this once per graph build and pass the result to resolveImport.
+ */
+export function buildDartPackageMap(projectPath: string): Map<string, string> {
+  const map = new Map<string, string>();
+  const root = path.resolve(projectPath);
+  for (const relManifest of findPubspecFiles(root)) {
+    let source: string;
+    try {
+      source = readFileSync(path.join(root, relManifest), "utf8");
+    } catch {
+      continue; // unreadable manifest — the other manifests still count
+    }
+    // A UTF-8 BOM sits before the first line's `name:` and would defeat the
+    // column-0 anchor below — `dart pub get` accepts a BOM'd manifest, so
+    // without this the package silently loses every package: edge again.
+    if (source.charCodeAt(0) === 0xfeff) source = source.slice(1);
+    const match = source.match(/^name:[ \t]*['"]?([a-z0-9_]+)/m);
+    if (!match) continue;
+    const packageDir = toForwardSlash(path.dirname(relManifest)); // "." at the root
+    if (!map.has(match[1])) map.set(match[1], packageDir);
+  }
+  return map;
+}
+
+/**
  * Resolve a module specifier to a relative file path within the project.
  * Returns null if the module is external (e.g., npm package, stdlib).
  *
@@ -476,6 +581,7 @@ export function resolveImport(
   csNamespaceMap?: Map<string, string[]>,
   goModuleInfo?: GoModuleInfo[] | null,
   phpPsr4Map?: Map<string, string[]>,
+  dartPackageMap?: Map<string, string>,
 ): string | null {
   // Skip obvious external/stdlib modules. Go is excluded from this
   // pre-check because its external classifier in `isExternalModule`
@@ -778,9 +884,38 @@ export function resolveImport(
     }
 
     case "dart": {
-      // package:foo/bar.dart → external; relative paths only
-      if (moduleSpecifier.startsWith("package:")) return null;
-      if (moduleSpecifier.startsWith("dart:")) return null;
+      // `dart:` never reaches here: isExternalModule classifies it external
+      // and the pre-check above already returned null.
+      if (moduleSpecifier.startsWith("package:")) {
+        // `package:<name>/<rest>` → `<package_root>/lib/<rest>`. The `lib/`
+        // segment is pub's universal mapping (a package URI's root IS the
+        // package's lib/ directory), so resolving <rest> against the package
+        // root alone would match nothing. A name absent from the map is an
+        // external package (package:flutter, pub.dev deps) and stays null —
+        // as does everything when no map was built (no pubspec.yaml found,
+        // or a pre-#106 caller that does not pass one).
+        const rest = moduleSpecifier.slice("package:".length);
+        const slash = rest.indexOf("/");
+        if (slash <= 0) return null; // `package:name` alone names no file
+        const packageDir = dartPackageMap?.get(rest.slice(0, slash));
+        if (packageDir === undefined) return null;
+        const packagePath = rest.slice(slash + 1);
+        // `package:<name>/` names no file, and the extension fallbacks in
+        // resolveRelativePath would resolve the bare lib target onto a decoy
+        // `lib.dart` or `lib/index.dart` — a wrong edge, not a missing one.
+        if (packagePath === "") return null;
+        // No valid package URI carries dot segments or backslashes;
+        // path.posix.join would normalize dot segments (and win32
+        // path.resolve treats a backslash as a separator), either of which
+        // could escape lib/ onto an unrelated in-project file, drawing an
+        // edge the code never expresses.
+        if (packagePath.includes("\\")) return null;
+        if (packagePath.split("/").some((segment) => segment === "." || segment === "..")) {
+          return null;
+        }
+        const libPath = path.posix.join(packageDir, "lib", packagePath);
+        return resolveRelativePath(libPath, projectPath, projectPath, fileSet, [".dart"]);
+      }
       return resolveRelativePath(moduleSpecifier, sourceDir, projectPath, fileSet, [".dart"]);
     }
 
@@ -829,7 +964,12 @@ function isExternalModule(spec: string, language: string): boolean {
     case "ruby":
       return !spec.startsWith("./") && !spec.startsWith("../") && !spec.includes("/");
     case "dart":
-      return spec.startsWith("dart:") || spec.startsWith("package:");
+      // Only the SDK scheme is unconditionally external. `package:` URIs are
+      // NOT: the project's own code is imported that way by convention
+      // (issue #106), so they classify as resolvable and the dart case in
+      // resolveImport decides via the pubspec-derived package map — in-repo
+      // names resolve, unknown names (real external packages) return null.
+      return spec.startsWith("dart:");
     case "lua":
       // Common Lua stdlib/C modules
       return ["string", "table", "math", "io", "os", "coroutine",
