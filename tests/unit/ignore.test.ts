@@ -40,6 +40,15 @@ describe("ignore", () => {
       expect(ig.ignores("node_modules/package/index.js")).toBe(true);
     });
 
+    it("ignores .dart_tool by default", () => {
+      // Flutter tooling state: generated code under .dart_tool/ (including
+      // flutter_gen) would otherwise be indexed and become graph nodes for
+      // any Flutter project not covered by gitignore processing.
+      fixture = createFixtureProject("ignore-dart-tool");
+      const ig = createIgnoreFilter(fixture.root);
+      expect(ig.ignores(".dart_tool/flutter_gen/gen.dart")).toBe(true);
+    });
+
     it("ignores .git by default", () => {
       fixture = createFixtureProject("ignore-git");
       const ig = createIgnoreFilter(fixture.root);

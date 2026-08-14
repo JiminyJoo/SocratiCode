@@ -943,12 +943,16 @@ describe("graph-resolution", () => {
       expect(map.size).toBe(0);
     });
 
-    it("skips pubspecs under .dart_tool", () => {
+    it("skips pubspecs under .dart_tool even when a negation re-includes it", () => {
       // Flutter codegen writes .dart_tool/flutter_gen/pubspec.yaml; mapping
-      // it would register a package root over generated state that the
-      // ignore filter does not cover (RESPECT_GITIGNORE defaults false).
+      // it would register a package root over generated state. The default
+      // ignore list covers .dart_tool too, so the fixture re-includes it via
+      // a .socraticodeignore negation — only the walk's unconditional skip
+      // stands between the generated manifest and the map, which is exactly
+      // the case the skip exists for.
       project = createTempProject({
         "pubspec.yaml": "name: my_app\n",
+        ".socraticodeignore": "!.dart_tool/\n",
         ".dart_tool/flutter_gen/pubspec.yaml": "name: flutter_gen\n",
       });
 

@@ -467,10 +467,11 @@ function findGoModFiles(projectPath: string): string[] {
  * so a manifest under `node_modules/`, `.git/`, or a gitignored path is
  * skipped.
  *
- * `.dart_tool/` is additionally skipped unconditionally: it is generated
- * tooling state, not in DEFAULT_IGNORE_PATTERNS, and Flutter code generation
- * writes a `flutter_gen/pubspec.yaml` inside it whose `name:` would register
- * a package root pointing at generated files.
+ * `.dart_tool/` is additionally skipped unconditionally. DEFAULT_IGNORE_PATTERNS
+ * already lists it, but a `.socraticodeignore` negation (`!.dart_tool/`) can
+ * re-include it, and Flutter code generation writes a `flutter_gen/pubspec.yaml`
+ * inside it whose `name:` would register a package root pointing at generated
+ * files.
  */
 function findPubspecFiles(projectPath: string): string[] {
   const ig = createIgnoreFilter(projectPath);

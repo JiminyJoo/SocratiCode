@@ -51,6 +51,7 @@ const DEFAULT_IGNORE_PATTERNS = [
   ".parcel-cache",
   ".turbo",
   "vendor",
+  ".dart_tool",
 ];
 
 /**
