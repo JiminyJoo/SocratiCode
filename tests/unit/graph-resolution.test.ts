@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   buildCsNamespaceMap,
+  buildDartPackageMap,
   buildGoModuleInfo,
   buildJvmSuffixMap,
   hasLiteralShellPathShape,
@@ -665,7 +666,10 @@ describe("graph-resolution", () => {
       expect(result).toBe("lib/utils/helpers.dart");
     });
 
-    it("returns null for package: imports", () => {
+    it("returns null for package: imports when no package map is passed", () => {
+      // Back-compat pin: every pre-#106 caller omits the map, and that
+      // omission must reproduce the old behavior exactly — package: imports
+      // stay unresolved rather than half-resolving through some default.
       project = createTempProject({
         "lib/main.dart": "",
       });
@@ -695,6 +699,259 @@ describe("graph-resolution", () => {
       );
 
       expect(result).toBeNull();
+    });
+  });
+
+  // ── Dart package: resolution (#106) ────────────────────────────────────
+
+  describe("Dart package: resolution (#106)", () => {
+    // Flutter's own templates import intra-project files as
+    // `package:<name>/...`, so before #106 a Flutter project's file graph
+    // lost nearly every edge: both the external classifier and the dart
+    // case rejected the scheme outright. These tests pin the mechanism the
+    // fix rests on — the pubspec-derived name map plus pub's universal
+    // `package:<name>/<rest>` → `<package_root>/lib/<rest>` mapping.
+
+    const dartResolve = (
+      spec: string,
+      from: string,
+      p: TempProject,
+      map: Map<string, string> | undefined,
+    ) =>
+      resolveImport(
+        spec,
+        path.join(p.root, from),
+        p.root,
+        p.fileSet,
+        "dart",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        map,
+      );
+
+    it("resolves an own-package import through lib/", () => {
+      // The lib/ segment is the load-bearing detail: pub maps the package
+      // URI root to lib/, so resolving <rest> against the package root
+      // alone (the shape issue #106 originally proposed) matches nothing.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\nenvironment:\n  sdk: ^3.0.0\n",
+        "lib/main.dart": "",
+        "lib/src/service.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      const result = dartResolve("package:my_app/src/service.dart", "lib/main.dart", project, map);
+
+      expect(result).toBe("lib/src/service.dart");
+    });
+
+    it("returns null for an external package absent from the map", () => {
+      // package:flutter and every pub.dev dependency have no in-repo
+      // pubspec, so they are not in the map — the edge must be dropped,
+      // not guessed into the project tree.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      const result = dartResolve("package:flutter/material.dart", "lib/main.dart", project, map);
+
+      expect(result).toBeNull();
+    });
+
+    it("resolves cross-package imports in a monorepo of nested packages", () => {
+      // Pub workspaces and melos monorepos import sibling packages with the
+      // same package: form as external ones; only the nested-pubspec scan
+      // tells the two apart. This is the edge class that makes
+      // codebase_impact see cross-package callers.
+      project = createTempProject({
+        "packages/feature_a/pubspec.yaml": "name: feature_a\n",
+        "packages/feature_a/lib/a.dart": "",
+        "packages/feature_b/pubspec.yaml": "name: feature_b\n",
+        "packages/feature_b/lib/src/b.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      const result = dartResolve(
+        "package:feature_b/src/b.dart",
+        "packages/feature_a/lib/a.dart",
+        project,
+        map,
+      );
+
+      expect(result).toBe("packages/feature_b/lib/src/b.dart");
+    });
+
+    it("rejects dot segments instead of letting them escape lib/", () => {
+      // path.posix.join normalizes `..`, so without the guard
+      // `package:my_app/../secret.dart` would resolve to a real file OUTSIDE
+      // lib/ and draw an edge the source never expresses.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+        "secret.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      expect(dartResolve("package:my_app/../secret.dart", "lib/main.dart", project, map)).toBeNull();
+      expect(dartResolve("package:my_app/./main.dart", "lib/main.dart", project, map)).toBeNull();
+    });
+
+    it("returns null for a bare package:name with no path", () => {
+      // `package:my_app` names a package, not a file; slicing it as if a
+      // path followed would resolve lib/ itself or throw.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      expect(dartResolve("package:my_app", "lib/main.dart", project, map)).toBeNull();
+    });
+
+    it("returns null for package:name/ with an empty path instead of hitting a decoy", () => {
+      // The extension fallbacks in resolveRelativePath would otherwise
+      // resolve the bare lib target onto `lib.dart` or `lib/index.dart` —
+      // an invented edge to a file the import never names.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib.dart": "",
+        "lib/index.dart": "",
+        "lib/main.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      expect(dartResolve("package:my_app/", "lib/main.dart", project, map)).toBeNull();
+    });
+
+    it("still resolves relative imports when a map is present", () => {
+      // The map must only add resolutions, never steal the relative path
+      // branch that already worked.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+        "lib/utils/helpers.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      const result = dartResolve("utils/helpers.dart", "lib/main.dart", project, map);
+
+      expect(result).toBe("lib/utils/helpers.dart");
+    });
+
+    it("keeps dart: imports external even with a map present", () => {
+      // The SDK scheme must never resolve into the project, whatever the
+      // map contains — the classifier narrowing must not have widened it.
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "lib/main.dart": "",
+        "lib/async.dart": "",
+      });
+      const map = buildDartPackageMap(project.root);
+
+      expect(dartResolve("dart:async", "lib/main.dart", project, map)).toBeNull();
+    });
+  });
+
+  describe("buildDartPackageMap", () => {
+    it("maps the root pubspec to '.' and nested pubspecs to their directories", () => {
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        "packages/feature_a/pubspec.yaml": "name: feature_a\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("my_app")).toBe(".");
+      expect(map.get("feature_a")).toBe("packages/feature_a");
+    });
+
+    it("reads a manifest that starts with a UTF-8 BOM", () => {
+      // `dart pub get` accepts a BOM'd pubspec, but the BOM sits before the
+      // first line's `name:` and defeats a column-0 anchor — the package
+      // would silently lose every package: edge, the exact #106 symptom.
+      project = createTempProject({
+        "pubspec.yaml": "\uFEFFname: my_app\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("my_app")).toBe(".");
+    });
+
+    it("reads quoted names", () => {
+      // YAML allows quoting scalars; both quote styles must yield the same
+      // name as the bare spelling.
+      project = createTempProject({
+        "a/pubspec.yaml": 'name: "alpha_pkg"\n',
+        "b/pubspec.yaml": "name: 'beta_pkg'\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("alpha_pkg")).toBe("a");
+      expect(map.get("beta_pkg")).toBe("b");
+    });
+
+    it("ignores indented name: keys inside dependency blocks", () => {
+      // A hosted-dependency block legitimately contains a nested `name:`.
+      // An unanchored match would map the DEPENDENCY's name to this
+      // package's root and invent edges into the wrong directory.
+      project = createTempProject({
+        "pubspec.yaml":
+          "name: my_app\ndependencies:\n  dep_pkg:\n    hosted:\n      name: hosted_dep\n      url: https://some-pub-server.example\n    version: ^1.0.0\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("my_app")).toBe(".");
+      expect(map.has("hosted_dep")).toBe(false);
+    });
+
+    it("contributes nothing from a manifest whose only name: is indented", () => {
+      // The anchored regex must not fall back to an indented key when no
+      // top-level one exists.
+      project = createTempProject({
+        "broken/pubspec.yaml": "description: no top-level name here\nmeta:\n  name: nested_only\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.size).toBe(0);
+    });
+
+    it("skips pubspecs under .dart_tool", () => {
+      // Flutter codegen writes .dart_tool/flutter_gen/pubspec.yaml; mapping
+      // it would register a package root over generated state that the
+      // ignore filter does not cover (RESPECT_GITIGNORE defaults false).
+      project = createTempProject({
+        "pubspec.yaml": "name: my_app\n",
+        ".dart_tool/flutter_gen/pubspec.yaml": "name: flutter_gen\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("my_app")).toBe(".");
+      expect(map.has("flutter_gen")).toBe(false);
+    });
+
+    it("is first-wins in sorted path order for duplicate names", () => {
+      // Duplicate names across nested pubspecs are invalid in one pub
+      // resolution context but can exist in a monorepo tree; without a
+      // deterministic tie-break the graph's edges would differ between
+      // rebuilds on different machines.
+      project = createTempProject({
+        "zeta/pubspec.yaml": "name: dup_pkg\n",
+        "alpha/pubspec.yaml": "name: dup_pkg\n",
+      });
+
+      const map = buildDartPackageMap(project.root);
+
+      expect(map.get("dup_pkg")).toBe("alpha");
     });
   });
 

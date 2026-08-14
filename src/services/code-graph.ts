@@ -14,7 +14,7 @@ import type {
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
-import { buildCsNamespaceMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpPsr4Map, resolveImport } from "./graph-resolution.js";
+import { buildCsNamespaceMap, buildDartPackageMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpPsr4Map, resolveImport } from "./graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
 import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
@@ -815,6 +815,16 @@ export async function buildCodeGraph(
   const hasGo = files.some((f) => f.endsWith(".go"));
   const goModuleInfo = hasGo ? buildGoModuleInfo(fileSet, resolvedPath) : undefined;
 
+  // Map each in-repo Dart package name to its root, from every pubspec.yaml
+  // in the tree (discovered by walking, like go.mod — pubspec.yaml is never
+  // in the graphable file set). Flutter code imports intra-project files as
+  // `package:<name>/...` by convention, so without this map those imports
+  // all resolved to null and Dart projects lost nearly every file-graph edge
+  // (issue #106). An empty/undefined map keeps the resolver's old behavior:
+  // every `package:` import stays unresolved.
+  const hasDart = files.some((f) => path.extname(f).toLowerCase() === ".dart");
+  const dartPackageMap = hasDart ? buildDartPackageMap(resolvedPath) : undefined;
+
   for (const relPath of files) {
     let ext = path.extname(relPath).toLowerCase();
     let lang = getAstGrepLang(ext);
@@ -935,7 +945,7 @@ export async function buildCodeGraph(
       // Try to resolve to a project file
       // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
       const resolutionLanguage = imp.isCssImport ? "css" : language;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map);
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap);
       if (resolved) {
         node.dependencies.push(resolved);
 
