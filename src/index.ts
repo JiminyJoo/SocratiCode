@@ -2,36 +2,38 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
-// Pre-flight: refuse to start on Node versions known to break @qdrant/js-client-rest.
-// The qdrant client bundles its own undici ^6 and constructs an undici.Agent it passes to
-// Node's built-in fetch() as init.dispatcher. On Node 26+ the built-in fetch is undici 8,
-// whose request handler renamed the legacy `onError` hook to `onResponseError`. qdrant's
-// bundled undici 6 Agent still validates that handler for a function `onError`, does not
-// find one, and throws `UND_ERR_INVALID_ARG: invalid onError method` on the first qdrant
-// call. (It is qdrant's old undici rejecting Node 26's new handler, not Node rejecting the
-// v6 Agent.)
+// Pre-flight: refuse to start on the PAIR known to break — Node 26+ with
+// @qdrant/js-client-rest older than 1.19. Those clients bundle undici 6, whose Agent
+// (handed to Node's built-in fetch as init.dispatcher) fails Node 26's undici-8 handler
+// validation, so every qdrant call dies with `UND_ERR_INVALID_ARG: invalid onError
+// method`. Upstream fixed this in client 1.19 by moving to undici 7
+// (https://github.com/qdrant/qdrant-js/issues/134), verified working on Node 26 against a
+// live Qdrant, so Node 26+ with client >= 1.19 starts normally; a fresh install resolves
+// a >= 1.19 client on Node 26 and never sees this refusal. The refusal remains for stale
+// installs (an old lockfile pinning a pre-1.19 client) and for an undeterminable client
+// version, where booting would trade this message for the opaque undici error later.
 //
 // This runtime guard is deliberately the ONLY gate. Do NOT add an upper bound to
 // `engines.node` in package.json. An upper bound is actively harmful here: a bare
 // `npx socraticode` install resolves a version range, and npm engine-filters that range,
 // so a `<26.0.0` bound makes Node 26 silently resolve to the newest version *below* the
 // bound (which predates this guard) and boot into the broken client instead of refusing.
-// With no upper bound, Node 26 installs the guarded version and hits this loud exit.
 //
 // (Imports below are evaluated before this check per ESM semantics, but qdrant-js's
 // module-init is side-effect-light: only an actual request triggers the undici path, so
 // exiting here is enough to spare users the opaque error later.)
-// Tracked upstream: https://github.com/qdrant/qdrant-js/issues/134 (PRs #123, #128).
-// Remove or relax this check when qdrant-js supports the undici bundled in Node 26+.
 const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
-if (Number.isFinite(nodeMajor) && nodeMajor >= 26) {
+const installedClient = readInstalledQdrantClientVersion();
+if (qdrantClientBreaksOnThisNode(nodeMajor, installedClient)) {
   // fs.writeSync(2, …) is the canonical Node idiom for "print fatal error then die":
   // blocking (no truncation when stderr is piped — every MCP host pipes stderr) and
   // synchronous (so process.exit(1) runs before any further top-level code).
   const msg =
-    `socraticode: Node ${process.versions.node} is not supported.\n` +
-    "  @qdrant/js-client-rest is incompatible with the undici bundled in Node 26+.\n" +
-    "  Use Node 22.x (via nvm: `nvm install 22 && nvm use 22`, or `brew install node@22` on macOS).\n" +
+    `socraticode: Node ${process.versions.node} needs @qdrant/js-client-rest 1.19 or newer ` +
+    `(installed: ${installedClient ?? "undeterminable"}).\n` +
+    "  Clients before 1.19 bundle an undici incompatible with Node 26+.\n" +
+    "  Reinstall socraticode (or update its lockfile) to pick up a current client,\n" +
+    "  or use Node 22.x (via nvm: `nvm install 22 && nvm use 22`).\n" +
     "  See https://github.com/qdrant/qdrant-js/issues/134.\n";
   writeSync(2, msg);
   process.exit(1);
@@ -43,6 +45,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { EXTENSION_LANGUAGE_MAP_INVALID, SOCRATICODE_VERSION } from "./constants.js";
 import { logger, setMcpLogSender } from "./services/logger.js";
+import {
+  qdrantClientBreaksOnThisNode,
+  readInstalledQdrantClientVersion,
+} from "./services/qdrant-client-compat.js";
 import { autoResumeIndexedProjects, gracefulShutdown } from "./services/startup.js";
 import { handleContextTool } from "./tools/context-tools.js";
 import { handleGraphTool } from "./tools/graph-tools.js";
