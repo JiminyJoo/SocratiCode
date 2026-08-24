@@ -913,7 +913,7 @@ Once connected, 21 tools are available to your AI assistant:
 | `codebase_graph_stats` | Get graph statistics (most connected files, orphans, language breakdown) |
 | `codebase_graph_circular` | Detect circular dependencies |
 | `codebase_graph_visualize` | Generate a Mermaid diagram (`mode=mermaid`, default) or an interactive HTML explorer (`mode=interactive`) of the dependency graph. Interactive mode writes a self-contained page (vendored Cytoscape.js + Dagre, works offline) and opens it in your default browser — file + symbol views, blast-radius overlay, live search, PNG export. |
-| `codebase_graph_status` | Check graph build progress or persisted graph metadata |
+| `codebase_graph_status` | Check graph build progress or persisted graph metadata (advises when few captured imports resolved, so a near-empty graph is not read as a healthy one) |
 | `codebase_graph_remove` | Remove a project's persisted code graph (waits for in-flight graph build to finish first) |
 
 #### Impact Analysis (symbol-level call graph)
@@ -969,6 +969,8 @@ SocratiCode supports languages at three levels:
 JavaScript, TypeScript, TSX, Python, Java, Kotlin, Scala, C, C++, C#, Go, Rust, Ruby, PHP, Swift, Dart, Bash/Shell, HTML, CSS/SCSS, Svelte, Vue
 
 Svelte and Vue: imports extracted from `<script>` blocks (re-parsed as TypeScript) and CSS `@import`/`@require` from `<style>` blocks (any combination of `lang`, `scoped`, `module`, `global` attributes). Path aliases from `tsconfig.json`/`jsconfig.json` `compilerOptions.paths` are resolved (including `extends` chains). SCSS partial resolution (`_` prefix convention) is supported.
+
+Python: absolute imports resolve through the import roots implied by the project's `pyproject.toml` files — root and nested, so uv workspaces get cross-package edges — covering both the `src/` layout (`packages/<dist>/src/<module>/…`, what `uv init --lib`, hatchling and setuptools generate) and the flat layout beside each manifest, including PEP 420 namespace packages and single-module distributions. A manifest applies to a file only when it sits on that file's ancestor path or an ancestor manifest declares it a `[tool.uv.workspace]` member, so a sample app, docs project or checked-in sdist carrying its own manifest does not become an import root for unrelated code; only `[tool.uv.workspace]` is read, so poetry, pdm and hatch path-dependency monorepos get ancestor-path scoping and no cross-package edges; applicable roots are tried nearest first, so a package resolves its own modules before a sibling's. Relative imports and the project-root `src/`/`lib/` and sibling-flat conventions are unchanged — the sibling-flat fallback still takes precedence over these roots, matching CPython, which puts the script's own directory at `sys.path[0]`.
 
 Dart: symbols (classes, mixins, enums, extensions, typedefs, functions, getters, setters, operators, constructors including named and factory, and abstract/bodyless members), call sites (method calls, cascades, constructor invocations), `main()` entry-point detection, and AST chunking are all tree-sitter based; import/export/part edges are extracted via regex. Intra-project `package:` imports (the Flutter convention) resolve through the project's `pubspec.yaml` files — root and nested, so pub-workspace/melos monorepos get cross-package edges — via pub's `package:<name>/<rest>` → `<package_root>/lib/<rest>` mapping; `dart:` and unknown package names stay external. The bundled grammar (`@ast-grep/lang-dart`) predates Dart 3 class modifiers (`sealed`/`base`/`interface`/`final`/`mixin class`) and `extension type`: declarations using those are skipped (with a one-time warning logged) until the upstream grammar is updated, while the rest of each file still indexes normally.
 
@@ -1488,7 +1490,7 @@ Copyright (C) 2026 Giancarlo Erra - Altaire Limited.
 ### Third-Party Licenses
 
 SocratiCode includes open-source dependencies under their own licenses
-(MIT, Apache 2.0, ISC). See [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES) for details.
+(MIT, Apache 2.0, ISC, BSD 3-Clause). See [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES) for details.
 
 ### Contributing
 

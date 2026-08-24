@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import { type Dirent, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { parse as parseToml, type TomlTable, type TomlValue } from "smol-toml";
 import { toForwardSlash } from "../constants.js";
 import type { PathAliases } from "./graph-aliases.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
@@ -560,6 +561,409 @@ export function buildDartPackageMap(projectPath: string): Map<string, string> {
 }
 
 /**
+ * Discover every `pyproject.toml` under `projectPath`, project-relative and
+ * forward-slash-normalized.
+ *
+ * `pyproject.toml` is not a graphable file (no AST grammar, not an extra
+ * extension), so it is never in the set returned by `getGraphableFiles` —
+ * this walk is independent of that set, exactly like {@link findGoModFiles}
+ * (the fileSet-scan trap from issue #82 applies here identically). The same
+ * ignore filter (`createIgnoreFilter` / `shouldIgnore`) `getGraphableFiles`
+ * uses is applied, with the same trailing-slash convention for directories,
+ * so a manifest under `node_modules/`, `.git/`, or a gitignored path is
+ * skipped.
+ *
+ * `site-packages/` and `dist-packages/` are additionally skipped
+ * unconditionally. Every installed third-party distribution ships its own
+ * `pyproject.toml` in one of them, and each would register an import root
+ * over vendored code that shadows the project's own modules.
+ * DEFAULT_IGNORE_PATTERNS covers the common virtualenv directory names
+ * (`.venv`, `venv`, `env`), but an environment named anything else
+ * (`.venv312`, `myenv`) or a `.socraticodeignore` negation re-including one
+ * lands the walk straight in `lib/pythonX.Y/site-packages`. `dist-packages`
+ * is the same directory under Debian and Ubuntu's system Python.
+ */
+function findPyProjectManifests(projectPath: string): string[] {
+  const ig = createIgnoreFilter(projectPath);
+  const results: string[] = [];
+  const walk = (dir: string): void => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const relPath = toForwardSlash(path.relative(projectPath, path.join(dir, entry.name)));
+      if (shouldIgnore(ig, entry.isDirectory() ? `${relPath}/` : relPath)) continue;
+      if (entry.isDirectory()) {
+        if (entry.name === "site-packages" || entry.name === "dist-packages") continue;
+        walk(path.join(dir, entry.name));
+      } else if (entry.name === "pyproject.toml") {
+        // Mirrors findGoModFiles: readdirSync Dirents do not follow symlinks,
+        // so a symlinked manifest reports isFile()===false and would be missed.
+        // uv workspaces symlink member manifests in some layouts.
+        let isFile = entry.isFile();
+        if (!isFile && entry.isSymbolicLink()) {
+          try {
+            isFile = statSync(path.join(dir, entry.name)).isFile();
+          } catch {
+            continue;
+          }
+        }
+        if (isFile) results.push(relPath);
+      }
+    }
+  };
+  walk(projectPath);
+  return results.sort();
+}
+
+/**
+ * One `pyproject.toml` found in the tree: where it sits, the import roots it
+ * implies, and the sibling packages it declares importable.
+ */
+export interface PythonManifest {
+  /** Project-relative directory holding the manifest; `"."` at the root. */
+  dir: string;
+  /** Import roots it implies: its own directory and its `src/`. */
+  roots: string[];
+  /**
+   * Project-relative directories of the workspace members it declares,
+   * resolved against the manifests actually discovered. Empty for a manifest
+   * with no `[tool.uv.workspace]` section.
+   */
+  members: string[];
+}
+
+/**
+ * Discover every `pyproject.toml` in the tree and record, for each, the import
+ * roots it implies and the workspace members it declares.
+ *
+ * A packaged Python project puts its importable modules under the manifest's
+ * directory in one of two layouts: `src/` (what `uv init --lib`, hatchling
+ * and setuptools all generate) or flat, directly beside the manifest. Neither
+ * is derivable from the import itself. `from usa_wa_adapter_sos.house import
+ * build` names no directory that appears in
+ * `packages/usa-wa-adapter-sos/src/usa_wa_adapter_sos/house/build.py`: the
+ * distribution directory is dashed, the module is underscored, and `src/`
+ * sits between them. The resolver's existing project-root `src/`+`lib/` probe
+ * only reaches a single-package repo, so in a workspace every cross-package
+ * import — and every package's own absolute self-import — resolved to null
+ * (issue #107). A 362-file uv workspace built 3 edges.
+ *
+ * Both roots are recorded per manifest without probing the filesystem for
+ * which layout is in use: a root that does not exist holds no files, so it
+ * matches nothing, and the check would cost a `stat` per manifest to remove
+ * lookups that already miss.
+ *
+ * Roots are recorded rather than module names enumerated under them. Names
+ * would have to come from the directories actually present — a distribution
+ * name and its import name are not reliably related (Pillow imports as `PIL`),
+ * so `[project] name` cannot supply them — and enumerating directories alone
+ * would miss single-module distributions, where `src/mymodule.py` is the whole
+ * importable surface and no directory bears the module's name. Trying each
+ * root in turn covers both, and covers PEP 420 namespace packages (no
+ * `__init__.py`) for free, since it never asks what a directory contains.
+ *
+ * The only part of a manifest that is read is its `[tool.uv.workspace]`
+ * member list, which {@link pythonRootsForFile} needs to tell a sibling
+ * package apart from an unrelated project that merely carries a manifest.
+ *
+ * Sorted by directory so that when two manifests contribute a root holding the
+ * same top-level module name, the same one wins on every machine.
+ *
+ * Call this once per graph build and pass each file's scoped roots (see
+ * {@link pythonRootsForFile}) to resolveImport.
+ */
+export function buildPythonManifests(projectPath: string): PythonManifest[] {
+  const root = path.resolve(projectPath);
+  const relManifests = findPyProjectManifests(root);
+  const dirs = relManifests.map((m) => toForwardSlash(path.dirname(m))); // "." at the root
+
+  return relManifests.map((relManifest, i) => {
+    const dir = dirs[i];
+    let source = "";
+    try {
+      source = readFileSync(path.join(root, relManifest), "utf8");
+    } catch {
+      // Unreadable manifest still contributes its roots; it just declares no
+      // members, so it scopes to its own subtree.
+    }
+    return {
+      dir,
+      roots: [dir, dir === "." ? "src" : `${dir}/src`],
+      members: declaredWorkspaceMembers(source, dir, dirs),
+    };
+  });
+}
+
+/**
+ * A parsed TOML table as this reader consumes it. {@link TomlTable} has no
+ * undefined member, but reading a key a manifest does not carry yields one, and
+ * that is precisely what the checks around every lookup are checking for — so
+ * the type has to be able to say it.
+ */
+type ReadTable = Record<string, TomlValue | undefined>;
+
+/**
+ * The `[tool.uv.workspace]` table of one manifest, or null when the document
+ * declares none — including when it cannot be parsed at all.
+ *
+ * Reading this by pattern-matching was a losing position. The cases that kept
+ * surfacing were not edges but the lexer: a `# """` comment masking a valid
+ * table, and `members = ["a" "b"]` inventing a member out of a document uv
+ * rejects outright. Tracking comment and string state is the first thing a TOML
+ * parser does and the last thing a scanner can bolt on, and under the
+ * narrow-never-widen invariant every remaining gap had to be paid for by
+ * voiding — real edges lost in manifests that were perfectly valid.
+ *
+ * Parsing settles the lexing, and the walk below covers every legal spelling of
+ * the same declaration for free: `[ tool.uv.workspace ]`, a `[tool.uv]` table
+ * carrying `workspace = { members = [...] }`, and a top-level
+ * `tool.uv.workspace.members` dotted key all arrive as the same nested tables.
+ * Each is ordinary TOML that a user can write today, that uv reads as a
+ * workspace, and that the previous reader silently found no members in — the
+ * same failure shape as issue #107 itself.
+ *
+ * A malformed manifest declares nothing rather than failing the build: one
+ * unparseable `pyproject.toml` anywhere in the tree must not cost the whole
+ * project its Python edges, which is why an unreadable file is skipped in
+ * {@link buildPythonManifests} too.
+ *
+ * A leading byte-order mark is stripped first. Both this parser and `tomllib`
+ * reject one, since the TOML grammar has no place for it, but uv's parser skips
+ * it and locks the workspace normally — so without stripping, a manifest saved
+ * with a BOM would lose every member it declares. uv's behaviour is the one
+ * being modelled.
+ */
+function workspaceTable(source: string): ReadTable | null {
+  let cursor: TomlValue | undefined;
+  try {
+    cursor = parseToml(source.replace(/^\uFEFF/, ""));
+  } catch {
+    return null;
+  }
+  // A missing key yields undefined, which the next step rejects, so one check
+  // per step covers both a key that is absent and a value that cannot hold one.
+  //
+  // These lookups read through the prototype chain, since the parser returns
+  // plain objects rather than null-prototype ones. None of the five names this
+  // reader asks for — tool, uv, workspace, members, exclude — exists on
+  // Object.prototype, so no manifest can reach an inherited value, and an
+  // own-key check ahead of each one could never change an outcome.
+  for (const key of ["tool", "uv", "workspace"]) {
+    if (!isTable(cursor)) return null;
+    const table: ReadTable = cursor;
+    cursor = table[key];
+  }
+  return isTable(cursor) ? cursor : null;
+}
+
+/**
+ * Whether a parsed value can be looked up by key. A TOML date parses to an
+ * object and passes this too, but no key can be found under one, so it reaches
+ * the same void as any other undeclared workspace.
+ */
+function isTable(value: TomlValue | undefined): value is TomlTable {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * One `members`/`exclude` value as patterns this reader can apply, or null when
+ * it cannot apply them faithfully — the caller's signal to void.
+ *
+ * Null covers three shapes that mean the same thing here: the key is absent, it
+ * holds something other than an array of strings, or an entry uses glob syntax
+ * beyond the `*` and `**` translated below. The caller separates out an absent
+ * `exclude` before asking, since that is an ordinary manifest excluding
+ * nothing rather than an unreadable one.
+ */
+function patternList(value: TomlValue | undefined): string[] | null {
+  // A type predicate rather than a cast, so the narrowing is proven by the same
+  // check that guards it — the invariant rests on this one holding.
+  if (!Array.isArray(value) || !value.every((entry): entry is string => typeof entry === "string")) {
+    return null;
+  }
+  return value.some(usesUnsupportedGlob) ? null : value;
+}
+
+/**
+ * Whether a member pattern uses glob syntax beyond the `*` and `**` this
+ * reader translates. uv matches with a full globset, so a character class,
+ * a `?`, a brace alternation or an escape selects a different set than a
+ * literal reading of the same text would.
+ *
+ * The pattern examined here is the parsed value, so a TOML escape sequence has
+ * already been resolved: `"packages/a\\b"` arrives carrying one backslash,
+ * which globset reads as an escape and this check rejects.
+ */
+function usesUnsupportedGlob(pattern: string): boolean {
+  return /[?[\]{}\\]/.test(pattern);
+}
+
+/**
+ * Project-relative directories of the `[tool.uv.workspace]` members a manifest
+ * declares, selected from `allManifestDirs` — a member glob only matters here
+ * when a real manifest sits at the path it names.
+ *
+ * uv member entries are globs relative to the declaring manifest
+ * (`members = ["packages/*"]`), with an optional `exclude` list of the same
+ * shape. Only `*` and `**` are translated, and a lone `*` does not mean the
+ * same thing in the two lists — see the note beside the translation below.
+ *
+ * The document is parsed rather than scanned (see {@link workspaceTable}), so
+ * a `members` key belonging to some other tool is a different key rather than
+ * nearby text, and only glob translation is left to approximate.
+ *
+ * **The invariant is that this reader may narrow what a manifest declares,
+ * never widen it**, and the whole section is voided the moment it meets
+ * anything it cannot represent exactly: an unparseable document, a `members`
+ * or `exclude` value that is not an array of strings, or glob syntax beyond
+ * `*` and `**`. Voiding falls back to ancestor-path scoping, which resolves
+ * strictly fewer imports.
+ *
+ * The invariant has to hold for `exclude` as well as `members`, and that is
+ * why approximating is not enough. Dropping a member costs an edge that
+ * should have resolved. Dropping an *exclusion* admits a package the manifest
+ * explicitly excludes, and draws a cross-package edge uv would not — the
+ * reader inventing a declaration rather than missing one. An earlier revision
+ * stripped comments before reading the array, which truncated
+ * `exclude = ["packages/#legacy", "packages/legacy"]` at the `#` and lost the
+ * real exclusion behind it.
+ *
+ * A `#` inside a string is not itself a problem and is read as the literal
+ * path character it is: `exclude = ["packages/#legacy"]` names a directory
+ * that does not exist, matches nothing, and leaves `legacy` a member, which
+ * is what uv does with the same bytes.
+ */
+function declaredWorkspaceMembers(
+  source: string,
+  manifestDir: string,
+  allManifestDirs: string[],
+): string[] {
+  const workspace = workspaceTable(source);
+  if (workspace === null) return [];
+
+  const memberPatterns = patternList(workspace.members);
+  if (memberPatterns === null) return [];
+  // An absent `exclude` is an ordinary manifest excluding nothing. One that is
+  // present and unreadable voids alongside `members`, since ignoring it would
+  // admit exactly the package the manifest set out to keep out. TOML has no
+  // null, so an undefined value here can only mean the key is absent.
+  const excludePatterns = workspace.exclude === undefined ? [] : patternList(workspace.exclude);
+  if (excludePatterns === null) return [];
+
+  // Split on the wildcards first and quote only the literal spans between
+  // them, so every other regex metacharacter matches itself. `**` always
+  // spans separators; what a lone `*` spans is `singleStar`, and the two
+  // sides of the declaration do not agree on it. Naming both spellings in the
+  // type rejects a fragment that is neither — a `".+"` or a `"[^/]"` that
+  // would quietly change what every pattern matches. It does not stop the two
+  // being transposed, since each is valid at either call site; the tests that
+  // assert each side separately are what pin that.
+  const toRe = (pattern: string, singleStar: "[^/]*" | ".*"): RegExp => {
+    const quote = (literal: string) => literal.replace(/[.+^${}()|[\]\\?*]/g, "\\$&");
+    const body = pattern
+      .split("**")
+      .map((span) => span.split("*").map(quote).join(singleStar))
+      .join(".*");
+    return new RegExp(`^${body}$`);
+  };
+  const prefix = manifestDir === "." ? "" : `${manifestDir}/`;
+  const relativeToManifest = (dir: string): string | null => {
+    if (!prefix) return dir;
+    return dir.startsWith(prefix) ? dir.slice(prefix.length) : null;
+  };
+
+  // uv expands `members` by globbing the filesystem, where a lone `*` selects
+  // one path segment, and matches `exclude` as a pattern against the member's
+  // whole path, where it does not stop at a separator. Two code paths, two
+  // meanings for the same character: `members = ["packages/*"]` leaves
+  // `packages/alpha/inner` out, while `exclude = ["*legacy"]` takes
+  // `packages/legacy` and `exclude = ["*"]` empties the workspace.
+  //
+  // Checked on uv 0.10.0 and 0.11.8, which agree on every one of these, so
+  // this is uv's model rather than one release's behaviour.
+  //
+  // The asymmetry has to be honoured because the invariant is not symmetric.
+  // A narrow `*` on the include side registers fewer roots than uv, which
+  // costs at most an edge. A narrow `*` on the exclude side fails to exclude,
+  // which admits a package the manifest named and draws an edge uv would not.
+  const included = memberPatterns.map((p) => toRe(p.replace(/\/+$/, ""), "[^/]*"));
+  if (included.length === 0) return [];
+  const excluded = excludePatterns.map((p) => toRe(p.replace(/\/+$/, ""), ".*"));
+
+  return allManifestDirs.filter((dir) => {
+    if (dir === manifestDir) return false;
+    const rel = relativeToManifest(dir);
+    if (rel === null) return false;
+    return included.some((re) => re.test(rel)) && !excluded.some((re) => re.test(rel));
+  });
+}
+
+/**
+ * The import roots that apply to one source file, nearest first.
+ *
+ * Two rules, each fixing a way a flat list of every root in the tree resolves
+ * an import to the wrong file:
+ *
+ * **Scope.** A manifest applies to a file only when it sits on the file's
+ * ancestor path, or when an ancestor manifest declares it as a workspace
+ * member. A repo's `examples/demo/pyproject.toml`, a checked-in `third_party/`
+ * sdist and an editable checkout inside an environment directory all carry
+ * manifests while sitting on no `sys.path` the file could import through;
+ * without this rule each one registers roots globally and turns an import that
+ * correctly resolved to nothing into a fabricated edge. Workspace members are
+ * the exception because that is exactly what a member declaration states: the
+ * sibling package IS importable from here, and resolving cross-package imports
+ * is what issue #107 is about.
+ *
+ * **Order.** Roots containing the file come first, deepest first, so a package
+ * resolves its own modules before a sibling's. Without this, a per-service
+ * monorepo of flat `uv init --app` services — each with its own `config.py` —
+ * resolved `import config` to whichever service sorted first alphabetically,
+ * drawing a confident edge into another service's file. Remaining in-scope
+ * roots follow lexicographically: they are the cross-package candidates, where
+ * nothing about the import says which package was meant, so the tie is broken
+ * the same way on every machine rather than left to walk order.
+ *
+ * `relSourceDir` is the file's directory, project-relative and
+ * forward-slashed, `"."` for a file at the root.
+ */
+export function pythonRootsForFile(
+  manifests: PythonManifest[],
+  relSourceDir: string,
+): string[] {
+  const isAncestorOf = (dir: string, target: string): boolean =>
+    dir === "." || dir === target || target.startsWith(`${dir}/`);
+
+  const ancestors = manifests.filter((m) => isAncestorOf(m.dir, relSourceDir));
+  const inScope = new Set(ancestors.map((m) => m.dir));
+  for (const m of ancestors) {
+    for (const member of m.members) inScope.add(member);
+  }
+
+  const roots: string[] = [];
+  for (const m of manifests) {
+    if (inScope.has(m.dir)) roots.push(...m.roots);
+  }
+
+  const contains = (root: string): boolean =>
+    root === "." || relSourceDir === root || relSourceDir.startsWith(`${root}/`);
+
+  return [...new Set(roots)].sort((a, b) => {
+    const aContains = contains(a);
+    const bContains = contains(b);
+    if (aContains !== bContains) return aContains ? -1 : 1;
+    // Deepest containing root first; "." is the shallowest and sorts last
+    // among them, so a package's own root outranks the project root.
+    if (aContains) return b.length - a.length || a.localeCompare(b);
+    return a.localeCompare(b);
+  });
+}
+
+/**
  * Resolve a module specifier to a relative file path within the project.
  * Returns null if the module is external (e.g., npm package, stdlib).
  *
@@ -582,6 +986,7 @@ export function resolveImport(
   goModuleInfo?: GoModuleInfo[] | null,
   phpPsr4Map?: Map<string, string[]>,
   dartPackageMap?: Map<string, string>,
+  pythonImportRoots?: string[],
 ): string | null {
   // Skip obvious external/stdlib modules. Go is excluded from this
   // pre-check because its external classifier in `isExternalModule`
@@ -651,13 +1056,34 @@ export function resolveImport(
       // where each top-level directory is a runnable Python application root
       // and `import config` from `service-a/main.py` means
       // `service-a/config.py` because the file is run via `python main.py`
-      // from inside its own directory. Tried last to preserve existing
-      // project-root precedence: any layout that already resolved before
-      // this PR continues to resolve to the same file. resolveRelativePath
-      // also handles the `<sourceDir>/<module>/__init__.py` package case
-      // via its built-in Python init fallback.
+      // from inside its own directory. resolveRelativePath also handles the
+      // `<sourceDir>/<module>/__init__.py` package case via its built-in
+      // Python init fallback.
+      //
+      // Ahead of the manifest-declared roots below, which is what CPython
+      // does: sys.path[0] is the script's own directory, ahead of every
+      // installed-distribution entry, so where a sibling file and a package
+      // root both offer the module, the sibling is what actually gets
+      // imported.
       const sibling = resolveRelativePath(modulePath, sourceDir, projectPath, fileSet, [".py"]);
       if (sibling) return sibling;
+
+      // Manifest-declared import roots (issue #107), nearest first. The probes
+      // above reach `src/` and `lib/` at the project root and the importing
+      // file's own directory; neither reaches `<package>/src/`, where a
+      // workspace puts each package's modules, so cross-package imports and a
+      // package's own absolute self-imports resolved to nothing.
+      //
+      // The list is already scoped to this file and ordered by proximity by
+      // pythonRootsForFile — a root that is not on the file's ancestor path
+      // and not a declared workspace member never appears here, and a package's
+      // own root is tried before a sibling package's.
+      for (const importRoot of pythonImportRoots ?? []) {
+        const inRoot = resolveRelativePath(
+          path.posix.join(importRoot, modulePath), projectPath, projectPath, fileSet, [".py"],
+        );
+        if (inRoot) return inRoot;
+      }
 
       return null;
     }

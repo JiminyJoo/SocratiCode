@@ -14,7 +14,7 @@ import type {
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
-import { buildCsNamespaceMap, buildDartPackageMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpPsr4Map, resolveImport } from "./graph-resolution.js";
+import { buildCsNamespaceMap, buildDartPackageMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpPsr4Map, buildPythonManifests, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
 import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
@@ -39,7 +39,7 @@ import {
 } from "./symbol-graph-store.js";
 
 // Re-export analysis functions for external consumers
-export { findCircularDependencies, generateMermaidDiagram, getFileDependencies, getGraphStats } from "./graph-analysis.js";
+export { findCircularDependencies, generateMermaidDiagram, getFileDependencies, getGraphStats, isImportResolutionLow } from "./graph-analysis.js";
 
 // createRequire needed to load native addon packages in ESM
 const esmRequire = createRequire(import.meta.url);
@@ -446,6 +446,9 @@ export async function getGraphStatus(projectPath: string): Promise<{
   lastBuiltAt: string;
   nodeCount: number;
   edgeCount: number;
+  /** Import specifiers captured across all files, resolved or not. Absent on
+   * graphs persisted before this field was recorded. */
+  importCount?: number;
   cached: boolean;
   symbol?: {
     fileCount: number;
@@ -488,6 +491,7 @@ export async function getGraphStatus(projectPath: string): Promise<{
     lastBuiltAt: meta.lastBuiltAt,
     nodeCount: meta.nodeCount,
     edgeCount: meta.edgeCount,
+    importCount: meta.importCount,
     cached: graphCache.has(resolved),
     symbol,
   };
@@ -825,6 +829,33 @@ export async function buildCodeGraph(
   const hasDart = files.some((f) => path.extname(f).toLowerCase() === ".dart");
   const dartPackageMap = hasDart ? buildDartPackageMap(resolvedPath) : undefined;
 
+  // Record the import roots every pyproject.toml in the tree implies, plus the
+  // workspace members each declares (discovered by walking, like go.mod and
+  // pubspec.yaml — pyproject.toml is never in the graphable file set). A
+  // workspace package's modules live under its own `src/`, which the
+  // resolver's project-root probe cannot reach, so without these roots every
+  // cross-package import — and every package's own absolute self-import —
+  // resolved to null and the file graph came out all but empty (issue #107).
+  // An empty list keeps the resolver's old behavior exactly.
+  const hasPython = files.some(
+    (f) => getLanguageFromExtension(path.extname(f).toLowerCase()) === "python",
+  );
+  const pythonManifests = hasPython ? buildPythonManifests(resolvedPath) : [];
+  // Which roots apply, and in what order, depends on where the importing file
+  // sits, so it is resolved per directory rather than once for the project —
+  // cached because a package directory typically holds many files.
+  const pythonRootsByDir = new Map<string, string[]>();
+  const pythonRootsFor = (relPath: string): string[] | undefined => {
+    if (pythonManifests.length === 0) return undefined;
+    const dir = toForwardSlash(path.dirname(relPath));
+    let roots = pythonRootsByDir.get(dir);
+    if (!roots) {
+      roots = pythonRootsForFile(pythonManifests, dir);
+      pythonRootsByDir.set(dir, roots);
+    }
+    return roots;
+  };
+
   for (const relPath of files) {
     let ext = path.extname(relPath).toLowerCase();
     let lang = getAstGrepLang(ext);
@@ -945,7 +976,7 @@ export async function buildCodeGraph(
       // Try to resolve to a project file
       // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
       const resolutionLanguage = imp.isCssImport ? "css" : language;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap);
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath));
       if (resolved) {
         node.dependencies.push(resolved);
 

@@ -10,7 +10,10 @@ import {
   buildDartPackageMap,
   buildGoModuleInfo,
   buildJvmSuffixMap,
+  buildPythonManifests,
   hasLiteralShellPathShape,
+  type PythonManifest,
+  pythonRootsForFile,
   resolveImport,
 } from "../../src/services/graph-resolution.js";
 
@@ -367,6 +370,929 @@ describe("graph-resolution", () => {
       );
 
       expect(result).toBeNull();
+    });
+  });
+
+  // ── Python manifest-declared import roots (#107) ──────────────────────
+
+  describe("Python src-layout resolution (#107)", () => {
+    // `uv init --lib`, hatchling and setuptools all generate
+    // `<package>/src/<module>/`, so in a workspace every cross-package import
+    // — and every package's own absolute self-import — named a path the
+    // project-root `src/`+`lib/` probe could not reach. A 362-file uv
+    // workspace built 3 edges. These tests pin the mechanism the fix rests
+    // on: the roots the pyproject.toml manifests declare, scoped to the
+    // importing file and tried nearest first.
+
+    const pyResolve = (spec: string, from: string, p: TempProject) => {
+      const manifests = buildPythonManifests(p.root);
+      const roots = pythonRootsForFile(manifests, path.posix.dirname(from));
+      return resolveImport(
+        spec,
+        path.join(p.root, from),
+        p.root,
+        p.fileSet,
+        "python",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        roots,
+      );
+    };
+
+    // The reporter's layout: dashed distribution directory, intervening src/,
+    // underscored module name — a three-way mismatch no name-shaped guess
+    // can bridge. The root manifest declares the members, which is what puts
+    // one package's roots in scope for another's files.
+    const workspace = {
+      "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+      "packages/adapter-legislature/pyproject.toml": '[project]\nname = "adapter-legislature"\n',
+      "packages/adapter-legislature/src/adapter_legislature/tenure_spans.py": "",
+      "packages/adapter-sos/pyproject.toml": '[project]\nname = "adapter-sos"\n',
+      "packages/adapter-sos/src/adapter_sos/house/build.py": "",
+      "packages/adapter-sos/src/adapter_sos/db.py": "",
+    };
+
+    it("resolves a cross-package import through a nested src/ root", () => {
+      project = createTempProject(workspace);
+
+      const result = pyResolve(
+        "adapter_legislature.tenure_spans",
+        "packages/adapter-sos/src/adapter_sos/house/build.py",
+        project,
+      );
+
+      expect(result).toBe(
+        "packages/adapter-legislature/src/adapter_legislature/tenure_spans.py",
+      );
+    });
+
+    it("resolves a package's own absolute self-import", () => {
+      // Confirmed broken on main too: a package could not even import itself
+      // by its absolute module name, only relatively.
+      project = createTempProject(workspace);
+
+      const result = pyResolve(
+        "adapter_sos.db",
+        "packages/adapter-sos/src/adapter_sos/house/build.py",
+        project,
+      );
+
+      expect(result).toBe("packages/adapter-sos/src/adapter_sos/db.py");
+    });
+
+    it("resolves a single-module distribution with no package directory", () => {
+      // The load-bearing case for registering ROOTS rather than enumerating
+      // the module names under them: `src/solo_mod.py` is the whole importable
+      // surface and no directory bears the module's name, so a name
+      // enumeration would never see it.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/solo/pyproject.toml": '[project]\nname = "solo"\n',
+        "packages/solo/src/solo_mod.py": "",
+        "app/main.py": "",
+      });
+
+      expect(pyResolve("solo_mod", "app/main.py", project)).toBe(
+        "packages/solo/src/solo_mod.py",
+      );
+    });
+
+    it("resolves a PEP 420 namespace package with no __init__.py", () => {
+      // Registering roots asks nothing about what a directory contains, so
+      // implicit namespace packages resolve without a special case.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/ns-pkg/pyproject.toml": '[project]\nname = "ns-pkg"\n',
+        "packages/ns-pkg/src/acme/plugins/loader.py": "",
+        "app/main.py": "",
+      });
+
+      expect(pyResolve("acme.plugins.loader", "app/main.py", project)).toBe(
+        "packages/ns-pkg/src/acme/plugins/loader.py",
+      );
+    });
+
+    it("resolves a flat-layout package beside its own manifest", () => {
+      // Not every packaged project uses src/; the manifest directory itself
+      // is an import root in the flat layout.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/flatpkg/pyproject.toml": '[project]\nname = "flatpkg"\n',
+        "packages/flatpkg/flat_mod/thing.py": "",
+        "app/main.py": "",
+      });
+
+      expect(pyResolve("flat_mod.thing", "app/main.py", project)).toBe(
+        "packages/flatpkg/flat_mod/thing.py",
+      );
+    });
+
+    it("resolves a package import to __init__.py under a nested root", () => {
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/adapter-sos/pyproject.toml": '[project]\nname = "adapter-sos"\n',
+        "packages/adapter-sos/src/adapter_sos/__init__.py": "",
+        "app/main.py": "",
+      });
+
+      expect(pyResolve("adapter_sos", "app/main.py", project)).toBe(
+        "packages/adapter-sos/src/adapter_sos/__init__.py",
+      );
+    });
+
+    it("returns null for a module absent from every declared root", () => {
+      // Third-party imports must stay unresolved rather than be guessed into
+      // the project tree.
+      project = createTempProject(workspace);
+
+      expect(
+        pyResolve("requests.adapters", "packages/adapter-sos/src/adapter_sos/db.py", project),
+      ).toBeNull();
+    });
+
+    it("returns null for a src-layout import when no roots are passed", () => {
+      // Back-compat pin: every pre-#107 caller omits the list, and that
+      // omission must reproduce the old behavior exactly rather than
+      // half-resolving through some default.
+      project = createTempProject(workspace);
+
+      const result = resolveImport(
+        "adapter_legislature.tenure_spans",
+        path.join(project.root, "packages/adapter-sos/src/adapter_sos/house/build.py"),
+        project.root,
+        project.fileSet,
+        "python",
+      );
+
+      expect(result).toBeNull();
+    });
+
+    it("preserves project-root precedence over a manifest root", () => {
+      // Backward-compat guarantee, mirroring the #46 pin above: a layout that
+      // already resolved to the project-root file still resolves to it.
+      project = createTempProject({
+        "config.py": "",
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-a/src/config.py": "",
+        "packages/pkg-a/src/pkg_a/main.py": "",
+      });
+
+      expect(pyResolve("config", "packages/pkg-a/src/pkg_a/main.py", project)).toBe("config.py");
+    });
+
+    it("prefers the sibling-flat guess over a manifest root", () => {
+      // CPython puts the script's own directory at sys.path[0], ahead of every
+      // installed-distribution entry, so where a sibling file and a package
+      // root both offer the module, the sibling is what actually gets
+      // imported. Both match here; the sibling wins.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-a/src/shared/utils.py": "",
+        "packages/pkg-a/src/pkg_a/main.py": "",
+        "packages/pkg-a/src/pkg_a/shared/utils.py": "",
+      });
+
+      expect(pyResolve("shared.utils", "packages/pkg-a/src/pkg_a/main.py", project)).toBe(
+        "packages/pkg-a/src/pkg_a/shared/utils.py",
+      );
+    });
+
+    it("keeps each service's flat modules local in a per-service monorepo", () => {
+      // Two flat `uv init --app` services, each with its own config.py. A flat
+      // list of every root in the tree resolved beta's `import config` to
+      // alpha's file, because alpha sorted first — a confident edge into
+      // another service, with an unchanged edge count so no yield signal could
+      // surface it.
+      project = createTempProject({
+        "services/alpha-svc/pyproject.toml": '[project]\nname = "alpha-svc"\n',
+        "services/alpha-svc/main.py": "",
+        "services/alpha-svc/config.py": "",
+        "services/beta-svc/pyproject.toml": '[project]\nname = "beta-svc"\n',
+        "services/beta-svc/main.py": "",
+        "services/beta-svc/config.py": "",
+      });
+
+      expect(pyResolve("config", "services/beta-svc/main.py", project)).toBe(
+        "services/beta-svc/config.py",
+      );
+      expect(pyResolve("config", "services/alpha-svc/main.py", project)).toBe(
+        "services/alpha-svc/config.py",
+      );
+    });
+
+    it("prefers the importing package's own root over a sibling's for a non-sibling import", () => {
+      // Proximity ordering, in the case the #46 fallback cannot reach: the
+      // module sits under both packages' src/ roots but next to neither file,
+      // so only ordering by containment picks the importer's own package.
+      //
+      // The importer is the alphabetically LATER package on purpose. With
+      // pkg-a importing, lexicographic order would land on the right file by
+      // accident and the test could not tell proximity from luck — which is
+      // how a flat sorted list passed review while resolving beta-svc's
+      // `import config` to alpha-svc's file.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/pkg-a/pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "packages/pkg-a/src/shared/utils.py": "",
+        "packages/pkg-b/pyproject.toml": '[project]\nname = "pkg-b"\n',
+        "packages/pkg-b/src/shared/utils.py": "",
+        "packages/pkg-b/src/pkg_b/main.py": "",
+      });
+
+      expect(pyResolve("shared.utils", "packages/pkg-b/src/pkg_b/main.py", project)).toBe(
+        "packages/pkg-b/src/shared/utils.py",
+      );
+    });
+
+    it("does not resolve through a manifest in a non-importable subtree", () => {
+      // A sample app, cookiecutter template, docs project, checked-in sdist or
+      // per-fixture manifest sits on no sys.path the importing file could
+      // reach. Registering its roots globally turns an import that correctly
+      // resolved to nothing into a fabricated edge.
+      project = createTempProject({
+        "pyproject.toml": '[project]\nname = "mainpkg"\n',
+        "src/mainpkg/app.py": "",
+        "examples/demo/pyproject.toml": '[project]\nname = "demo"\n',
+        "examples/demo/settings.py": "",
+      });
+
+      expect(pyResolve("settings", "src/mainpkg/app.py", project)).toBeNull();
+    });
+
+    it("still resolves within a non-importable subtree's own files", () => {
+      // The example project is out of scope for the main package, not broken
+      // in itself: its own manifest is on its own files' ancestor path.
+      project = createTempProject({
+        "pyproject.toml": '[project]\nname = "mainpkg"\n',
+        "examples/demo/pyproject.toml": '[project]\nname = "demo"\n',
+        "examples/demo/src/demo_pkg/app.py": "",
+        "examples/demo/src/demo_pkg/settings.py": "",
+      });
+
+      expect(pyResolve("demo_pkg.settings", "examples/demo/src/demo_pkg/app.py", project)).toBe(
+        "examples/demo/src/demo_pkg/settings.py",
+      );
+    });
+
+    it("still resolves relative imports when roots are present", () => {
+      project = createTempProject({
+        "pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "src/pkg_a/main.py": "",
+        "src/pkg_a/models.py": "",
+      });
+
+      expect(pyResolve(".models", "src/pkg_a/main.py", project)).toBe("src/pkg_a/models.py");
+    });
+
+    it("keeps stdlib imports external even with roots present", () => {
+      // A project directory named after a stdlib module must not start
+      // drawing edges for `import os`.
+      project = createTempProject({
+        "pyproject.toml": '[project]\nname = "pkg-a"\n',
+        "src/os.py": "",
+        "src/pkg_a/main.py": "",
+      });
+
+      expect(pyResolve("os", "src/pkg_a/main.py", project)).toBeNull();
+    });
+  });
+
+  describe("buildPythonManifests", () => {
+    it("registers both the manifest directory and its src/ subdirectory", () => {
+      // The layout is not derivable from the import, so both candidates are
+      // registered; a root that does not exist holds no files and matches
+      // nothing.
+      project = createTempProject({
+        "packages/pkg-a/pyproject.toml": "",
+      });
+
+      const [manifest] = buildPythonManifests(project.root);
+
+      expect(manifest.dir).toBe("packages/pkg-a");
+      expect(manifest.roots).toEqual(["packages/pkg-a", "packages/pkg-a/src"]);
+    });
+
+    it("maps a root-level manifest to '.' and 'src'", () => {
+      project = createTempProject({ "pyproject.toml": "" });
+
+      const [manifest] = buildPythonManifests(project.root);
+
+      expect(manifest.dir).toBe(".");
+      expect(manifest.roots).toEqual([".", "src"]);
+    });
+
+    it("resolves workspace member globs against the manifests found", () => {
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/zeta/pyproject.toml": "",
+        "examples/demo/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha", "packages/zeta"]);
+    });
+
+    it("honours an exclude list alongside members", () => {
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/legacy"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    // An entry this reader cannot represent means something different in the
+    // two arrays, which is why they share one void. Losing a MEMBER costs an
+    // edge that should have resolved. Losing an EXCLUSION admits a package the
+    // manifest explicitly excludes and draws a cross-package edge uv would
+    // not — the reader inventing a declaration rather than missing one. These
+    // pin the exclude side, whose only case used to be the plain literal.
+
+    it("voids the section when an exclude entry is truncated by a comment", () => {
+      // The regression: comment-stripping cut the array at the `#`, so the
+      // real exclusion behind it vanished and `legacy` became a member.
+      // Reading strings as opaque keeps both entries, and the exclusion holds.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/#legacy", "packages/legacy"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    // uv expands `members` by globbing the filesystem, where a lone `*` selects
+    // one path segment, but matches `exclude` against the member's whole path,
+    // where it does not stop at a separator. Translating both with the same
+    // narrow `*` under-excluded, and under-excluding is the direction that
+    // invents an edge. All three checked against uv 0.10.0 and 0.11.8, which
+    // agree.
+
+    it("excludes through a `*` that spans a path separator", () => {
+      // `*legacy` does not match `packages/legacy` a segment at a time, so a
+      // segment-wise `*` kept legacy a member and drew a cross-package edge to
+      // the one package the manifest named to keep out.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["*legacy"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("empties the workspace when a bare `*` is excluded", () => {
+      // Not an exotic spelling, and the whole point of the asymmetry: uv reads
+      // this as excluding every member, leaving the root alone.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["*"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("keeps a member whose path a `*` in the include list cannot span", () => {
+      // The include side must NOT gain the spanning `*`: uv globs the
+      // filesystem for members, so `packages/*` stops at a segment and
+      // `packages/alpha/inner` is not a member. Widening it here would
+      // register a root over a package the workspace never declared.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/alpha/inner/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("keeps a package a member when the only exclusion names a `#` path", () => {
+      // Looks like the case above and is not: uv reads `packages/#legacy` as a
+      // literal path that matches nothing, so `legacy` stays a member and the
+      // cross-package edge is correct. Voiding here would drop a real edge.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/#legacy"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha", "packages/legacy"]);
+    });
+
+    it("voids the section when an exclude entry uses a glob character class", () => {
+      // uv honours `[a]` as a class and excludes legacy. Matching it literally
+      // would exclude nothing and admit legacy, so the section is voided.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/leg[a]cy"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when an exclude entry is not a quoted scalar", () => {
+      // A bare word is not a TOML value, so the document does not parse and the
+      // manifest declares nothing. Reading the members and ignoring the
+      // unreadable exclude would admit exactly the package it kept out.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = [packages/legacy]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when an exclude entry uses a `?` wildcard", () => {
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/legac?"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    // uv reads each of the following as a workspace declaring `packages/*`,
+    // confirmed against uv 0.11.8 on identical manifests. Every one is ordinary
+    // TOML a user can write today; a reader matching the header as text found
+    // no members in any of them and said nothing about why — the same silent
+    // shape as issue #107 itself.
+
+    it("reads members from a spaced table header", () => {
+      project = createTempProject({
+        "pyproject.toml": '[ tool.uv.workspace ]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads members from an inline workspace table under [tool.uv]", () => {
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv]\nworkspace = { members = ["packages/*"] }\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads members from a top-level dotted key", () => {
+      // Dotted keys belong to the table they sit under, so this one declares a
+      // workspace only because it precedes `[project]`. uv agrees.
+      project = createTempProject({
+        "pyproject.toml": 'tool.uv.workspace.members = ["packages/*"]\n[project]\nname = "root"\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads members past a comment containing a string delimiter", () => {
+      // A `"""` inside a comment opens nothing. Treating it as a delimiter
+      // blanked the rest of the file, and the real table below it vanished.
+      project = createTempProject({
+        "pyproject.toml": '# """\n[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads members from a manifest saved with a byte-order mark", () => {
+      // uv's parser skips a BOM and locks the workspace; TOML's grammar has no
+      // place for one, so `tomllib` and this parser both reject the document.
+      // Without stripping it the manifest would lose every member it declares.
+      project = createTempProject({
+        "pyproject.toml": '\uFEFF[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads a member spelled as a multi-line string", () => {
+      // A legal, if unusual, way to write the same glob. uv resolves it.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["""packages/*"""]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("reads members from a header carrying a trailing comment", () => {
+      // TOML's grammar allows a comment after a table header. Anchoring the
+      // header to end-of-line rejected the commented form, and because a
+      // manifest with no readable members simply scopes to its own subtree,
+      // the failure was silent: every cross-package import went back to null.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]  # the workspace root\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("does not read a quoted word inside a comment as a member", () => {
+      // A comment sitting in the array would otherwise contribute its quoted
+      // text as a member glob.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = [\n  "packages/*",  # not "examples/demo"\n]\n',
+        "packages/alpha/pyproject.toml": "",
+        "examples/demo/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("voids the section when a member uses a glob character class", () => {
+      // uv matches with a full globset, so `packages/[ab]*` selects a set this
+      // reader cannot compute. Reading the rest of the array and ignoring this
+      // entry would be a guess about what the manifest declares; voiding falls
+      // back to ancestor-path scoping, which resolves strictly fewer imports.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/[ab]*", "packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when a member uses a `?` wildcard", () => {
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/alph?"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when the array is missing a separator", () => {
+      // uv refuses to parse this manifest, so it declares nothing. Scanning for
+      // quoted runs read two members out of a document that has none.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/alpha" "packages/zeta"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/zeta/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when members is not an array", () => {
+      // uv fails the lock outright on this manifest. A single string is not a
+      // member list, and guessing that it means a one-element one would be the
+      // reader deciding what the manifest meant.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = "packages/*"\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when a member entry is not a string", () => {
+      // Keeping the well-formed neighbours would be a guess about a manifest uv
+      // rejects, and every entry kept is a root registered over other packages.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/*", 3]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("voids the section when exclude is not an array", () => {
+      // The exclude side needs its own guard: treating an unreadable exclusion
+      // as no exclusion admits the one package the manifest names.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = "packages/legacy"\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("keeps building the graph when a manifest cannot be parsed", () => {
+      // A manifest that fails to parse declares nothing; it must not throw out
+      // of the walk, or one malformed file anywhere in the tree would cost the
+      // whole project its Python roots. Same contract as an unreadable file.
+      project = createTempProject({
+        "pyproject.toml": "[tool.uv.workspace\nmembers = [",
+        "packages/alpha/pyproject.toml": '[tool.uv.workspace]\nmembers = ["inner"]\n',
+        "packages/alpha/inner/pyproject.toml": "",
+      });
+
+      const manifests = buildPythonManifests(project.root);
+
+      expect(manifests.map((m) => m.dir)).toEqual([
+        "packages/alpha/inner",
+        "packages/alpha",
+        ".",
+      ]);
+      expect(manifests.find((m) => m.dir === ".")?.members).toEqual([]);
+      expect(manifests.find((m) => m.dir === "packages/alpha")?.members).toEqual([
+        "packages/alpha/inner",
+      ]);
+    });
+
+    it("reads a `#` inside a member string as a literal path character", () => {
+      // Not a defect and must not be treated as one: uv reads this as a path
+      // that happens to contain `#`, matches nothing, and the manifest declares
+      // no members. A `#` in a string does not open a comment.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["packages/#alpha"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("reads a member string carrying the other quote character", () => {
+      // An extraction that stopped at whichever quote came first yielded the
+      // member `it` — a directory the manifest never names. Inside a basic
+      // string an apostrophe is just a character.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv.workspace]\nmembers = ["it\'s/*"]\n',
+        "it/pyproject.toml": "",
+        "it's/inner/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["it's/inner"]);
+    });
+
+    it("ignores a prose header that a real table header appears to close", () => {
+      // The `[tool.other]` line is prose inside the same block, not a table, so
+      // a reader that ends the section there never meets the closing delimiter
+      // and cannot tell this from a declaration. The whole block is one string
+      // value, and the document declares no workspace at all.
+      project = createTempProject({
+        "pyproject.toml":
+          'description = """\n[tool.uv.workspace]\nmembers = ["packages/*"]\n[tool.other]\n"""\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("reads a members list beside a multi-line string in the same table", () => {
+      // A multi-line string in the workspace table must not cost the table its
+      // real declaration. The prose carries its own `members` line ahead of the
+      // real one, so reading the section as text finds the wrong array first.
+      project = createTempProject({
+        "pyproject.toml":
+          '[tool.uv.workspace]\nnotes = """\nmembers = ["packages/legacy"]\n"""\nmembers = ["packages/alpha"]\n',
+        "packages/alpha/pyproject.toml": "",
+        "packages/legacy/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual(["packages/alpha"]);
+    });
+
+    it("ignores a workspace header written inside a multi-line string", () => {
+      // `tomllib` and uv both report no such table for prose in a description
+      // block. Matching the header as text cannot tell the two apart and would
+      // invent members for a manifest that declares none.
+      project = createTempProject({
+        "pyproject.toml":
+          'description = """\n[tool.uv.workspace]\nmembers = ["packages/*"]\n"""\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("reads members only from the tool.uv.workspace table", () => {
+      // A `members` key under some other tool's table is a different key, not
+      // uv's — `[tool.other]` is where this one lives.
+      project = createTempProject({
+        "pyproject.toml": '[tool.other]\nmembers = ["packages/*"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("declares no members for a [tool.uv] table with no workspace", () => {
+      // The ordinary single-package uv manifest: `[tool.uv]` present, no
+      // workspace under it. The lookup walks two keys successfully and finds
+      // nothing at the third, so the value it ends on has to be checked before
+      // it is read as a table — otherwise the commonest uv manifest of all
+      // takes the whole graph build down with it.
+      project = createTempProject({
+        "pyproject.toml": '[tool.uv]\ndev-dependencies = ["pytest"]\n',
+        "packages/alpha/pyproject.toml": "",
+      });
+
+      const root = buildPythonManifests(project.root).find((m) => m.dir === ".");
+
+      expect(root?.members).toEqual([]);
+    });
+
+    it("skips manifests under site-packages", () => {
+      // Every installed distribution ships a pyproject.toml, and each would
+      // register an import root over vendored code that shadows the project's
+      // own modules. The virtualenv here is named so that
+      // DEFAULT_IGNORE_PATTERNS (.venv/venv/env) does not cover it.
+      project = createTempProject({
+        "pyproject.toml": "",
+        ".venv312/lib/python3.12/site-packages/requests/pyproject.toml": "",
+      });
+
+      expect(buildPythonManifests(project.root).map((m) => m.dir)).toEqual(["."]);
+    });
+
+    it("skips manifests under dist-packages", () => {
+      // Debian and Ubuntu's system Python installs distributions into
+      // dist-packages rather than site-packages; both shadow project modules
+      // the same way.
+      project = createTempProject({
+        "pyproject.toml": "",
+        "vendored/lib/python3.12/dist-packages/requests/pyproject.toml": "",
+      });
+
+      expect(buildPythonManifests(project.root).map((m) => m.dir)).toEqual(["."]);
+    });
+
+    it("skips manifests under ignored directories", () => {
+      project = createTempProject({
+        "pyproject.toml": "",
+        "node_modules/some-pkg/pyproject.toml": "",
+      });
+
+      expect(buildPythonManifests(project.root).map((m) => m.dir)).toEqual(["."]);
+    });
+
+    it("returns an empty list for a project with no manifest", () => {
+      // Keeps the resolver's pre-#107 behavior for unpackaged script repos:
+      // no manifests means no roots and no extra resolution step at all.
+      project = createTempProject({ "app/main.py": "" });
+
+      expect(buildPythonManifests(project.root)).toEqual([]);
+    });
+  });
+
+  describe("pythonRootsForFile", () => {
+    const manifests = (entries: Array<[string, string[]]>): PythonManifest[] =>
+      entries.map(([dir, members]) => ({
+        dir,
+        roots: [dir, dir === "." ? "src" : `${dir}/src`],
+        members,
+      }));
+
+    it("orders containing roots first, deepest first", () => {
+      // A package's own root must outrank the project root, or a name present
+      // in both resolves to the wrong one.
+      const roots = pythonRootsForFile(
+        manifests([[".", ["packages/pkg-a"]], ["packages/pkg-a", []]]),
+        "packages/pkg-a/src/pkg_a",
+      );
+
+      expect(roots.slice(0, 2)).toEqual(["packages/pkg-a/src", "packages/pkg-a"]);
+    });
+
+    it("puts a containing root ahead of one that sorts earlier alphabetically", () => {
+      // Containment must beat lexicographic order outright, not merely agree
+      // with it. pkg-z's own roots come first even though pkg-a sorts before
+      // them, which is the whole of the fix for the cross-service mixup.
+      const roots = pythonRootsForFile(
+        manifests([
+          [".", ["packages/pkg-a", "packages/pkg-z"]],
+          ["packages/pkg-a", []],
+          ["packages/pkg-z", []],
+        ]),
+        "packages/pkg-z/src/pkg_z",
+      );
+
+      expect(roots.slice(0, 2)).toEqual(["packages/pkg-z/src", "packages/pkg-z"]);
+      expect(roots.indexOf("packages/pkg-z")).toBeLessThan(roots.indexOf("packages/pkg-a"));
+    });
+
+    it("excludes a manifest that is neither an ancestor nor a declared member", () => {
+      // Only the root manifest's roots survive, and `src` precedes `.`
+      // because the file sits inside it — deepest containing root first.
+      const roots = pythonRootsForFile(
+        manifests([[".", []], ["examples/demo", []]]),
+        "src/mainpkg",
+      );
+
+      expect(roots).toEqual(["src", "."]);
+    });
+
+    it("includes a sibling package declared as a workspace member", () => {
+      const roots = pythonRootsForFile(
+        manifests([
+          [".", ["packages/pkg-a", "packages/pkg-b"]],
+          ["packages/pkg-a", []],
+          ["packages/pkg-b", []],
+        ]),
+        "packages/pkg-a/src/pkg_a",
+      );
+
+      expect(roots).toContain("packages/pkg-b/src");
+    });
+
+    it("orders non-containing roots lexicographically for cross-machine determinism", () => {
+      // Nothing about a cross-package import says which package was meant, so
+      // the tie must break the same way everywhere rather than by walk order.
+      const roots = pythonRootsForFile(
+        manifests([
+          [".", ["packages/pkg-b", "packages/pkg-c"]],
+          ["packages/pkg-b", []],
+          ["packages/pkg-c", []],
+        ]),
+        "app",
+      );
+
+      expect(roots.filter((r) => r.startsWith("packages/"))).toEqual([
+        "packages/pkg-b",
+        "packages/pkg-b/src",
+        "packages/pkg-c",
+        "packages/pkg-c/src",
+      ]);
+    });
+
+    it("returns nothing when no manifest applies", () => {
+      expect(pythonRootsForFile(manifests([["examples/demo", []]]), "src/app")).toEqual([]);
     });
   });
 
