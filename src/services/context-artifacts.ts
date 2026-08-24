@@ -21,9 +21,10 @@ import os from "node:os";
 import path from "node:path";
 import { glob } from "glob";
 import { contextCollectionName, projectIdFromPath } from "../config.js";
-import { CHUNK_OVERLAP, CHUNK_SIZE, MAX_CHUNK_CHARS } from "../constants.js";
+import { CHUNK_OVERLAP, CHUNK_SIZE, DETECT_HEAD_BYTES, MAX_CHUNK_CHARS } from "../constants.js";
 import type { ArtifactIndexState, ContextArtifact, SearchResult } from "../types.js";
 import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
+import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 import { logger } from "./logger.js";
 import {
   deleteArtifactChunks,
@@ -140,14 +141,90 @@ export async function loadConfig(projectPath: string): Promise<SocratiCodeConfig
 // ── File reading ─────────────────────────────────────────────────────────
 
 /**
+ * Decide whether a file's bytes are binary, using the same rule as the
+ * indexer's Stage-0 guard for extensionless files
+ * (`detectExtensionlessExtension` in constants.ts): a NUL byte in the first
+ * {@link DETECT_HEAD_BYTES}. That also rejects UTF-16, whose interleaved NUL
+ * bytes appear immediately.
+ *
+ * A sniff rather than a fatal UTF-8 decode, deliberately. `TextDecoder("utf-8",
+ * {fatal: true})` would reject a latin1 text file outright — a total loss of a
+ * file that is mostly searchable — while the sniff keeps it, decoding only the
+ * few undecodable bytes to U+FFFD.
+ *
+ * The *rule* matches Stage-0; the *scope* is wider, and deliberately so. Stage-0
+ * runs only on extensionless files, while the code index reads anything whose
+ * extension is indexable with no binary guard at all (`fsp.readFile(..., "utf-8")`
+ * in indexer.ts). So one class does diverge: a NUL-bearing file with an
+ * indexable extension — a `.sql` or `.yaml` holding embedded binary — is indexed
+ * as code but skipped here. That is the intended reading for artifacts, where a
+ * directory is swept rather than declared file by file, and the skip is logged.
+ */
+function isBinaryContent(buf: Buffer): boolean {
+  return buf.subarray(0, DETECT_HEAD_BYTES).includes(0);
+}
+
+/**
+ * Files a directory walk left out, by reason. All zero for a single-file artifact.
+ *
+ * These count what the walk *found* and then rejected. `node_modules` and `.git`
+ * are pruned by glob before the walk yields anything, so they appear in no
+ * counter — see the note on that `ignore` option for why the prune is worth
+ * keeping.
+ */
+export interface ArtifactExclusions {
+  /** Rejected by the ignore chain. Excludes the glob-pruned trees above. */
+  ignored: number;
+  /** Rejected by {@link isBinaryContent}. */
+  binary: number;
+  /** Read threw — permissions, a dangling symlink, deleted mid-walk. */
+  unreadable: number;
+}
+
+/** Shared, frozen — every single-file read returns the same zeroed instance. */
+const NO_EXCLUSIONS: Readonly<ArtifactExclusions> = Object.freeze({
+  ignored: 0,
+  binary: 0,
+  unreadable: 0,
+});
+
+/** One artifact's content, as {@link readArtifactContent} produced it. */
+export interface ArtifactContent {
+  content: string;
+  contentHash: string;
+  exclusions: Readonly<ArtifactExclusions>;
+}
+
+/**
  * Read the content of an artifact. If the path points to a directory,
  * concatenates all files within it (recursively), separated by headers.
- * Returns the combined content and a content hash for staleness detection.
+ * Returns the combined content, a content hash for staleness detection, and
+ * the count of files left out.
+ *
+ * A directory walk excludes three classes of file, each logged per-file at
+ * debug:
+ *   1. Anything the ignore chain rejects — built-in defaults + `.gitignore` +
+ *      `.socraticodeignore`, the same chain the code indexer uses.
+ *   2. Binary content, per {@link isBinaryContent}.
+ *   3. Files that fail to read at all (permissions, races).
+ * Dot-files and dot-directories are never walked (`dot: false` below).
+ *
+ * The summary is returned rather than logged here, because this function also
+ * serves the staleness check that runs on every search — logging it here would
+ * repeat the same line per search instead of reporting it once per index.
+ * {@link indexArtifact} logs it at info.
+ *
+ * A single-file artifact is read verbatim and gets none of this: a declared
+ * path is an explicit instruction, and silently skipping it would replace one
+ * silent failure with another.
+ *
+ * Exclusion happens here, inside the function that also computes the hash, so
+ * the indexed content and the staleness hash cannot diverge.
  */
 export async function readArtifactContent(
   artifactPath: string,
   projectPath: string,
-): Promise<{ content: string; contentHash: string }> {
+): Promise<ArtifactContent> {
   const resolved = path.isAbsolute(artifactPath)
     ? artifactPath
     : path.resolve(projectPath, artifactPath);
@@ -157,11 +234,25 @@ export async function readArtifactContent(
   if (stat.isFile()) {
     const content = await fsp.readFile(resolved, "utf-8");
     const contentHash = hashContent(content);
-    return { content, contentHash };
+    return { content, contentHash, exclusions: NO_EXCLUSIONS };
   }
 
   if (stat.isDirectory()) {
-    // Find all files in the directory (recursively, skip hidden/dot-files)
+    // Find all files in the directory (recursively, skip hidden/dot-files).
+    // `dot: false` is not a stray default: it is why `.pytest_cache/` was
+    // already excluded while `__pycache__/` — not hidden — was walked.
+    //
+    // The glob-level ignores duplicate two of the chain's default patterns, and
+    // are kept anyway for what they cost the walk rather than what they match.
+    // A pattern ending in `**` registers with glob as a children-pattern, so
+    // `childrenIgnored()` prunes the subtree instead of listing it and
+    // discarding it after; an artifact directory holding a vendored
+    // `node_modules` would otherwise be enumerated in full on every staleness
+    // check — that is, on every context search. The trade is that a pruned file
+    // is never seen and so is counted in no {@link ArtifactExclusions} field:
+    // the counters describe the walk's own rejections, not everything absent
+    // from the result. Routing these through the counted path would buy exact
+    // totals at the price of that walk.
     const files = await glob("**/*", {
       cwd: resolved,
       nodir: true,
@@ -171,25 +262,70 @@ export async function readArtifactContent(
 
     files.sort(); // deterministic ordering
 
+    // The ignore chain is rooted at the artifact directory, not the project.
+    // Two reasons, both structural: glob returns paths relative to `resolved`,
+    // and the `ignore` package throws RangeError on an absolute or
+    // `../`-prefixed path — while an artifact path may be absolute or resolve
+    // under the global config fallback, outside any project. Rooting here also
+    // keeps a directory from ignoring itself: an artifact declared at
+    // `./build/openapi/` yields relative paths that no longer start with
+    // `build/`, so the default patterns cannot erase the whole artifact.
+    // Built per read rather than memoised. The build walks this directory for
+    // nested .gitignore files, but measured against the walk-and-hash that
+    // follows it is about 4% of the call — and a memo would have to fingerprint
+    // every nested ignore file to stay correct, which costs as much as the
+    // rebuild it avoids.
+    const ig = createIgnoreFilter(resolved);
+
     const parts: string[] = [];
+    let ignoredCount = 0;
+    let binaryCount = 0;
+    let unreadableCount = 0;
+
     for (const file of files) {
+      if (shouldIgnore(ig, file)) {
+        ignoredCount++;
+        logger.debug(`Artifact: skipping ignored file ${file}`);
+        continue;
+      }
       const filePath = path.join(resolved, file);
       try {
-        const content = await fsp.readFile(filePath, "utf-8");
-        parts.push(`# ── ${file} ──\n${content}`);
+        // Read once as a Buffer, sniff, then decode — reading as "utf-8" up
+        // front cannot detect binary, because it never throws: it returns a
+        // string of U+FFFD replacement characters.
+        const buf = await fsp.readFile(filePath);
+        if (isBinaryContent(buf)) {
+          binaryCount++;
+          logger.debug(`Artifact: skipping binary file ${file}`);
+          continue;
+        }
+        parts.push(`# ── ${file} ──\n${buf.toString("utf-8")}`);
       } catch {
-        // skip unreadable files (binary, permissions, etc.)
+        // skip unreadable files (permissions, deleted mid-walk, etc.)
+        unreadableCount++;
         logger.debug(`Artifact: skipping unreadable file ${file}`);
       }
     }
 
+    const exclusions: ArtifactExclusions = {
+      ignored: ignoredCount,
+      binary: binaryCount,
+      unreadable: unreadableCount,
+    };
+    const excluded = ignoredCount + binaryCount + unreadableCount;
+
     if (parts.length === 0) {
-      throw new Error(`Artifact directory is empty or contains no readable files: ${resolved}`);
+      const detail = excluded > 0
+        ? ` (${excluded} file${excluded === 1 ? "" : "s"} excluded: ${ignoredCount} ignored, ${binaryCount} binary, ${unreadableCount} unreadable)`
+        : "";
+      throw new Error(
+        `Artifact directory is empty or contains no readable files: ${resolved}${detail}`,
+      );
     }
 
     const combined = parts.join("\n\n");
     const contentHash = hashContent(combined);
-    return { content: combined, contentHash };
+    return { content: combined, contentHash, exclusions };
   }
 
   throw new Error(`Artifact path is neither a file nor a directory: ${resolved}`);
@@ -263,11 +399,19 @@ function generateChunkId(artifactPath: string, artifactName: string, startLine: 
 /**
  * Index a single artifact into Qdrant.
  * Removes any existing chunks for this artifact first, then inserts new ones.
+ *
+ * `preread` lets a caller that has *already* read the artifact hand the result
+ * over instead of paying for a second full read. {@link ensureArtifactsIndexed}
+ * reads every artifact to compute its staleness hash, and re-reading here would
+ * walk the directory and re-read every file a second time — by far the largest
+ * cost on that path. Passing the content through also closes the window between
+ * the two reads, so what gets indexed is exactly what was hashed.
  */
 export async function indexArtifact(
   projectPath: string,
   artifact: ContextArtifact,
   collection: string,
+  preread?: ArtifactContent,
 ): Promise<ArtifactIndexState> {
   const resolvedProject = path.resolve(projectPath);
   const resolvedArtifactPath = path.isAbsolute(artifact.path)
@@ -279,8 +423,21 @@ export async function indexArtifact(
     path: resolvedArtifactPath,
   });
 
-  // Read content
-  const { content, contentHash } = await readArtifactContent(artifact.path, resolvedProject);
+  // Read content, unless the caller already did
+  const { content, contentHash, exclusions } =
+    preread ?? (await readArtifactContent(artifact.path, resolvedProject));
+
+  // Report what the directory walk left out. Logged here rather than in
+  // readArtifactContent so it appears once per index, not on every staleness
+  // check — and so a shrinking chunk count has a visible cause.
+  const excluded = exclusions.ignored + exclusions.binary + exclusions.unreadable;
+  if (excluded > 0) {
+    logger.info("Excluded files from artifact directory", {
+      name: artifact.name,
+      path: resolvedArtifactPath,
+      ...exclusions,
+    });
+  }
 
   // Chunk
   const chunks = chunkArtifactContent(content, artifact.name, artifact.path);
@@ -451,18 +608,17 @@ export async function ensureArtifactsIndexed(projectPath: string): Promise<{
     try {
       const existing = stateMap.get(artifact.name);
 
-      // Read current content hash
-      const { contentHash: currentHash } = await readArtifactContent(
-        artifact.path,
-        resolvedProject,
-      );
+      // Read current content, keeping it rather than just its hash: on the
+      // stale branch it is handed to indexArtifact, which would otherwise walk
+      // the directory and re-read every file to reproduce what we hold here.
+      const current = await readArtifactContent(artifact.path, resolvedProject);
 
-      if (existing && existing.contentHash === currentHash) {
+      if (existing && existing.contentHash === current.contentHash) {
         // Up to date
         upToDate.push(artifact.name);
       } else {
         // Stale or new — re-index
-        const state = await indexArtifact(resolvedProject, artifact, collection);
+        const state = await indexArtifact(resolvedProject, artifact, collection, current);
         reindexed.push(artifact.name);
         stateMap.set(artifact.name, state);
         await saveContextMetadata(collection, resolvedProject, [...stateMap.values()]);
