@@ -15,7 +15,7 @@ import { ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
-import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
+import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
 import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
@@ -881,6 +881,17 @@ export async function buildCodeGraph(
   const hasElixir = files.some((f) => [".ex", ".exs"].includes(path.extname(f).toLowerCase()));
   const elixirModuleMap = hasElixir ? buildElixirModuleMap(fileSet, resolvedPath) : undefined;
 
+  // Record every crate the tree declares, from each Cargo.toml (discovered by
+  // walking, like go.mod and pubspec.yaml — Cargo.toml is never in the
+  // graphable file set). A Rust path names a position in a module tree
+  // (`crate::`, `super::`) or another crate by name, neither of which the
+  // resolver could follow without knowing where each crate's root module sits:
+  // every specifier containing `::` resolved to null, so the file graph held
+  // only bare `mod` declarations. An empty list keeps `mod`, `super` and `self`
+  // resolving from the file's own position, as before.
+  const hasRust = files.some((f) => path.extname(f).toLowerCase() === ".rs");
+  const rustCrates = hasRust ? buildRustCrateMap(fileSet, resolvedPath) : undefined;
+
   for (const relPath of files) {
     let ext = path.extname(relPath).toLowerCase();
     let lang = getAstGrepLang(ext);
@@ -1002,7 +1013,7 @@ export async function buildCodeGraph(
       // Try to resolve to a project file
       // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
       const resolutionLanguage = imp.isCssImport ? "css" : language;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap);
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates);
       if (resolved) {
         node.dependencies.push(resolved);
 

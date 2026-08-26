@@ -486,3 +486,80 @@ describe("buildCodeGraph — Go module resolution (issues #45 & #82)", () => {
     ).toBe(true);
   });
 });
+
+// ── Rust crate resolution through the real pipeline ───────────────────────
+// Cargo.toml has no AST grammar, so it is never in the graphable file set —
+// the same trap #82 documents for go.mod. These drive the real
+// getGraphableFiles → buildCodeGraph path over a workspace laid out the way
+// Cargo generates one, where every edge below was absent before crate roots
+// were read.
+describe("buildCodeGraph — Rust crate resolution", () => {
+  const roots: string[] = [];
+  let graph: Awaited<ReturnType<typeof buildCodeGraph>>;
+
+  beforeAll(async () => {
+    ensureDynamicLanguages();
+    const dir = writeLayout({
+      "Cargo.toml": '[workspace]\nmembers = ["crates/cli", "crates/core"]\n',
+
+      "crates/core/Cargo.toml": '[package]\nname = "app-core"\n',
+      "crates/core/src/lib.rs": ["pub mod store;", "", "pub use store::Store;"].join("\n"),
+      "crates/core/src/store.rs": [
+        "mod open;",
+        "",
+        "pub struct Store;",
+        "pub struct StoreError;",
+      ].join("\n"),
+      "crates/core/src/store/open.rs": [
+        "use super::Store;",
+        "",
+        "pub fn open() -> Store { Store }",
+      ].join("\n"),
+
+      "crates/cli/Cargo.toml": '[package]\nname = "app-cli"\n',
+      "crates/cli/src/main.rs": [
+        "mod runner;",
+        "",
+        "use app_core::{Store, store::StoreError};",
+        "",
+        "fn main() { runner::run(); }",
+      ].join("\n"),
+      "crates/cli/src/runner.rs": "pub fn run() {}",
+    });
+    roots.push(dir);
+    graph = await buildCodeGraph(dir);
+  });
+
+  afterAll(() => {
+    for (const r of roots) {
+      try { fs.rmSync(r, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  const edge = (source: string, target: string): boolean =>
+    graph.edges.some((e) => e.source === source && e.target === target);
+
+  it("follows a pub mod declaration", () => {
+    expect(edge("crates/core/src/lib.rs", "crates/core/src/store.rs")).toBe(true);
+  });
+
+  it("follows super:: to a parent module living beside its directory", () => {
+    expect(edge("crates/core/src/store/open.rs", "crates/core/src/store.rs")).toBe(true);
+  });
+
+  it("follows a path into a sibling crate by its Cargo name", () => {
+    // `app_core::Store` is re-exported from the library root; the underscored
+    // import name only reaches the dashed package because the manifest says so.
+    expect(edge("crates/cli/src/main.rs", "crates/core/src/lib.rs")).toBe(true);
+    // The group's other leaf names a module one level down, and lands there.
+    expect(edge("crates/cli/src/main.rs", "crates/core/src/store.rs")).toBe(true);
+  });
+
+  it("follows a mod declaration inside a binary crate", () => {
+    expect(edge("crates/cli/src/main.rs", "crates/cli/src/runner.rs")).toBe(true);
+  });
+
+  it("draws no edge into a crate for a third-party path", () => {
+    expect(graph.edges.every((e) => e.target.endsWith(".rs"))).toBe(true);
+  });
+});

@@ -11,10 +11,13 @@ import {
   buildGoModuleInfo,
   buildJvmSuffixMap,
   buildPythonManifests,
+  buildRustCrateMap,
   hasLiteralShellPathShape,
   type PythonManifest,
   pythonRootsForFile,
+  type RustCrate,
   resolveImport,
+  resolveRustImport,
 } from "../../src/services/graph-resolution.js";
 
 // ── Helper to create temp project layouts ─────────────────────────────
@@ -1345,6 +1348,361 @@ describe("graph-resolution", () => {
       );
 
       expect(result).toBeNull();
+    });
+
+    // ── Crate map ──────────────────────────────────────────────────────
+
+    /** Lay out a project and read its crates the way buildCodeGraph does. */
+    let fileSet = new Set<string>();
+    const rustProject = (files: Record<string, string>): RustCrate[] => {
+      project = createTempProject(files);
+      fileSet = project.fileSet;
+      return buildRustCrateMap(fileSet, project.root);
+    };
+
+    it("records a crate under the name Cargo lets others import it by", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "my-app-core"\n',
+        "src/lib.rs": "",
+      });
+
+      expect(crates).toEqual([
+        { dir: ".", name: "my_app_core", libRoot: "src/lib.rs", roots: ["src/lib.rs"] },
+      ]);
+    });
+
+    it("takes the library path a manifest declares over the conventional one", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "odd"\n\n[lib]\npath = "lib/entry.rs"\n',
+        "lib/entry.rs": "",
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0].libRoot).toBe("lib/entry.rs");
+    });
+
+    it("takes the library name over the package name", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "the-package"\n\n[lib]\nname = "the_lib"\n',
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0].name).toBe("the_lib");
+    });
+
+    it("gives no importable name to a crate with no library", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "just-a-binary"\n',
+        "src/main.rs": "",
+      });
+
+      expect(crates[0]).toMatchObject({ name: null, libRoot: null, roots: ["src/main.rs"] });
+    });
+
+    it("records every target as a root of its own module tree", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "many"\n\n[[bin]]\nname = "declared"\npath = "extra/tool.rs"\n',
+        "src/lib.rs": "",
+        "src/main.rs": "",
+        "src/bin/one.rs": "",
+        "src/bin/two/main.rs": "",
+        "src/bin/two/helper.rs": "",
+        "extra/tool.rs": "",
+        "tests/it.rs": "",
+        "examples/demo.rs": "",
+        "benches/bench.rs": "",
+        "build.rs": "",
+      });
+
+      expect(crates[0].roots).toEqual([
+        "benches/bench.rs",
+        "build.rs",
+        "examples/demo.rs",
+        "extra/tool.rs",
+        "src/bin/one.rs",
+        "src/bin/two/main.rs",
+        "src/lib.rs",
+        "src/main.rs",
+        "tests/it.rs",
+      ]);
+    });
+
+    it("keeps a malformed manifest's conventional targets and gives it no name", () => {
+      const crates = rustProject({
+        "Cargo.toml": "[package\nname = ",
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0]).toMatchObject({ name: null, roots: ["src/lib.rs"] });
+    });
+
+    it("ignores the manifests Cargo unpacks under target/", () => {
+      const crates = rustProject({
+        // DEFAULT_IGNORE_PATTERNS lists `target`, so only a negation reaches
+        // the unconditional skip — and a negation is all it takes for every
+        // vendored dependency to register as a crate of this project.
+        ".socraticodeignore": "!target/\n",
+        "Cargo.toml": '[package]\nname = "real"\n',
+        "src/lib.rs": "",
+        "target/package/vendored-0.1.0/Cargo.toml": '[package]\nname = "vendored"\n',
+        "target/package/vendored-0.1.0/src/lib.rs": "",
+      });
+
+      expect(crates.map((c) => c.name)).toEqual(["real"]);
+    });
+
+    // ── Module paths ───────────────────────────────────────────────────
+
+    it("resolves crate:: against the crate root", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/db/pool.rs": "",
+        "src/db/mod.rs": "",
+      });
+
+      expect(resolveRustImport("crate::db::pool", "src/lib.rs", fileSet, crates))
+        .toBe("src/db/pool.rs");
+    });
+
+    it("stops at the deepest path segment that names a file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/db.rs": "",
+      });
+
+      // `Connection` is a type inside db.rs, not a module below it.
+      expect(resolveRustImport("crate::db::Connection", "src/lib.rs", fileSet, crates))
+        .toBe("src/db.rs");
+    });
+
+    it("resolves a path naming only root items to the root module", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/other.rs": "",
+      });
+
+      expect(resolveRustImport("crate::Error", "src/other.rs", fileSet, crates))
+        .toBe("src/lib.rs");
+    });
+
+    it("resolves super:: to the parent module's sibling", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/api/routes.rs": "",
+        "src/api/state.rs": "",
+      });
+
+      expect(resolveRustImport("super::state::State", "src/api/routes.rs", fileSet, crates))
+        .toBe("src/api/state.rs");
+    });
+
+    it("climbs one module per super", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/a/b/c.rs": "",
+        "src/a/shared.rs": "",
+      });
+
+      expect(resolveRustImport("super::super::shared", "src/a/b/c.rs", fileSet, crates))
+        .toBe("src/a/shared.rs");
+    });
+
+    it("does not let super:: climb out of the crate", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app"]\n',
+        "crates/app/Cargo.toml": '[package]\nname = "app"\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/thing.rs": "",
+        // Beside the crate's src/, so an unchecked second climb lands on it.
+        "crates/app/outside.rs": "",
+      });
+
+      // `thing` sits directly under the crate root, so `super` is already the
+      // root and a second climb would leave the module tree entirely.
+      expect(resolveRustImport("super::super::outside", "crates/app/src/thing.rs", fileSet, crates))
+        .toBeNull();
+    });
+
+    it("does not draw an edge from a module file to itself", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/a/mod.rs": "",
+      });
+
+      // `use super::a::Thing;` inside `mod tests` in a/mod.rs walks back down
+      // to the file it started from.
+      expect(resolveRustImport("super::a::Thing", "src/a/mod.rs", fileSet, crates))
+        .toBeNull();
+    });
+
+    it("resolves self:: to a submodule of the importing file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/parser.rs": "",
+        "src/parser/lexer.rs": "",
+      });
+
+      expect(resolveRustImport("self::lexer::Token", "src/parser.rs", fileSet, crates))
+        .toBe("src/parser/lexer.rs");
+    });
+
+    it("resolves a sibling crate by the name Cargo gives it", () => {
+      const crates = rustProject({
+        "Cargo.toml": "[workspace]\nmembers = [\"crates/cli\", \"crates/core\"]\n",
+        "crates/cli/Cargo.toml": '[package]\nname = "app-cli"\n',
+        "crates/cli/src/main.rs": "",
+        "crates/core/Cargo.toml": '[package]\nname = "app-core"\n',
+        "crates/core/src/lib.rs": "",
+        "crates/core/src/config.rs": "",
+      });
+
+      expect(resolveRustImport("app_core::config::Config", "crates/cli/src/main.rs", fileSet, crates))
+        .toBe("crates/core/src/config.rs");
+    });
+
+    it("leaves a third-party crate unresolved", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/models.rs": "",
+      });
+
+      expect(resolveRustImport("serde::Deserialize", "src/lib.rs", fileSet, crates))
+        .toBeNull();
+    });
+
+    it("resolves a uniform path to a module in scope", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/store.rs": "",
+      });
+
+      // `mod store;` beside `pub use store::Store;` — the 2018 spelling that
+      // omits `self::`, which is how a crate republishes its own modules.
+      expect(resolveRustImport("store::Store", "src/lib.rs", fileSet, crates))
+        .toBe("src/store.rs");
+    });
+
+    it("resolves super:: to the parent module's own file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/store.rs": "",
+        "src/store/open.rs": "",
+      });
+
+      // The parent of `store::open` is `store`, which lives in store.rs beside
+      // the directory — the layout rustc recommends over store/mod.rs.
+      expect(resolveRustImport("super::Store", "src/store/open.rs", fileSet, crates))
+        .toBe("src/store.rs");
+    });
+
+
+    it("resolves a mod declaration into the declaring file's own directory", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/parser.rs": "",
+        "src/parser/lexer.rs": "",
+        "src/lexer.rs": "",
+      });
+
+      // `mod lexer;` inside src/parser.rs is src/parser/lexer.rs — the file
+      // beside parser.rs is a different module with the same name.
+      expect(resolveRustImport("lexer", "src/parser.rs", fileSet, crates))
+        .toBe("src/parser/lexer.rs");
+    });
+
+    it("resolves a mod declaration in a crate root beside it", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/config.rs": "",
+      });
+
+      expect(resolveRustImport("config", "src/lib.rs", fileSet, crates))
+        .toBe("src/config.rs");
+    });
+
+    it("treats a binary under src/bin as its own crate root", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/helper.rs": "",
+        "src/bin/tool.rs": "",
+        "src/bin/helper.rs": "",
+      });
+
+      // The binary's module tree starts in src/bin, so its `crate::helper` is
+      // src/bin/helper.rs and not the library's src/helper.rs.
+      expect(resolveRustImport("crate::helper", "src/bin/tool.rs", fileSet, crates))
+        .toBe("src/bin/helper.rs");
+    });
+
+    it("prefers the crate whose directory holds the importing file", () => {
+      const crates = rustProject({
+        "workspace-a/Cargo.toml": '[package]\nname = "shared"\n',
+        "workspace-a/src/lib.rs": "",
+        "workspace-a/src/thing.rs": "",
+        "workspace-b/Cargo.toml": '[package]\nname = "shared"\n',
+        "workspace-b/src/lib.rs": "",
+        "workspace-b/src/thing.rs": "",
+        "workspace-b/src/user.rs": "",
+      });
+
+      expect(resolveRustImport("shared::thing", "workspace-b/src/user.rs", fileSet, crates))
+        .toBe("workspace-b/src/thing.rs");
+    });
+
+    it("resolves mod, self and super with no manifest in the tree", () => {
+      project = createTempProject({
+        "src/lib.rs": "",
+        "src/api.rs": "",
+        "src/api/routes.rs": "",
+        "src/api/state.rs": "",
+      });
+
+      expect(resolveRustImport("routes", "src/api.rs", project.fileSet, []))
+        .toBe("src/api/routes.rs");
+      expect(resolveRustImport("super::state", "src/api/routes.rs", project.fileSet, []))
+        .toBe("src/api/state.rs");
+      expect(resolveRustImport("crate::api::state", "src/api/routes.rs", project.fileSet, []))
+        .toBeNull();
+    });
+
+    it("resolves through resolveImport with the crate map passed in", () => {
+      project = createTempProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/config.rs": "",
+      });
+      const crates = buildRustCrateMap(project.fileSet, project.root);
+
+      const result = resolveImport(
+        "crate::config::Config",
+        path.join(project.root, "src/lib.rs"),
+        project.root,
+        project.fileSet,
+        "rust",
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        crates,
+      );
+
+      expect(result).toBe("src/config.rs");
     });
   });
 

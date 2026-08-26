@@ -1115,6 +1115,396 @@ export function pythonRootsForFile(
 }
 
 /**
+ * Discover every `Cargo.toml` under `projectPath`, project-relative and
+ * forward-slash-normalized.
+ *
+ * `Cargo.toml` is not a graphable file (no AST grammar, not an extra
+ * extension), so it is never in the set returned by `getGraphableFiles` — this
+ * walk is independent of that set, exactly like {@link findGoModFiles} (the
+ * fileSet-scan trap from issue #82 applies here identically). The same ignore
+ * filter `getGraphableFiles` uses is applied, with the same trailing-slash
+ * convention for directories.
+ *
+ * `target/` is additionally skipped unconditionally. It is where Cargo unpacks
+ * every dependency it builds, each carrying its own `Cargo.toml`, and a vendored
+ * crate registered from there would claim a name the workspace also declares.
+ * DEFAULT_IGNORE_PATTERNS lists it, but a `.socraticodeignore` negation can
+ * re-include it, and `CARGO_TARGET_DIR` can put it under any other name — which
+ * is why the manifests found there are also the ones nothing else would catch.
+ */
+function findCargoManifests(projectPath: string): string[] {
+  const ig = createIgnoreFilter(projectPath);
+  const results: string[] = [];
+  const walk = (dir: string): void => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const relPath = toForwardSlash(path.relative(projectPath, path.join(dir, entry.name)));
+      if (shouldIgnore(ig, entry.isDirectory() ? `${relPath}/` : relPath)) continue;
+      if (entry.isDirectory()) {
+        if (entry.name === "target") continue;
+        walk(path.join(dir, entry.name));
+      } else if (entry.name === "Cargo.toml") {
+        // Mirrors findGoModFiles: readdirSync Dirents do not follow symlinks,
+        // so a symlinked manifest reports isFile()===false and would be missed.
+        let isFile = entry.isFile();
+        if (!isFile && entry.isSymbolicLink()) {
+          try {
+            isFile = statSync(path.join(dir, entry.name)).isFile();
+          } catch {
+            continue;
+          }
+        }
+        if (isFile) results.push(relPath);
+      }
+    }
+  };
+  walk(projectPath);
+  // Sorted so a name declared by two manifests resolves to the same crate on
+  // every machine.
+  return results.sort();
+}
+
+/** One crate found in the tree: what it is called, and where its modules start. */
+export interface RustCrate {
+  /** Project-relative directory holding its `Cargo.toml`; `"."` at the root. */
+  dir: string;
+  /**
+   * The name other crates import it by — `[package] name` with dashes turned
+   * into underscores, which is the translation Cargo itself performs. Null for
+   * a manifest that declares no package (a `[workspace]`-only root) or no
+   * library target, neither of which anything can import by name.
+   */
+  name: string | null;
+  /** Project-relative path of the library root module, when the crate has one. */
+  libRoot: string | null;
+  /**
+   * Project-relative paths of every root module the manifest implies: the
+   * library, plus each binary, integration test, example and benchmark, plus
+   * the build script. Each is the top of its own module tree, which is what
+   * `crate::` is relative to.
+   */
+  roots: string[];
+}
+
+/** A parsed `Cargo.toml` as this reader consumes it. */
+type CargoTable = Record<string, TomlValue | undefined>;
+
+function asTable(value: TomlValue | undefined): CargoTable | null {
+  // isTable admits a TOML date, which carries none of the keys read below and
+  // so reaches the same "declares nothing" path as any other non-table.
+  return isTable(value) ? value : null;
+}
+
+/** A declared target's `path`, when the entry carries one. */
+function declaredTargetPath(entry: TomlValue | undefined): string | null {
+  const table = asTable(entry);
+  const declared = table?.path;
+  return typeof declared === "string" ? declared : null;
+}
+
+/**
+ * Build the crate map for a Rust project, one entry per `Cargo.toml`.
+ *
+ * Rust names its own code three ways, and only one of them says anything about
+ * the filesystem. `mod foo;` names a sibling file, which the resolver already
+ * followed. `crate::`, `super::` and `self::` name a position in the module
+ * tree, whose root is a target's root module — `src/lib.rs`, `src/main.rs`, or
+ * whatever `[[bin]] path` declares. `some_crate::` names a whole other crate,
+ * which is only in this project if a manifest here declares it, under a name
+ * whose dashes Cargo turns into underscores (`sailor-core` is imported as
+ * `sailor_core`). None of the three resolved before this map existed: every
+ * specifier containing `::` returned null, so a Rust project's file graph came
+ * out as its bare `mod` declarations and nothing else.
+ *
+ * Targets are read from the manifest where declared and taken by convention
+ * otherwise, matching Cargo's own autodiscovery: `src/lib.rs`, `src/main.rs`,
+ * `src/bin/<name>.rs`, `src/bin/<name>/main.rs`, `tests/`, `examples/`,
+ * `benches/` and
+ * `build.rs`. A convention path is recorded only when the file is actually in
+ * `fileSet`, so a root that does not exist never shadows one that does.
+ *
+ * The manifest is parsed with the same TOML reader the Python side uses rather
+ * than scanned, so a `path` key belonging to a dependency is a different key
+ * rather than nearby text. A manifest that cannot be parsed contributes its
+ * convention targets and no name: one unreadable `Cargo.toml` must not cost the
+ * whole project its Rust edges.
+ *
+ * Call this once per graph build and pass the result to resolveImport.
+ */
+export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): RustCrate[] {
+  const root = path.resolve(projectPath);
+  const relManifests = findCargoManifests(root);
+  if (relManifests.length === 0) return [];
+
+  const rustFiles = [...fileSet].filter((f) => f.endsWith(".rs")).sort();
+  const crates: RustCrate[] = [];
+
+  for (const relManifest of relManifests) {
+    const dir = toForwardSlash(path.dirname(relManifest)); // "." at the root
+    const under = (relative: string): string => (dir === "." ? relative : `${dir}/${relative}`);
+
+    let manifest: CargoTable | null = null;
+    try {
+      manifest = asTable(parseToml(readFileSync(path.join(root, relManifest), "utf8")));
+    } catch {
+      // Unreadable or malformed manifest: its convention targets still count.
+    }
+
+    const pkg = asTable(manifest?.package);
+    const lib = asTable(manifest?.lib);
+    const declaredLib = declaredTargetPath(manifest?.lib);
+    const conventionLib = under("src/lib.rs");
+    const libRoot =
+      declaredLib && fileSet.has(under(declaredLib))
+        ? under(declaredLib)
+        : fileSet.has(conventionLib)
+          ? conventionLib
+          : null;
+
+    // `[lib] name` overrides the package name for the importable target; both
+    // spellings reach the same file, so both are recorded by the caller's map.
+    const declaredName = typeof lib?.name === "string" ? lib.name : null;
+    const packageName = typeof pkg?.name === "string" ? pkg.name : null;
+    const name = libRoot ? ((declaredName ?? packageName)?.replace(/-/g, "_") ?? null) : null;
+
+    const roots = new Set<string>();
+    if (libRoot) roots.add(libRoot);
+
+    // Explicitly declared targets. An array-of-tables key holds one table per
+    // target; a manifest that spells it as a single table is malformed for
+    // Cargo, and declaredTargetPath reads it as one entry rather than failing.
+    for (const key of ["bin", "test", "example", "bench"]) {
+      const declared = manifest?.[key];
+      for (const entry of Array.isArray(declared) ? declared : [declared]) {
+        const targetPath = declaredTargetPath(entry);
+        if (targetPath && fileSet.has(under(targetPath))) roots.add(under(targetPath));
+      }
+    }
+    const buildScript = typeof pkg?.build === "string" ? pkg.build : "build.rs";
+    if (fileSet.has(under(buildScript))) roots.add(under(buildScript));
+
+    // Convention targets, as Cargo autodiscovers them.
+    if (fileSet.has(under("src/main.rs"))) roots.add(under("src/main.rs"));
+    for (const dirName of ["src/bin", "tests", "examples", "benches"]) {
+      const prefix = `${under(dirName)}/`;
+      for (const file of rustFiles) {
+        if (!file.startsWith(prefix)) continue;
+        const rest = file.slice(prefix.length);
+        // `<dir>/name.rs` is a target; `<dir>/name/main.rs` is a target whose
+        // own modules live beside it. Anything deeper is a module of one of
+        // those, not a target of its own.
+        if (!rest.includes("/")) roots.add(file);
+        else if (rest.split("/").length === 2 && rest.endsWith("/main.rs")) roots.add(file);
+      }
+    }
+
+    crates.push({ dir, name, libRoot, roots: [...roots].sort() });
+  }
+
+  return crates;
+}
+
+/**
+ * The directory a Rust file's submodules live in.
+ *
+ * A crate root (`src/lib.rs`, `src/main.rs`, `src/bin/tool.rs`) and a `mod.rs`
+ * both own the directory they sit in — `mod foo;` in either names `foo.rs`
+ * beside them. Every other file owns the directory named after it: `mod bar;`
+ * inside `src/foo.rs` names `src/foo/bar.rs`, never `src/bar.rs`.
+ *
+ * `lib.rs` and `main.rs` own their directory by convention as well as by being
+ * roots, so a tree with no `Cargo.toml` — where no root is known — still reads
+ * them the way Cargo would.
+ */
+function rustModuleDir(relFile: string, isCrateRoot: boolean): string {
+  const dir = toForwardSlash(path.dirname(relFile));
+  if (isCrateRoot || ["mod.rs", "lib.rs", "main.rs"].includes(path.basename(relFile))) return dir;
+  const stem = path.basename(relFile, ".rs");
+  return dir === "." ? stem : `${dir}/${stem}`;
+}
+
+/** Join a module directory and a path below it, with `"."` meaning the root. */
+function underModuleDir(moduleDir: string, relative: string): string {
+  return moduleDir === "." ? relative : `${moduleDir}/${relative}`;
+}
+
+/**
+ * The crate root module governing one file, and the directory that root's
+ * module tree starts from.
+ *
+ * A file can sit under several roots — `src/bin/tool.rs` is a root of its own
+ * while also sitting under `src/lib.rs`'s directory — so the deepest module
+ * directory wins, and a file that IS a root is its own. Null when no manifest
+ * covers the file, which is what keeps `crate::` unresolved rather than
+ * guessed in a tree with no `Cargo.toml`.
+ */
+function rustRootForFile(
+  crates: RustCrate[],
+  relFile: string,
+): { root: string; moduleDir: string } | null {
+  let best: { root: string; moduleDir: string } | null = null;
+  for (const crate of crates) {
+    for (const root of crate.roots) {
+      if (root === relFile) return { root, moduleDir: rustModuleDir(root, true) };
+      const moduleDir = rustModuleDir(root, true);
+      const covers = moduleDir === "." || relFile.startsWith(`${moduleDir}/`);
+      if (covers && (best === null || moduleDir.length > best.moduleDir.length)) {
+        best = { root, moduleDir };
+      }
+    }
+  }
+  return best;
+}
+
+/**
+ * The file holding the module that owns `moduleDir`, in either of the two
+ * layouts Rust allows for a module with children: `foo.rs` beside `foo/`, or
+ * `foo/mod.rs` inside it.
+ */
+function rustModuleFile(moduleDir: string, fileSet: Set<string>): string | null {
+  if (moduleDir === ".") return null;
+  for (const candidate of [`${moduleDir}.rs`, `${moduleDir}/mod.rs`]) {
+    if (fileSet.has(candidate)) return candidate;
+  }
+  return null;
+}
+
+/**
+ * Walk a module path down from a module directory to the file that holds it.
+ *
+ * The trailing segments of a Rust path name items, not modules — `crate::db::
+ * Connection` ends at a type — and nothing in the path says where the modules
+ * stop. So the longest prefix that names a file wins, and a path that names
+ * only items in the root resolves to the root module itself.
+ */
+function resolveRustModulePath(
+  moduleDir: string,
+  segments: string[],
+  rootFile: string | null,
+  fileSet: Set<string>,
+): string | null {
+  for (let k = segments.length; k >= 1; k--) {
+    const base = underModuleDir(moduleDir, segments.slice(0, k).join("/"));
+    if (fileSet.has(`${base}.rs`)) return `${base}.rs`;
+    if (fileSet.has(`${base}/mod.rs`)) return `${base}/mod.rs`;
+  }
+  return rootFile && fileSet.has(rootFile) ? rootFile : null;
+}
+
+/**
+ * Resolve one Rust module path to the project file it names.
+ *
+ * `relSourceFile` is the importing file, project-relative and forward-slashed.
+ * `crates` comes from {@link buildRustCrateMap}; an empty list leaves
+ * `crate::` and cross-crate paths unresolved, which is what a tree carrying no
+ * `Cargo.toml` should produce.
+ *
+ * `super::` and `self::` are answered from the file's own position rather than
+ * from its crate root, so they resolve in a manifest-less tree too. Climbing
+ * stops at the crate root's directory when a root is known: a path cannot leave
+ * its crate through `super`, and without the guard `super::super::x` at the top
+ * of a workspace member would reach into a sibling's files.
+ */
+export function resolveRustImport(
+  specifier: string,
+  relSourceFile: string,
+  fileSet: Set<string>,
+  crates: RustCrate[],
+): string | null {
+  const segments = specifier
+    .split("::")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  if (segments.length === 0) return null;
+
+  const own = rustRootForFile(crates, relSourceFile);
+  const isRoot = own?.root === relSourceFile;
+  const ownModuleDir = rustModuleDir(relSourceFile, isRoot);
+
+  // A crate this project declares, preferring one whose directory contains the
+  // importing file — two manifests can carry the same package name, and a
+  // workspace member's own name must not resolve into an unrelated checkout.
+  const crateNamed = (name: string): RustCrate | null => {
+    const candidates = crates.filter((crate) => crate.name === name && crate.libRoot);
+    if (candidates.length === 0) return null;
+    return (
+      candidates.sort((a, b) => {
+        const aCovers = a.dir === "." || relSourceFile.startsWith(`${a.dir}/`);
+        const bCovers = b.dir === "." || relSourceFile.startsWith(`${b.dir}/`);
+        if (aCovers !== bCovers) return aCovers ? -1 : 1;
+        return b.dir.length - a.dir.length || a.dir.localeCompare(b.dir);
+      })[0] ?? null
+    );
+  };
+
+  const head = segments[0];
+
+  // A bare specifier is a `mod foo;` declaration (see extractImports), which
+  // names a file in the declaring file's own module directory. `use foo;` —
+  // a whole crate, no path — arrives in the same shape, so the local module
+  // is tried first and the crate name second: only one of the two exists in
+  // any tree that compiles.
+  if (segments.length === 1 && !["crate", "self", "super"].includes(head)) {
+    const local = resolveRustModulePath(ownModuleDir, [head], null, fileSet);
+    if (local) return local;
+    return crateNamed(head)?.libRoot ?? null;
+  }
+
+  if (head === "crate") {
+    if (!own) return null;
+    return resolveRustModulePath(own.moduleDir, segments.slice(1), own.root, fileSet);
+  }
+
+  if (head === "self" || head === "super") {
+    let moduleDir = ownModuleDir;
+    let rest = segments;
+    while (rest.length > 0 && (rest[0] === "self" || rest[0] === "super")) {
+      if (rest[0] === "super") {
+        // The crate root's own directory is the top: `super` from a module
+        // directly under it would leave the crate.
+        if (own && moduleDir === own.moduleDir) return null;
+        moduleDir = toForwardSlash(path.dirname(moduleDir));
+      }
+      rest = rest.slice(1);
+    }
+    // What the climb landed on is a module too, and `super::Item` names an
+    // item declared right there — in `foo.rs` beside `foo/`, or in
+    // `foo/mod.rs`. Without this the whole `foo.rs`-plus-`foo/` layout, which
+    // is the one rustc recommends, lost every `super::` edge out of a child.
+    const parent = rustModuleFile(moduleDir, fileSet);
+    const resolved = resolveRustModulePath(
+      moduleDir,
+      rest,
+      parent === relSourceFile ? null : parent,
+      fileSet,
+    );
+    return resolved === relSourceFile ? null : resolved;
+  }
+
+  const crate = crateNamed(head);
+  if (crate?.libRoot) {
+    return resolveRustModulePath(
+      rustModuleDir(crate.libRoot, true),
+      segments.slice(1),
+      crate.libRoot,
+      fileSet,
+    );
+  }
+
+  // A uniform path: since Rust 2018 a `use` may start at a module in scope
+  // without saying `self::`, and `pub use inner::Thing;` beside `mod inner;`
+  // is how a crate republishes its own modules. Reached only once the head is
+  // known not to name a crate here, so a third-party path still resolves to
+  // nothing unless the tree really holds a module by that name.
+  return resolveRustModulePath(ownModuleDir, segments, null, fileSet);
+}
+
+/**
  * Resolve a module specifier to a relative file path within the project.
  * Returns null if the module is external (e.g., npm package, stdlib).
  *
@@ -1140,6 +1530,7 @@ export function resolveImport(
   pythonImportRoots?: string[],
   elixirModuleMap?: Map<string, string[]>,
   phpFqcnMap?: Map<string, string[]>,
+  rustCrates?: RustCrate[],
 ): string | null {
   // Skip obvious external/stdlib modules. Go is excluded from this
   // pre-check because its external classifier in `isExternalModule`
@@ -1445,18 +1836,17 @@ export function resolveImport(
     }
 
     case "rust": {
-      // mod foo → foo.rs or foo/mod.rs
-      if (!moduleSpecifier.includes("::")) {
-        const candidates = [
-          path.join(sourceDir, `${moduleSpecifier}.rs`),
-          path.join(sourceDir, moduleSpecifier, "mod.rs"),
-        ];
-        for (const candidate of candidates) {
-          const rel = toForwardSlash(path.relative(projectPath, candidate));
-          if (fileSet.has(rel)) return rel;
-        }
-      }
-      return null;
+      // `mod foo;`, `crate::`, `super::`, `self::` and cross-crate paths all
+      // resolve against the crate map. Before it, everything carrying `::`
+      // returned null and a Rust graph held only bare `mod` declarations. An
+      // empty map still resolves `mod`, `super` and `self` from the file's own
+      // position.
+      return resolveRustImport(
+        moduleSpecifier,
+        toForwardSlash(path.relative(projectPath, sourceFile)),
+        fileSet,
+        rustCrates ?? [],
+      );
     }
 
     case "csharp": {

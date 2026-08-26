@@ -221,6 +221,80 @@ function extractJsTsImportsFromNode(sgNode: ReturnType<ReturnType<typeof parse>[
   return imports;
 }
 
+/** Split a `use` group body on its top-level commas, ignoring nested groups. */
+function splitRustUseList(inner: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") depth--;
+    else if (ch === "," && depth === 0) {
+      parts.push(inner.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(inner.slice(start));
+  return parts.map((part) => part.trim()).filter(Boolean);
+}
+
+/**
+ * One leaf of a `use` tree as a module path: the alias is dropped, and so are
+ * trailing `self` and `*`, which name the module the path already reached
+ * rather than something under it.
+ */
+function rustUseLeafPath(leaf: string): string {
+  const segments = leaf
+    .replace(/\s+as\s+(?:\w+)\s*$/, "")
+    .split("::")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  while (segments.length > 0 && ["self", "*"].includes(segments[segments.length - 1])) {
+    segments.pop();
+  }
+  return segments.join("::");
+}
+
+/**
+ * Flatten one `use` tree into the module paths it names, one per leaf:
+ *
+ *   crate::config::Config     → ["crate::config::Config"]
+ *   crate::{a::Thing, b}      → ["crate::a::Thing", "crate::b"]
+ *   crate::a::{self, b as c}  → ["crate::a", "crate::a::b"]
+ *   crate::a::*               → ["crate::a"]
+ *
+ * A braced group is not a module path and never resolved to one; recording the
+ * leaves instead is what lets `use crate::{parser, printer}` draw an edge to
+ * each of the two files rather than to their parent module — or, in a flat
+ * crate with no parent module file, to nothing at all.
+ */
+export function expandRustUseTree(tree: string): string[] {
+  const trimmed = tree.trim();
+  if (!trimmed) return [];
+
+  const open = trimmed.indexOf("{");
+  if (open === -1) {
+    const leaf = rustUseLeafPath(trimmed);
+    return leaf ? [leaf] : [];
+  }
+  const close = trimmed.lastIndexOf("}");
+  if (close < open) return [];
+
+  const prefix = trimmed.slice(0, open).replace(/::\s*$/, "").trim();
+  const paths: string[] = [];
+  for (const part of splitRustUseList(trimmed.slice(open + 1, close))) {
+    for (const expanded of expandRustUseTree(part)) {
+      paths.push(prefix ? `${prefix}::${expanded}` : expanded);
+    }
+    // `self` and `*` expand to nothing, so the group's own prefix is what the
+    // leaf named: `use crate::a::{self, b}` imports `crate::a` as well as
+    // `crate::a::b`.
+    if ((part === "self" || part === "*") && prefix) paths.push(prefix);
+  }
+  return paths;
+}
+
 /**
  * Extract import statements from source code using ast-grep.
  * Returns raw module specifiers for each language's import syntax.
@@ -374,19 +448,26 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
       }
 
       case "rust": {
-        // use std::collections::HashMap;
+        // use std::collections::HashMap;  /  pub use crate::config::Config;
+        //
+        // A `use_declaration` node carries its visibility modifier, so the
+        // optional `pub` / `pub(crate)` / `pub(in path)` prefix has to be
+        // consumed here: without it every re-export in the tree was dropped
+        // before reaching the resolver, and re-exports are how a Rust crate
+        // publishes its own modules.
         for (const node of sgNode.findAll({ rule: { kind: "use_declaration" } })) {
           const text = node.text();
-          const match = text.match(/^use\s+(.+);?\s*$/);
-          if (match) {
-            imports.push({ moduleSpecifier: match[1].trim().replace(/;$/, ""), isDynamic: false });
+          const match = text.match(/^(?:pub\s*(?:\([^)]*\)\s*)?)?use\s+([\s\S]+?)\s*;?\s*$/);
+          if (!match) continue;
+          for (const spec of expandRustUseTree(match[1])) {
+            imports.push({ moduleSpecifier: spec, isDynamic: false });
           }
         }
-        // mod foo;
+        // mod foo;  /  pub mod foo;  /  pub(crate) mod foo;
         for (const node of sgNode.findAll({ rule: { kind: "mod_item" } })) {
           const text = node.text();
           if (text.includes("{")) continue; // inline mod definition, not an import
-          const match = text.match(/^mod\s+(\w+)\s*;/);
+          const match = text.match(/^(?:pub\s*(?:\([^)]*\)\s*)?)?mod\s+(\w+)\s*;/);
           if (match) {
             imports.push({ moduleSpecifier: match[1], isDynamic: false });
           }

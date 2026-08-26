@@ -455,6 +455,9 @@ import static java.lang.Math.PI;
   // ── Rust ───────────────────────────────────────────────────────────────
 
   describe("Rust imports", () => {
+    const specsOf = (source: string): string[] =>
+      extractImports(source, "rust", ".rs").map((i) => i.moduleSpecifier);
+
     it("extracts use statements", () => {
       const source = `
 use std::collections::HashMap;
@@ -465,6 +468,75 @@ mod config;
       const specs = imports.map((i) => i.moduleSpecifier);
 
       expect(specs.length).toBeGreaterThan(0);
+    });
+
+    it("extracts module declarations behind a visibility modifier", () => {
+      const specs = specsOf(`
+mod private_one;
+pub mod public_one;
+pub(crate) mod crate_visible;
+pub(in crate::outer) mod scoped;
+`);
+
+      expect(specs).toEqual(["private_one", "public_one", "crate_visible", "scoped"]);
+    });
+
+    it("extracts re-exports", () => {
+      const specs = specsOf(`
+pub use crate::config::Config;
+pub(crate) use crate::db::Pool;
+`);
+
+      expect(specs).toEqual(["crate::config::Config", "crate::db::Pool"]);
+    });
+
+    it("still skips inline module definitions", () => {
+      const specs = specsOf(`
+pub mod inline {
+    pub fn thing() {}
+}
+mod declared;
+`);
+
+      expect(specs).toEqual(["declared"]);
+    });
+
+    it("expands a use group into one path per leaf", () => {
+      const specs = specsOf("use crate::{parser, printer::Printer};");
+
+      expect(specs).toEqual(["crate::parser", "crate::printer::Printer"]);
+    });
+
+    it("expands nested use groups", () => {
+      const specs = specsOf("use crate::{a::{b, c}, d};");
+
+      expect(specs).toEqual(["crate::a::b", "crate::a::c", "crate::d"]);
+    });
+
+    it("reads self and glob leaves as the module they name", () => {
+      const specs = specsOf(`
+use crate::config::{self, Config};
+use crate::helpers::*;
+`);
+
+      expect(specs).toEqual(["crate::config", "crate::config::Config", "crate::helpers"]);
+    });
+
+    it("drops the alias from a renamed import", () => {
+      const specs = specsOf("use crate::models::User as DomainUser;");
+
+      expect(specs).toEqual(["crate::models::User"]);
+    });
+
+    it("reads a use declaration split across lines", () => {
+      const specs = specsOf(`
+use crate::{
+    alpha,
+    beta::Gamma,
+};
+`);
+
+      expect(specs).toEqual(["crate::alpha", "crate::beta::Gamma"]);
     });
   });
 
