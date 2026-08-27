@@ -1023,11 +1023,13 @@ export async function buildCodeGraph(
     // compiles with `foo` in scope, and at the file's own level a name
     // declared inside an inline block reaches the dependency instead, or
     // fails with E0432 when there is none.
+    // Only a declaration carries a declared name, so asking for the name is
+    // the whole question — pairing it with `isModuleDeclaration` would add a
+    // condition no tree can make false, and a guard nothing can fail is a
+    // guard nobody can check.
     const declaredMods = new Set<string>();
     for (const imp of importInfos) {
-      if (imp.isModuleDeclaration && imp.declaredName) {
-        declaredMods.add(imp.declaredName);
-      }
+      if (imp.declaredName) declaredMods.add(imp.declaredName);
     }
 
     for (const imp of importInfos) {
