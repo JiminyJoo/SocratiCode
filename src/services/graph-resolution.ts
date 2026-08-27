@@ -1759,7 +1759,7 @@ export function resolveRustImport(
   // 1.98.0.
   const declaredFile = ((): string | null => {
     const spec = declaredMods?.get(head);
-    if (!spec || !spec.endsWith(".rs")) return null;
+    if (!spec?.endsWith(".rs")) return null;
     const fromInline = spec.startsWith("self/");
     const base = fromInline ? ownModuleDir : path.dirname(relSourceFile);
     const declared = toForwardSlash(
