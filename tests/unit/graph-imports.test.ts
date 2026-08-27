@@ -575,6 +575,20 @@ mod conventional;
       expect(specs).toEqual(["elsewhere/moved.rs", "fixtures/support.rs", "conventional"]);
     });
 
+    it("marks a path attribute written inside an inline module", () => {
+      const specs = specsOf(`
+mod block {
+    #[path = "moved.rs"]
+    mod inner;
+}
+`);
+
+      // rustc counts this one from the file's own module directory, one
+      // directory deeper per inline level — unlike a declared module, which
+      // counts from the directory the file sits in.
+      expect(specs).toEqual(["self/block/moved.rs"]);
+    });
+
     it("extracts an extern crate declaration", () => {
       const specs = specsOf(`
 extern crate serde;

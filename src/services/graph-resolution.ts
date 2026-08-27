@@ -1677,13 +1677,25 @@ export function resolveRustImport(
   fileSet: Set<string>,
   crates: RustCrate[],
 ): string | null {
+  const own = rustRootForFile(crates, relSourceFile);
+  const isRoot = own?.root === relSourceFile;
+  const ownModuleDir = rustModuleDir(relSourceFile, isRoot);
+
   // A `#[path = "…"]` attribute arrives as the path it declares, extension and
-  // all, which no module path ever carries. It is relative to the directory
-  // the declaring file sits in — never to the directory that file's submodules
-  // live in, so `src/a/b.rs` and `src/a/mod.rs` both reach `src/a/moved.rs`.
+  // all, which no module path ever carries.
+  //
+  // On a declared module it is relative to the directory the declaring file
+  // sits in — never to the directory that file's submodules live in, so
+  // `src/a/b.rs` and `src/a/mod.rs` both reach `src/a/moved.rs`. Written
+  // inside an inline `mod`, it counts from the file's own module directory
+  // instead, one directory deeper per inline level; extractImports marks that
+  // form with a `self/` head, since nothing in the path itself tells them
+  // apart.
   if (specifier.endsWith(".rs")) {
+    const fromInline = specifier.startsWith("self/");
+    const base = fromInline ? ownModuleDir : path.dirname(relSourceFile);
     const declared = toForwardSlash(
-      path.normalize(path.join(path.dirname(relSourceFile), specifier)),
+      path.normalize(path.join(base, fromInline ? specifier.slice("self/".length) : specifier)),
     );
     return fileSet.has(declared) ? declared : null;
   }
@@ -1693,10 +1705,6 @@ export function resolveRustImport(
     .map((segment) => segment.trim())
     .filter(Boolean);
   if (segments.length === 0) return null;
-
-  const own = rustRootForFile(crates, relSourceFile);
-  const isRoot = own?.root === relSourceFile;
-  const ownModuleDir = rustModuleDir(relSourceFile, isRoot);
 
   // The package whose manifest governs this file, which is what says under
   // which names its dependencies are imported: the same crate answers to

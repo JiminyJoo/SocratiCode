@@ -1920,6 +1920,23 @@ describe("graph-resolution", () => {
       expect(resolveRustImport("nowhere/absent.rs", "src/lib.rs", fileSet, crates)).toBeNull();
     });
 
+    it("counts a path attribute inside an inline module from the module directory", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/area.rs": "",
+        "src/block/moved.rs": "",
+        "src/area/block/moved.rs": "",
+      });
+
+      // From the crate root the module directory is `src`; from `src/area.rs`
+      // it is `src/area`. Both then take one directory per inline level.
+      expect(resolveRustImport("self/block/moved.rs", "src/lib.rs", fileSet, crates))
+        .toBe("src/block/moved.rs");
+      expect(resolveRustImport("self/block/moved.rs", "src/area.rs", fileSet, crates))
+        .toBe("src/area/block/moved.rs");
+    });
+
     it("reads an unanchored path from the crate root in edition 2015", () => {
       const crates = rustProject({
         "Cargo.toml": '[package]\nname = "app"\n',

@@ -597,15 +597,26 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
             .match(/^(?:pub\s*(?:\([^)]*\)\s*)?)?mod\s+((?:r#)?\w+)\s*;/);
           if (!match) continue;
           const typed = node as unknown as SgNodeLike;
+          const inline = rustInlineModules(typed);
           // `#[path = "…"]` moves the file away from every convention, and only
           // the attribute says where. It travels as a path with its extension,
           // which no module path ever has, and the resolver reads it as one.
+          //
+          // The two forms count from different places, which rustc settles and
+          // no reading of the path can: a declared module resolves it against
+          // the directory the declaring file sits in, while one inside an
+          // inline block resolves it against that file's own module directory
+          // plus a directory per inline level. The `self/` head marks the
+          // second form for the resolver.
           const declaredPath = rustPathAttribute(typed);
           if (declaredPath) {
-            imports.push({ moduleSpecifier: declaredPath, isDynamic: false });
+            const spec =
+              inline.length === 0
+                ? declaredPath
+                : `self/${inline.join("/")}/${declaredPath}`;
+            imports.push({ moduleSpecifier: spec, isDynamic: false });
             continue;
           }
-          const inline = rustInlineModules(typed);
           const name = stripRawIdent(match[1]);
           // Declared inside `mod outer { … }`, the file sits under `outer/`,
           // not beside the declaring file.
