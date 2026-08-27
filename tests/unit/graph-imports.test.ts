@@ -710,6 +710,109 @@ mod tests {
       // and a bare head may name another crate, which rebasing would lose.
       expect(specs).toEqual(["crate::db::Connection", "serde::Deserialize"]);
     });
+
+    it("expands a group whose first leaf is itself a group", () => {
+      const specs = specsOf("use crate::{{parser, printer}, config};");
+
+      // The depth counter has to see the opening brace of the very first
+      // character of the group body. Starting the scan one character in
+      // leaves depth at zero inside the nested group, and the comma that
+      // separates its own leaves is then read as separating the outer ones.
+      expect(specs).toEqual(["crate::parser", "crate::printer", "crate::config"]);
+    });
+
+    it("keeps a single-segment path written inside an inline module", () => {
+      const specs = specsOf(`
+mod tests {
+    use standalone;
+}
+`);
+
+      // One segment is still a path. The block declares nothing by that name,
+      // so it is left alone the way any other bare head is — dropping it
+      // loses the edge entirely.
+      expect(specs).toEqual(["standalone"]);
+    });
+
+    it("keeps a leading :: inside an inline module that declares the same name", () => {
+      const specs = specsOf(`
+mod tests {
+    mod config;
+    use ::config::Item;
+}
+`);
+
+      // The `::` says the head names a crate, and it says so precisely where
+      // a module of that name is in scope — which is the one case where
+      // rebasing the path into the block would reach the wrong file.
+      expect(specs).toEqual(["::config::Item", "self::tests::config"]);
+    });
+
+    it("counts a self:: path from the inline module it is written in", () => {
+      const specs = specsOf(`
+mod tests {
+    use self::helper::run;
+}
+`);
+
+      // Inside `mod tests`, `self` is the block, so read from the file the
+      // path names `tests::helper` — one level below where it would land if
+      // the block were not there.
+      expect(specs).toEqual(["self::tests::helper::run"]);
+    });
+
+    it("joins every inline level a rebased bare head passes through", () => {
+      const specs = specsOf(`
+mod outer {
+    mod inner {
+        mod fixtures;
+        use fixtures::build;
+    }
+}
+`);
+
+      // Two levels, so the separator between them is written rather than
+      // implied — a single level hides a missing `::` because there is
+      // nothing to join.
+      expect(specs).toEqual([
+        "self::outer::inner::fixtures::build",
+        "self::outer::inner::fixtures",
+      ]);
+    });
+
+    it("marks a module declaration as a static import, whichever form it takes", () => {
+      const imports = extractImports(
+        `
+#[path = "elsewhere/moved.rs"]
+mod moved;
+mod conventional;
+`,
+        "rust",
+        ".rs",
+      );
+
+      // The flag decides the edge's type in the graph. A `mod` declaration is
+      // as static as an import gets: nothing about it is decided at run time.
+      expect(imports.map((i) => i.isDynamic)).toEqual([false, false]);
+    });
+
+    it("marks an extern crate declaration as a static import", () => {
+      const imports = extractImports("extern crate serde;", "rust", ".rs");
+
+      expect(imports.map((i) => i.isDynamic)).toEqual([false]);
+    });
+
+    it("records nothing for a crate that renames itself", () => {
+      const specs = specsOf(`
+extern crate self as this_crate;
+extern crate serde;
+`);
+
+      // `extern crate self` names the crate the file is already in, which is
+      // no edge — and resolving the word `self` as a module path would reach
+      // the file's own directory.
+      expect(specs).toEqual(["serde"]);
+    });
   });
 
   // ── Go ─────────────────────────────────────────────────────────────────
