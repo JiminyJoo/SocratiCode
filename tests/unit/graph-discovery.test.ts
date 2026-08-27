@@ -580,6 +580,21 @@ describe("buildCodeGraph — Rust crate resolution", () => {
         "pub fn shadowed() {}",
       ].join("\n"),
       "crates/cli/src/shadow/inner/serde.rs": "pub struct Local;",
+      // A declared module and a path through it, landing on two different
+      // files: the declaration draws the edge to `holder.rs`, the unanchored
+      // path draws the one to `holder/child.rs`. Edges are a set, so this is
+      // the only shape in which the graph can show that the collected
+      // declarations reach the resolver at all — asserting the declaration's
+      // own edge would stay green with the set emptied.
+      "crates/cli/src/holder_user.rs": [
+        "mod holder;",
+        "",
+        "use holder::child::Thing;",
+        "",
+        "pub fn make() -> Thing { Thing }",
+      ].join("\n"),
+      "crates/cli/src/holder_user/holder.rs": "pub mod child;",
+      "crates/cli/src/holder_user/holder/child.rs": "pub struct Thing;",
     });
     roots.push(dir);
     graph = await buildCodeGraph(dir);
@@ -642,6 +657,19 @@ describe("buildCodeGraph — Rust crate resolution", () => {
     expect(edge("crates/cli/src/shadow.rs", "crates/cli/src/shadow/inner/serde.rs")).toBe(
       true,
     );
+  });
+
+  it("carries the declarations a file makes all the way to the resolver", () => {
+    // Two files, one declaration: `mod holder;` draws the first edge, and the
+    // unanchored `use holder::child::Thing;` can only draw the second if the
+    // declaration reached the resolver. Empty the collected set and this
+    // second assertion fails while the first still holds.
+    expect(edge("crates/cli/src/holder_user.rs", "crates/cli/src/holder_user/holder.rs")).toBe(
+      true,
+    );
+    expect(
+      edge("crates/cli/src/holder_user.rs", "crates/cli/src/holder_user/holder/child.rs"),
+    ).toBe(true);
   });
 
   it("follows a module declared with a dependency's name", () => {

@@ -1748,6 +1748,11 @@ export function resolveRustImport(
   // existing caller behaves as before.
   const declaredHere = declaredMods === undefined || declaredMods.has(head);
 
+  // In edition 2015 an unanchored path is absolute from the crate root, so it
+  // names a module of the crate rather than one in this file's scope — and no
+  // declaration in this file is required, or expected.
+  const rootRelative = importingCrate?.edition === "2015" && own !== null;
+
   const target = ((): string | null => {
     // A bare specifier is a `mod foo;` declaration (see extractImports), which
     // names a file in the declaring file's own module directory. `use foo;` —
@@ -1762,10 +1767,15 @@ export function resolveRustImport(
     // cargo 1.70.0 and 1.98.0 that line reaches the dependency with the file
     // sitting right there.
     if (segments.length === 1 && !["crate", "self", "super"].includes(head)) {
+      // A declaration always counts from the declaring file. A bare `use foo;`
+      // counts from the crate root in 2015, and in 2018 needs the declaration.
+      const from = declaredHere
+        ? ownModuleDir
+        : rootRelative
+          ? own.moduleDir
+          : null;
       const local =
-        global || !declaredHere
-          ? null
-          : resolveRustModulePath(ownModuleDir, [head], null, fileSet);
+        global || from === null ? null : resolveRustModulePath(from, [head], null, fileSet);
       if (local) return local;
       return crateNamed(head)?.libRoot ?? null;
     }
@@ -1835,10 +1845,17 @@ export function resolveRustImport(
     // gate: with `mod log;` present, `use log::item;` reaches the module and
     // not the dependency. `declaredMods` left undefined keeps the older,
     // looser reading, so every existing caller behaves as before.
-    const unanchoredFrom =
-      importingCrate?.edition === "2015" && own ? own.moduleDir : ownModuleDir;
+    //
+    // The gate is a 2018 rule and only a 2018 rule. In edition 2015 the path
+    // is absolute from the crate root, so it names a module of the crate and
+    // not one in the file's scope: `use registry::write;` in `src/client.rs`
+    // compiles with `mod registry;` written in `lib.rs` and nothing at all in
+    // `client.rs` — checked on cargo 1.70.0 and 1.98.0. Gating that on a
+    // declaration in the importing file would drop the edge on every 2015
+    // crate, which is every crate whose manifest omits the key.
+    const unanchoredFrom = rootRelative ? own.moduleDir : ownModuleDir;
     const local =
-      global || !declaredHere
+      global || (!rootRelative && !declaredHere)
         ? null
         : resolveRustModulePath(unanchoredFrom, segments, null, fileSet);
     if (local) return local;

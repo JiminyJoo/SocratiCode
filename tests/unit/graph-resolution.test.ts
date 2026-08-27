@@ -2126,6 +2126,30 @@ describe("graph-resolution", () => {
       ).toBeNull();
     });
 
+    it("keeps an edition 2015 unanchored path out of the declaration gate", () => {
+      const crates = rustProject({
+        // No edition key: Cargo reads 2015, and there the path below is
+        // absolute from the crate root.
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/registry.rs": "",
+        "src/client.rs": "",
+      });
+
+      // `mod registry;` is written in lib.rs; client.rs declares nothing at
+      // all, and `use registry::write;` compiles there on cargo 1.70.0 and
+      // 1.98.0. The gate is a 2018 rule: applied here it would drop the edge
+      // on every crate whose manifest omits the edition key.
+      expect(
+        resolveRustImport("registry::write", "src/client.rs", fileSet, crates, new Set()),
+      ).toBe("src/registry.rs");
+      // And a bare head in the same position, which arrives in the shape a
+      // declaration does.
+      expect(resolveRustImport("registry", "src/client.rs", fileSet, crates, new Set())).toBe(
+        "src/registry.rs",
+      );
+    });
+
     it("leaves a single-segment path on the crate when no declaration names it", () => {
       const crates = rustProject({
         "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/bar"]\n',
