@@ -1704,7 +1704,12 @@ export function resolveRustImport(
   // `use ::config::Item;` says the head names a crate and not a module in
   // scope — it is how a file that also has a local `config` reaches the other
   // one. Since a local module otherwise wins, the marker has to survive.
-  const global = specifier.startsWith("::");
+  //
+  // What it means, though, is an edition rule: `::` is the extern prelude from
+  // 2018 on, and the crate root in 2015, where it says nothing a bare head does
+  // not already say. Checked on 1.98.0 with one crate carrying `pub mod log;`
+  // and `use ::log::LocalMarker;`: it compiles in 2015 and is E0432 in 2018.
+  const globalMarker = specifier.startsWith("::");
 
   const segments = specifier
     .split("::")
@@ -1772,6 +1777,12 @@ export function resolveRustImport(
   // names a module of the crate rather than one in this file's scope — and no
   // declaration in this file is required, or expected.
   const rootRelative = importingCrate?.edition === "2015" && own !== null;
+
+  // And so the leading `::` marks an external crate only where the extern
+  // prelude exists. In 2015 it is the same crate root an unanchored path counts
+  // from, and letting the marker through sent the path looking for a workspace
+  // crate of that name — or, finding none, to nothing at all.
+  const global = globalMarker && !rootRelative;
 
   const target = ((): string | null => {
     // A bare specifier is a `mod foo;` declaration (see extractImports), which

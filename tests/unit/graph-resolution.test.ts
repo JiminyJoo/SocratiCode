@@ -2108,6 +2108,25 @@ describe("graph-resolution", () => {
         .toBe("crates/config/src/lib.rs");
     });
 
+    it("reads a leading :: as the crate root in edition 2015", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/config.rs": "",
+        "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
+        "crates/config/src/lib.rs": "",
+      });
+
+      // The same specifier, one edition earlier, means the opposite thing:
+      // there is no extern prelude to point at, and `::` is the crate root an
+      // unanchored path already counts from. Checked on 1.98.0, where a crate
+      // with `pub mod log;` and `use ::log::LocalMarker;` compiles under 2015
+      // and is E0432 under 2018.
+      expect(resolveRustImport("::config::Settings", "crates/app/src/lib.rs", fileSet, crates))
+        .toBe("crates/app/src/config.rs");
+    });
+
     it("lets an unanchored path reach a module the file declares, and only then", () => {
       const crates = rustProject({
         "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nserde = "1"\n',
