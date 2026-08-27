@@ -502,21 +502,39 @@ describe("buildCodeGraph — Rust crate resolution", () => {
     const dir = writeLayout({
       "Cargo.toml": '[workspace]\nmembers = ["crates/cli", "crates/core"]\n',
 
-      "crates/core/Cargo.toml": '[package]\nname = "app-core"\n',
+      "crates/core/Cargo.toml": '[package]\nname = "app-core"\nedition = "2021"\n',
       "crates/core/src/lib.rs": ["pub mod store;", "", "pub use store::Store;"].join("\n"),
       "crates/core/src/store.rs": [
         "mod open;",
+        "mod support;",
         "",
         "pub struct Store;",
         "pub struct StoreError;",
       ].join("\n"),
       "crates/core/src/store/open.rs": [
         "use super::Store;",
+        "mod detail;",
         "",
         "pub fn open() -> Store { Store }",
       ].join("\n"),
+      "crates/core/src/store/support.rs": "pub fn helper() {}",
+      // A test block two levels down: `super` inside it counts from the file,
+      // so reaching `store::support` from here takes one climb more than the
+      // file's own depth suggests.
+      "crates/core/src/store/open/detail.rs": [
+        "pub fn detail() {}",
+        "",
+        "#[cfg(test)]",
+        "mod tests {",
+        "    use super::*;",
+        "    use super::super::super::support::helper;",
+        "",
+        "    #[test]",
+        "    fn works() { detail(); helper(); }",
+        "}",
+      ].join("\n"),
 
-      "crates/cli/Cargo.toml": '[package]\nname = "app-cli"\n',
+      "crates/cli/Cargo.toml": '[package]\nname = "app-cli"\nedition = "2021"\n',
       "crates/cli/src/main.rs": [
         "mod runner;",
         "",
@@ -524,7 +542,7 @@ describe("buildCodeGraph — Rust crate resolution", () => {
         "",
         "fn main() { runner::run(); }",
       ].join("\n"),
-      "crates/cli/src/runner.rs": "pub fn run() {}",
+      "crates/cli/src/runner.rs": ["use serde::Deserialize;", "", "pub fn run() {}"].join("\n"),
     });
     roots.push(dir);
     graph = await buildCodeGraph(dir);
@@ -560,6 +578,29 @@ describe("buildCodeGraph — Rust crate resolution", () => {
   });
 
   it("draws no edge into a crate for a third-party path", () => {
-    expect(graph.edges.every((e) => e.target.endsWith(".rs"))).toBe(true);
+    // `runner.rs` imports `serde` and nothing else. Asserting that every edge
+    // ends in a `.rs` file would hold on an empty set too — and did, while the
+    // resolver was returning nothing at all; the edges leaving this one file
+    // are what says a third-party path resolved to nothing.
+    const leaving = graph.edges
+      .filter((e) => e.source === "crates/cli/src/runner.rs")
+      .map((e) => e.target);
+
+    expect(leaving).toEqual([]);
+  });
+
+  it("draws no edge at the parent module for a test block's glob import", () => {
+    // `use super::*;` inside `#[cfg(test)] mod tests` names the file it is
+    // written in. Counted from the file instead, it lands on the parent
+    // module and closes a cycle with the `mod detail;` pointing the other way.
+    expect(edge("crates/core/src/store/open/detail.rs", "crates/core/src/store/open.rs")).toBe(
+      false,
+    );
+  });
+
+  it("counts the inline test module as a level a super:: path climbs", () => {
+    expect(
+      edge("crates/core/src/store/open/detail.rs", "crates/core/src/store/support.rs"),
+    ).toBe(true);
   });
 });

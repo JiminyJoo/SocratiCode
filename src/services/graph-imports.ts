@@ -240,20 +240,141 @@ function splitRustUseList(inner: string): string[] {
 }
 
 /**
+ * The module a raw identifier names. `mod r#async;` declares the module
+ * `async`, whose file rustc looks for as `async.rs` — the `r#` is how the
+ * source escapes a keyword, not part of the name. Without stripping it, the
+ * path `crate::r#async::poll` resolves to nothing and falls back to the crate
+ * root, which draws an edge at the wrong file.
+ */
+function stripRawIdent(segment: string): string {
+  return segment.startsWith("r#") ? segment.slice(2) : segment;
+}
+
+/**
  * One leaf of a `use` tree as a module path: the alias is dropped, and so are
  * trailing `self` and `*`, which name the module the path already reached
  * rather than something under it.
  */
 function rustUseLeafPath(leaf: string): string {
   const segments = leaf
-    .replace(/\s+as\s+(?:\w+)\s*$/, "")
+    .replace(/\s+as\s+(?:r#)?\w+\s*$/, "")
     .split("::")
-    .map((segment) => segment.trim())
+    .map((segment) => stripRawIdent(segment.trim()))
     .filter(Boolean);
   while (segments.length > 0 && ["self", "*"].includes(segments[segments.length - 1])) {
     segments.pop();
   }
   return segments.join("::");
+}
+
+/**
+ * Strip comments from a `use` declaration before its text is parsed as a path.
+ *
+ * A `use` tree may be spread over several lines with comments between the
+ * leaves, and the text of the AST node carries them. Left in, they become path
+ * segments: `crate::{ // note\n models::User }` yields the specifier
+ * `crate::// note\n    models::User`, which names no module and falls back to
+ * the crate root. A `use` holds no string literals, so removing comment spans
+ * from the raw text is safe.
+ */
+function stripRustComments(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
+}
+
+/**
+ * The chain of inline `mod` blocks enclosing a node, outermost first.
+ *
+ * `mod tests { … }` opens a module without opening a file, so a path written
+ * inside it is relative to a position one level below the file. The chain is
+ * what lets that position be reconstructed; it is empty for the overwhelming
+ * majority of declarations, which sit at the top of a file.
+ */
+function rustInlineModules(node: SgNodeLike): string[] {
+  const chain: string[] = [];
+  let current = node.parent();
+  while (current) {
+    if (current.kind() === "mod_item") {
+      const name = current.field("name")?.text();
+      if (name) chain.unshift(stripRawIdent(name));
+    }
+    current = current.parent();
+  }
+  return chain;
+}
+
+/** The subset of the ast-grep node API this module reads. */
+interface SgNodeLike {
+  kind(): string;
+  text(): string;
+  parent(): SgNodeLike | null;
+  prev(): SgNodeLike | null;
+  field(name: string): SgNodeLike | null;
+}
+
+/**
+ * Rewrite a path written inside inline modules so it means the same thing when
+ * read from the file's own position.
+ *
+ * `self` and `super` count module levels, and an inline `mod` is a level that
+ * the file system does not show. `use super::open_store;` inside
+ * `mod tests { … }` in `store/open.rs` names that very file — but counted from
+ * the file it reads as the parent module, and an edge is drawn at
+ * `store.rs`, which the source never imports. That edge also closes a cycle
+ * with the `mod open;` declaration pointing the other way, and `#[cfg(test)]
+ * mod tests` sits in a large share of all Rust files.
+ *
+ * Returns null when the path names the file itself, which is not an edge.
+ * Paths anchored at `crate` are unaffected, and a bare head is left alone:
+ * inside `mod tests`, `use some_crate::Thing;` is how a test reaches another
+ * crate of the project, and rebasing it would lose that edge.
+ */
+function rustPathFromInline(path: string, inline: string[]): string | null {
+  if (inline.length === 0) return path;
+  const segments = path.split("::").filter(Boolean);
+  if (segments.length === 0) return null;
+  if (segments[0] === "crate") return path;
+
+  let climbed = 0;
+  let rest = segments;
+  if (rest[0] === "self") {
+    rest = rest.slice(1);
+  } else {
+    while (rest.length > 0 && rest[0] === "super") {
+      climbed++;
+      rest = rest.slice(1);
+    }
+    if (climbed === 0) return path;
+  }
+
+  // Each `super` first consumes an inline level; only what is left of the
+  // climb reaches the file system.
+  const remainingClimb = Math.max(0, climbed - inline.length);
+  const prefix = inline.slice(0, Math.max(0, inline.length - climbed));
+  if (remainingClimb > 0) {
+    return [...Array(remainingClimb).fill("super"), ...rest].join("::");
+  }
+  const rebased = [...prefix, ...rest];
+  return rebased.length === 0 ? null : ["self", ...rebased].join("::");
+}
+
+/**
+ * The file a `#[path = "…"]` attribute points at, relative to the directory
+ * the declaring file sits in — never to the directory that file's submodules
+ * live in. Both `src/a/b.rs` and `src/a/mod.rs` resolve `#[path = "moved.rs"]`
+ * to `src/a/moved.rs`.
+ *
+ * Attributes are siblings preceding the `mod` in the tree, and several may
+ * stack (`#[cfg(test)]` above `#[path = …]`), so the walk goes back through
+ * all of them.
+ */
+function rustPathAttribute(node: SgNodeLike): string | null {
+  let previous = node.prev();
+  while (previous?.kind() === "attribute_item") {
+    const match = previous.text().match(/^#\[\s*path\s*=\s*"([^"]+)"\s*\]$/);
+    if (match) return match[1];
+    previous = previous.prev();
+  }
+  return null;
 }
 
 /**
@@ -456,20 +577,51 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
         // before reaching the resolver, and re-exports are how a Rust crate
         // publishes its own modules.
         for (const node of sgNode.findAll({ rule: { kind: "use_declaration" } })) {
-          const text = node.text();
+          const text = stripRustComments(node.text());
           const match = text.match(/^(?:pub\s*(?:\([^)]*\)\s*)?)?use\s+([\s\S]+?)\s*;?\s*$/);
           if (!match) continue;
+          const inline = rustInlineModules(node as unknown as SgNodeLike);
           for (const spec of expandRustUseTree(match[1])) {
-            imports.push({ moduleSpecifier: spec, isDynamic: false });
+            const fromInline = rustPathFromInline(spec, inline);
+            if (fromInline) imports.push({ moduleSpecifier: fromInline, isDynamic: false });
           }
         }
-        // mod foo;  /  pub mod foo;  /  pub(crate) mod foo;
+        // mod foo;  /  pub mod foo;  /  pub(crate) mod foo;  /  mod r#async;
         for (const node of sgNode.findAll({ rule: { kind: "mod_item" } })) {
-          const text = node.text();
-          if (text.includes("{")) continue; // inline mod definition, not an import
-          const match = text.match(/^(?:pub\s*(?:\([^)]*\)\s*)?)?mod\s+(\w+)\s*;/);
-          if (match) {
-            imports.push({ moduleSpecifier: match[1], isDynamic: false });
+          // A body makes it a module definition, not a declaration pointing at
+          // another file. Reading the field rather than looking for a brace in
+          // the text keeps an attribute that happens to carry one out of it.
+          if (node.field("body")) continue;
+          const match = node
+            .text()
+            .match(/^(?:pub\s*(?:\([^)]*\)\s*)?)?mod\s+((?:r#)?\w+)\s*;/);
+          if (!match) continue;
+          const typed = node as unknown as SgNodeLike;
+          // `#[path = "…"]` moves the file away from every convention, and only
+          // the attribute says where. It travels as a path with its extension,
+          // which no module path ever has, and the resolver reads it as one.
+          const declaredPath = rustPathAttribute(typed);
+          if (declaredPath) {
+            imports.push({ moduleSpecifier: declaredPath, isDynamic: false });
+            continue;
+          }
+          const inline = rustInlineModules(typed);
+          const name = stripRawIdent(match[1]);
+          // Declared inside `mod outer { … }`, the file sits under `outer/`,
+          // not beside the declaring file.
+          const spec = inline.length === 0 ? name : ["self", ...inline, name].join("::");
+          imports.push({ moduleSpecifier: spec, isDynamic: false });
+        }
+        // extern crate serde;  /  #[macro_use] extern crate log as logging;
+        //
+        // The 2015 way of naming a dependency, still written today above a
+        // `#[macro_use]`. The crate it names cannot collide with a local
+        // module of the same name — rustc rejects that — so the bare name is
+        // safe to resolve the way a `mod` declaration is.
+        for (const node of sgNode.findAll({ rule: { kind: "extern_crate_declaration" } })) {
+          const name = node.field("name")?.text();
+          if (name && name !== "self") {
+            imports.push({ moduleSpecifier: stripRawIdent(name), isDynamic: false });
           }
         }
         break;

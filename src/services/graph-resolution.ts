@@ -1008,19 +1008,6 @@ function declaredWorkspaceMembers(
   // Split on the wildcards first and quote only the literal spans between
   // them, so every other regex metacharacter matches itself. `**` always
   // spans separators; what a lone `*` spans is `singleStar`, and the two
-  // sides of the declaration do not agree on it. Naming both spellings in the
-  // type rejects a fragment that is neither — a `".+"` or a `"[^/]"` that
-  // would quietly change what every pattern matches. It does not stop the two
-  // being transposed, since each is valid at either call site; the tests that
-  // assert each side separately are what pin that.
-  const toRe = (pattern: string, singleStar: "[^/]*" | ".*"): RegExp => {
-    const quote = (literal: string) => literal.replace(/[.+^${}()|[\]\\?*]/g, "\\$&");
-    const body = pattern
-      .split("**")
-      .map((span) => span.split("*").map(quote).join(singleStar))
-      .join(".*");
-    return new RegExp(`^${body}$`);
-  };
   const prefix = manifestDir === "." ? "" : `${manifestDir}/`;
   const relativeToManifest = (dir: string): string | null => {
     if (!prefix) return dir;
@@ -1041,9 +1028,9 @@ function declaredWorkspaceMembers(
   // A narrow `*` on the include side registers fewer roots than uv, which
   // costs at most an edge. A narrow `*` on the exclude side fails to exclude,
   // which admits a package the manifest named and draws an edge uv would not.
-  const included = memberPatterns.map((p) => toRe(p.replace(/\/+$/, ""), "[^/]*"));
+  const included = memberPatterns.map((p) => globToRegex(p.replace(/\/+$/, ""), "[^/]*"));
   if (included.length === 0) return [];
-  const excluded = excludePatterns.map((p) => toRe(p.replace(/\/+$/, ""), ".*"));
+  const excluded = excludePatterns.map((p) => globToRegex(p.replace(/\/+$/, ""), ".*"));
 
   return allManifestDirs.filter((dir) => {
     if (dir === manifestDir) return false;
@@ -1051,6 +1038,19 @@ function declaredWorkspaceMembers(
     if (rel === null) return false;
     return included.some((re) => re.test(rel)) && !excluded.some((re) => re.test(rel));
   });
+}
+
+/**
+ * Compile a glob pattern into a regular expression.
+ * `**` spans separators; `singleStar` controls what a lone `*` spans.
+ */
+function globToRegex(pattern: string, singleStar: "[^/]*" | ".*"): RegExp {
+  const quote = (literal: string) => literal.replace(/[.+^${}()|[\]\\?*]/g, "\\$&");
+  const body = pattern
+    .split("**")
+    .map((span) => span.split("*").map(quote).join(singleStar))
+    .join(".*");
+  return new RegExp(`^${body}$`);
 }
 
 /**
@@ -1125,12 +1125,11 @@ export function pythonRootsForFile(
  * filter `getGraphableFiles` uses is applied, with the same trailing-slash
  * convention for directories.
  *
- * `target/` is additionally skipped unconditionally. It is where Cargo unpacks
- * every dependency it builds, each carrying its own `Cargo.toml`, and a vendored
- * crate registered from there would claim a name the workspace also declares.
- * DEFAULT_IGNORE_PATTERNS lists it, but a `.socraticodeignore` negation can
- * re-include it, and `CARGO_TARGET_DIR` can put it under any other name — which
- * is why the manifests found there are also the ones nothing else would catch.
+ * `target/` is skipped unconditionally by directory name. Additionally, any
+ * directory carrying `CACHEDIR.TAG` (created by Cargo per the Cache Directory
+ * Tagging Standard) or `.cargo-ok` is skipped unconditionally: this defends
+ * against custom `CARGO_TARGET_DIR` directory names where Cargo unpacks
+ * dependencies and build artifacts during compilation.
  */
 function findCargoManifests(projectPath: string): string[] {
   const ig = createIgnoreFilter(projectPath);
@@ -1140,6 +1139,17 @@ function findCargoManifests(projectPath: string): string[] {
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch {
+      return;
+    }
+    // A Cargo target / build directory contains CACHEDIR.TAG at its root,
+    // created by Cargo during build (per the Cache Directory Tagging Standard).
+    // Skipping any directory carrying this tag or .cargo-ok prevents unpacked
+    // dependencies and vendored build artifacts under non-default CARGO_TARGET_DIR
+    // names from registering as project crates.
+    if (
+      dir !== projectPath &&
+      entries.some((e) => e.name === "CACHEDIR.TAG" || e.name === ".cargo-ok")
+    ) {
       return;
     }
     for (const entry of entries) {
@@ -1176,8 +1186,9 @@ export interface RustCrate {
   /**
    * The name other crates import it by — `[package] name` with dashes turned
    * into underscores, which is the translation Cargo itself performs. Null for
-   * a manifest that declares no package (a `[workspace]`-only root) or no
-   * library target, neither of which anything can import by name.
+   * a manifest that declares no package (a `[workspace]`-only root), no
+   * library target, or an explicit `[workspace.exclude]` member, none of which
+   * anything can import by name.
    */
   name: string | null;
   /** Project-relative path of the library root module, when the crate has one. */
@@ -1189,6 +1200,22 @@ export interface RustCrate {
    * `crate::` is relative to.
    */
   roots: string[];
+  /**
+   * The Rust edition the manifest declares, defaulting to `"2015"` when the
+   * key is absent, as Cargo does. It decides both target autodiscovery and
+   * where an unanchored path in a `use` starts counting from.
+   */
+  edition: string;
+  /**
+   * Map from local dependency name / alias (with dashes turned to underscores)
+   * to the target crate's package name (with dashes turned to underscores).
+   *
+   * Covers:
+   *   [dependencies]
+   *   my_alias = { package = "actual-package-name", ... }
+   * as well as `[workspace.dependencies]` referenced via `workspace = true`.
+   */
+  aliases?: Record<string, string>;
 }
 
 /** A parsed `Cargo.toml` as this reader consumes it. */
@@ -1208,6 +1235,59 @@ function declaredTargetPath(entry: TomlValue | undefined): string | null {
 }
 
 /**
+ * Extract dependency aliases declared in a `Cargo.toml` table (e.g. `[dependencies]`,
+ * `[dev-dependencies]`, `[build-dependencies]`, `[target.*.dependencies]`).
+ *
+ * Normalizes dashes to underscores for both the local alias name and the target
+ * crate package name. If `dep.workspace = true`, resolves against workspace
+ * dependencies declared in the enclosing workspace manifest.
+ */
+function extractCargoAliases(
+  manifest: CargoTable | null,
+  wsDeps: Map<string, string>,
+): Record<string, string> {
+  if (!manifest) return {};
+  const aliases: Record<string, string> = {};
+
+  const processDepTable = (tableValue: TomlValue | undefined): void => {
+    const table = asTable(tableValue);
+    if (!table) return;
+    for (const [depKey, depVal] of Object.entries(table)) {
+      const alias = depKey.replace(/-/g, "_");
+      if (isTable(depVal)) {
+        if (typeof depVal.package === "string") {
+          aliases[alias] = depVal.package.replace(/-/g, "_");
+        } else if (depVal.workspace === true) {
+          const wsTarget = wsDeps.get(alias) ?? wsDeps.get(depKey.replace(/_/g, "-"));
+          aliases[alias] = wsTarget ?? alias;
+        } else {
+          aliases[alias] = alias;
+        }
+      } else if (typeof depVal === "string") {
+        aliases[alias] = alias;
+      }
+    }
+  };
+
+  processDepTable(manifest.dependencies);
+  processDepTable(manifest["dev-dependencies"]);
+  processDepTable(manifest["build-dependencies"]);
+
+  const targetSection = asTable(manifest.target);
+  if (targetSection) {
+    for (const targetVal of Object.values(targetSection)) {
+      const targetTable = asTable(targetVal);
+      if (!targetTable) continue;
+      processDepTable(targetTable.dependencies);
+      processDepTable(targetTable["dev-dependencies"]);
+      processDepTable(targetTable["build-dependencies"]);
+    }
+  }
+
+  return aliases;
+}
+
+/**
  * Build the crate map for a Rust project, one entry per `Cargo.toml`.
  *
  * Rust names its own code three ways, and only one of them says anything about
@@ -1222,11 +1302,15 @@ function declaredTargetPath(entry: TomlValue | undefined): string | null {
  * out as its bare `mod` declarations and nothing else.
  *
  * Targets are read from the manifest where declared and taken by convention
- * otherwise, matching Cargo's own autodiscovery: `src/lib.rs`, `src/main.rs`,
- * `src/bin/<name>.rs`, `src/bin/<name>/main.rs`, `tests/`, `examples/`,
- * `benches/` and
- * `build.rs`. A convention path is recorded only when the file is actually in
- * `fileSet`, so a root that does not exist never shadows one that does.
+ * otherwise, matching Cargo's own autodiscovery rules per edition:
+ *   - `autobins`, `autotests`, `autoexamples`, `autobenches`, `autolib` flags
+ *     turn off autodiscovery for their respective directories when set to `false`.
+ *   - In edition 2015, autodiscovery is turned off by default for a target type
+ *     when at least one target of that type is manually declared. In edition
+ *     2018+, autodiscovery remains enabled unless explicitly set to `false`.
+ *   - `[package] build = false` disables the build script target (`build.rs`).
+ *   - `[workspace] exclude` patterns exclude matching directories from being
+ *     registered as importable workspace members (`name = null`).
  *
  * The manifest is parsed with the same TOML reader the Python side uses rather
  * than scanned, so a `path` key belonging to a dependency is a different key
@@ -1242,35 +1326,108 @@ export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): Ru
   if (relManifests.length === 0) return [];
 
   const rustFiles = [...fileSet].filter((f) => f.endsWith(".rs")).sort();
-  const crates: RustCrate[] = [];
+  const parsedManifests: Array<{ relManifest: string; dir: string; manifest: CargoTable | null }> = [];
 
   for (const relManifest of relManifests) {
     const dir = toForwardSlash(path.dirname(relManifest)); // "." at the root
-    const under = (relative: string): string => (dir === "." ? relative : `${dir}/${relative}`);
-
     let manifest: CargoTable | null = null;
     try {
-      manifest = asTable(parseToml(readFileSync(path.join(root, relManifest), "utf8")));
+      manifest = asTable(parseToml(readFileSync(path.join(root, relManifest), "utf8").replace(/^\uFEFF/, "")));
     } catch {
       // Unreadable or malformed manifest: its convention targets still count.
+    }
+    parsedManifests.push({ relManifest, dir, manifest });
+  }
+
+  // Collect all workspace tables to resolve `[workspace] exclude` and `[workspace.dependencies]`.
+  const workspaceManifests = parsedManifests
+    .filter((m) => m.manifest?.workspace !== undefined && isTable(m.manifest.workspace))
+    .map((m) => ({ dir: m.dir, table: m.manifest?.workspace as CargoTable }));
+
+  const findEnclosingWorkspace = (
+    dir: string,
+  ): { dir: string; table: CargoTable } | null => {
+    let best: { dir: string; table: CargoTable } | null = null;
+    for (const ws of workspaceManifests) {
+      const isAncestor = ws.dir === "." || dir === ws.dir || dir.startsWith(`${ws.dir}/`);
+      if (isAncestor && (best === null || ws.dir.length > best.dir.length)) {
+        best = ws;
+      }
+    }
+    return best;
+  };
+
+  const crates: RustCrate[] = [];
+
+  for (const { dir, manifest } of parsedManifests) {
+    const under = (relative: string): string => (dir === "." ? relative : `${dir}/${relative}`);
+
+    const enclosingWs = findEnclosingWorkspace(dir);
+    let isExcludedByWorkspace = false;
+    const wsDeps = new Map<string, string>();
+
+    if (enclosingWs) {
+      const relToWs =
+        enclosingWs.dir === "."
+          ? dir
+          : dir.startsWith(`${enclosingWs.dir}/`)
+            ? dir.slice(enclosingWs.dir.length + 1)
+            : null;
+
+      if (relToWs !== null && relToWs !== "") {
+        const excludePatterns = patternList(enclosingWs.table.exclude);
+        if (excludePatterns && excludePatterns.length > 0) {
+          const excludeRes = excludePatterns.map((p) => globToRegex(p.replace(/\/+$/, ""), ".*"));
+          if (excludeRes.some((re) => re.test(relToWs))) {
+            isExcludedByWorkspace = true;
+          }
+        }
+      }
+
+      const wsDepsTable = asTable(enclosingWs.table.dependencies);
+      if (wsDepsTable) {
+        for (const [depKey, depVal] of Object.entries(wsDepsTable)) {
+          const normKey = depKey.replace(/-/g, "_");
+          if (isTable(depVal) && typeof depVal.package === "string") {
+            wsDeps.set(normKey, depVal.package.replace(/-/g, "_"));
+          } else {
+            wsDeps.set(normKey, normKey);
+          }
+        }
+      }
     }
 
     const pkg = asTable(manifest?.package);
     const lib = asTable(manifest?.lib);
+    // A manifest with no `edition` key is a 2015 manifest — Cargo warns about
+    // it and carries on. Reading only the explicit spelling left every such
+    // package on 2018 rules, and a `[[bin]]` declared beside an undeclared
+    // file in `src/bin/` then handed the file a crate root Cargo never gives
+    // it. Old manifests are exactly the ones that omit the key.
+    const edition = typeof pkg?.edition === "string" ? pkg.edition : "2015";
+    const is2015 = edition === "2015";
+
     const declaredLib = declaredTargetPath(manifest?.lib);
+    const autolib = typeof pkg?.autolib === "boolean" ? pkg.autolib : true;
     const conventionLib = under("src/lib.rs");
     const libRoot =
       declaredLib && fileSet.has(under(declaredLib))
         ? under(declaredLib)
-        : fileSet.has(conventionLib)
+        : (manifest?.lib !== undefined || autolib) && fileSet.has(conventionLib)
           ? conventionLib
           : null;
 
     // `[lib] name` overrides the package name for the importable target; both
     // spellings reach the same file, so both are recorded by the caller's map.
+    // An explicitly excluded workspace member cannot be imported by name.
     const declaredName = typeof lib?.name === "string" ? lib.name : null;
     const packageName = typeof pkg?.name === "string" ? pkg.name : null;
-    const name = libRoot ? ((declaredName ?? packageName)?.replace(/-/g, "_") ?? null) : null;
+    const name =
+      isExcludedByWorkspace
+        ? null
+        : libRoot
+          ? ((declaredName ?? packageName)?.replace(/-/g, "_") ?? null)
+          : null;
 
     const roots = new Set<string>();
     if (libRoot) roots.add(libRoot);
@@ -1282,16 +1439,48 @@ export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): Ru
       const declared = manifest?.[key];
       for (const entry of Array.isArray(declared) ? declared : [declared]) {
         const targetPath = declaredTargetPath(entry);
-        if (targetPath && fileSet.has(under(targetPath))) roots.add(under(targetPath));
+        const targetEntryTable = asTable(entry);
+        if (targetPath && fileSet.has(under(targetPath))) {
+          roots.add(under(targetPath));
+        } else if (!targetPath && typeof targetEntryTable?.name === "string") {
+          const targetName = targetEntryTable.name;
+          if (key === "bin") {
+            const candidates = [`src/bin/${targetName}.rs`, `src/bin/${targetName}/main.rs`];
+            if (targetName === (packageName ?? name)) candidates.push("src/main.rs");
+            for (const cand of candidates) {
+              if (fileSet.has(under(cand))) roots.add(under(cand));
+            }
+          } else if (key === "test") {
+            for (const cand of [`tests/${targetName}.rs`, `tests/${targetName}/main.rs`]) {
+              if (fileSet.has(under(cand))) roots.add(under(cand));
+            }
+          } else if (key === "example") {
+            for (const cand of [`examples/${targetName}.rs`, `examples/${targetName}/main.rs`]) {
+              if (fileSet.has(under(cand))) roots.add(under(cand));
+            }
+          } else if (key === "bench") {
+            for (const cand of [`benches/${targetName}.rs`, `benches/${targetName}/main.rs`]) {
+              if (fileSet.has(under(cand))) roots.add(under(cand));
+            }
+          }
+        }
       }
     }
-    const buildScript = typeof pkg?.build === "string" ? pkg.build : "build.rs";
-    if (fileSet.has(under(buildScript))) roots.add(under(buildScript));
 
-    // Convention targets, as Cargo autodiscovers them.
-    if (fileSet.has(under("src/main.rs"))) roots.add(under("src/main.rs"));
-    for (const dirName of ["src/bin", "tests", "examples", "benches"]) {
-      const prefix = `${under(dirName)}/`;
+    // Build script target: `build = false` in [package] explicitly disables it.
+    if (pkg?.build !== false) {
+      const buildScript = typeof pkg?.build === "string" ? pkg.build : "build.rs";
+      if (fileSet.has(under(buildScript))) roots.add(under(buildScript));
+    }
+
+    // Convention targets, as Cargo autodiscovers them according to edition and flags.
+    const autoBins =
+      typeof pkg?.autobins === "boolean"
+        ? pkg.autobins
+        : !(is2015 && manifest?.bin !== undefined);
+    if (autoBins) {
+      if (fileSet.has(under("src/main.rs"))) roots.add(under("src/main.rs"));
+      const prefix = `${under("src/bin")}/`;
       for (const file of rustFiles) {
         if (!file.startsWith(prefix)) continue;
         const rest = file.slice(prefix.length);
@@ -1303,7 +1492,55 @@ export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): Ru
       }
     }
 
-    crates.push({ dir, name, libRoot, roots: [...roots].sort() });
+    const autoTests =
+      typeof pkg?.autotests === "boolean"
+        ? pkg.autotests
+        : !(is2015 && manifest?.test !== undefined);
+    if (autoTests) {
+      const prefix = `${under("tests")}/`;
+      for (const file of rustFiles) {
+        if (!file.startsWith(prefix)) continue;
+        const rest = file.slice(prefix.length);
+        if (!rest.includes("/")) roots.add(file);
+        else if (rest.split("/").length === 2 && rest.endsWith("/main.rs")) roots.add(file);
+      }
+    }
+
+    const autoExamples =
+      typeof pkg?.autoexamples === "boolean"
+        ? pkg.autoexamples
+        : !(is2015 && manifest?.example !== undefined);
+    if (autoExamples) {
+      const prefix = `${under("examples")}/`;
+      for (const file of rustFiles) {
+        if (!file.startsWith(prefix)) continue;
+        const rest = file.slice(prefix.length);
+        if (!rest.includes("/")) roots.add(file);
+        else if (rest.split("/").length === 2 && rest.endsWith("/main.rs")) roots.add(file);
+      }
+    }
+
+    const autoBenches =
+      typeof pkg?.autobenches === "boolean"
+        ? pkg.autobenches
+        : !(is2015 && manifest?.bench !== undefined);
+    if (autoBenches) {
+      const prefix = `${under("benches")}/`;
+      for (const file of rustFiles) {
+        if (!file.startsWith(prefix)) continue;
+        const rest = file.slice(prefix.length);
+        if (!rest.includes("/")) roots.add(file);
+        else if (rest.split("/").length === 2 && rest.endsWith("/main.rs")) roots.add(file);
+      }
+    }
+
+    const aliases = extractCargoAliases(manifest, wsDeps);
+    const crateEntry: RustCrate = { dir, name, libRoot, roots: [...roots].sort(), edition };
+    if (Object.keys(aliases).length > 0) {
+      crateEntry.aliases = aliases;
+    }
+
+    crates.push(crateEntry);
   }
 
   return crates;
@@ -1347,19 +1584,43 @@ function rustRootForFile(
   crates: RustCrate[],
   relFile: string,
 ): { root: string; moduleDir: string } | null {
+  // The answer depends only on the file and the crate map, and every import in
+  // a file asks it again — around twenty times per file, once per `use`. On a
+  // workspace of a hundred crates that repetition measured two seconds of the
+  // build. The cache is keyed on the crate map itself, so it lives exactly as
+  // long as the build that produced it and never outlives a stale map.
+  let perFile = rustRootCache.get(crates);
+  if (!perFile) {
+    perFile = new Map();
+    rustRootCache.set(crates, perFile);
+  }
+  const cached = perFile.get(relFile);
+  if (cached !== undefined) return cached;
+
   let best: { root: string; moduleDir: string } | null = null;
   for (const crate of crates) {
     for (const root of crate.roots) {
-      if (root === relFile) return { root, moduleDir: rustModuleDir(root, true) };
       const moduleDir = rustModuleDir(root, true);
+      if (root === relFile) {
+        best = { root, moduleDir };
+        break;
+      }
       const covers = moduleDir === "." || relFile.startsWith(`${moduleDir}/`);
       if (covers && (best === null || moduleDir.length > best.moduleDir.length)) {
         best = { root, moduleDir };
       }
     }
+    if (best?.root === relFile) break;
   }
+  perFile.set(relFile, best);
   return best;
 }
+
+/** Per-build memo for {@link rustRootForFile}; see the note in that function. */
+const rustRootCache = new WeakMap<
+  RustCrate[],
+  Map<string, { root: string; moduleDir: string } | null>
+>();
 
 /**
  * The file holding the module that owns `moduleDir`, in either of the two
@@ -1416,6 +1677,17 @@ export function resolveRustImport(
   fileSet: Set<string>,
   crates: RustCrate[],
 ): string | null {
+  // A `#[path = "…"]` attribute arrives as the path it declares, extension and
+  // all, which no module path ever carries. It is relative to the directory
+  // the declaring file sits in — never to the directory that file's submodules
+  // live in, so `src/a/b.rs` and `src/a/mod.rs` both reach `src/a/moved.rs`.
+  if (specifier.endsWith(".rs")) {
+    const declared = toForwardSlash(
+      path.normalize(path.join(path.dirname(relSourceFile), specifier)),
+    );
+    return fileSet.has(declared) ? declared : null;
+  }
+
   const segments = specifier
     .split("::")
     .map((segment) => segment.trim())
@@ -1426,11 +1698,23 @@ export function resolveRustImport(
   const isRoot = own?.root === relSourceFile;
   const ownModuleDir = rustModuleDir(relSourceFile, isRoot);
 
+  // The package whose manifest governs this file, which is what says under
+  // which names its dependencies are imported: the same crate answers to
+  // different names in two members of one workspace.
+  const importingCrate = crates
+    .filter((crate) => crate.dir === "." || relSourceFile.startsWith(`${crate.dir}/`))
+    .sort((a, b) => b.dir.length - a.dir.length)[0];
+
   // A crate this project declares, preferring one whose directory contains the
   // importing file — two manifests can carry the same package name, and a
   // workspace member's own name must not resolve into an unrelated checkout.
   const crateNamed = (name: string): RustCrate | null => {
-    const candidates = crates.filter((crate) => crate.name === name && crate.libRoot);
+    // `dep = { package = "real-name" }` renames a dependency for the crate
+    // that declares it, and the code then writes the alias. The alias appears
+    // in no `[package] name`, so without this the path resolved to nothing —
+    // or worse, to a local module that happened to carry the alias.
+    const declared = importingCrate?.aliases?.[name] ?? name;
+    const candidates = crates.filter((crate) => crate.name === declared && crate.libRoot);
     if (candidates.length === 0) return null;
     return (
       candidates.sort((a, b) => {
@@ -1444,64 +1728,87 @@ export function resolveRustImport(
 
   const head = segments[0];
 
-  // A bare specifier is a `mod foo;` declaration (see extractImports), which
-  // names a file in the declaring file's own module directory. `use foo;` —
-  // a whole crate, no path — arrives in the same shape, so the local module
-  // is tried first and the crate name second: only one of the two exists in
-  // any tree that compiles.
-  if (segments.length === 1 && !["crate", "self", "super"].includes(head)) {
-    const local = resolveRustModulePath(ownModuleDir, [head], null, fileSet);
-    if (local) return local;
-    return crateNamed(head)?.libRoot ?? null;
-  }
-
-  if (head === "crate") {
-    if (!own) return null;
-    return resolveRustModulePath(own.moduleDir, segments.slice(1), own.root, fileSet);
-  }
-
-  if (head === "self" || head === "super") {
-    let moduleDir = ownModuleDir;
-    let rest = segments;
-    while (rest.length > 0 && (rest[0] === "self" || rest[0] === "super")) {
-      if (rest[0] === "super") {
-        // The crate root's own directory is the top: `super` from a module
-        // directly under it would leave the crate.
-        if (own && moduleDir === own.moduleDir) return null;
-        moduleDir = toForwardSlash(path.dirname(moduleDir));
-      }
-      rest = rest.slice(1);
+  const target = ((): string | null => {
+    // A bare specifier is a `mod foo;` declaration (see extractImports), which
+    // names a file in the declaring file's own module directory. `use foo;` —
+    // a whole crate, no path — and `extern crate foo;` arrive in the same
+    // shape, so the local module is tried first and the crate name second:
+    // only one of the two exists in any tree that compiles.
+    if (segments.length === 1 && !["crate", "self", "super"].includes(head)) {
+      const local = resolveRustModulePath(ownModuleDir, [head], null, fileSet);
+      if (local) return local;
+      return crateNamed(head)?.libRoot ?? null;
     }
-    // What the climb landed on is a module too, and `super::Item` names an
-    // item declared right there — in `foo.rs` beside `foo/`, or in
-    // `foo/mod.rs`. Without this the whole `foo.rs`-plus-`foo/` layout, which
-    // is the one rustc recommends, lost every `super::` edge out of a child.
-    const parent = rustModuleFile(moduleDir, fileSet);
-    const resolved = resolveRustModulePath(
-      moduleDir,
-      rest,
-      parent === relSourceFile ? null : parent,
-      fileSet,
-    );
-    return resolved === relSourceFile ? null : resolved;
-  }
 
-  const crate = crateNamed(head);
-  if (crate?.libRoot) {
-    return resolveRustModulePath(
-      rustModuleDir(crate.libRoot, true),
-      segments.slice(1),
-      crate.libRoot,
-      fileSet,
-    );
-  }
+    if (head === "crate") {
+      if (!own) return null;
+      return resolveRustModulePath(own.moduleDir, segments.slice(1), own.root, fileSet);
+    }
 
-  // A uniform path: since Rust 2018 a `use` may start at a module in scope
-  // without saying `self::`, and `pub use inner::Thing;` beside `mod inner;`
-  // is how a crate republishes its own modules. Reached only once the head is
-  // known not to name a crate here, so a third-party path still resolves to
-  // nothing unless the tree really holds a module by that name.
-  return resolveRustModulePath(ownModuleDir, segments, null, fileSet);
+    if (head === "self" || head === "super") {
+      let moduleDir = ownModuleDir;
+      let rest = segments;
+      while (rest.length > 0 && (rest[0] === "self" || rest[0] === "super")) {
+        if (rest[0] === "super") {
+          // The crate root's own directory is the top: `super` from a module
+          // directly under it would leave the crate.
+          if (own && moduleDir === own.moduleDir) return null;
+          moduleDir = toForwardSlash(path.dirname(moduleDir));
+        }
+        rest = rest.slice(1);
+      }
+      // What the climb landed on is a module too, and `super::Item` names an
+      // item declared right there — in `foo.rs` beside `foo/`, or in
+      // `foo/mod.rs`. Without this the whole `foo.rs`-plus-`foo/` layout, which
+      // is the one rustc recommends, lost every `super::` edge out of a child.
+      const parent = rustModuleFile(moduleDir, fileSet);
+      return resolveRustModulePath(
+        moduleDir,
+        rest,
+        parent === relSourceFile ? null : parent,
+        fileSet,
+      );
+    }
+
+    // A uniform path: since Rust 2018 a `use` may start at a module in scope
+    // without saying `self::`, and `pub use inner::Thing;` beside `mod inner;`
+    // is how a crate republishes its own modules.
+    //
+    // This is tried before the crate names because that is the order rustc
+    // resolves in: a module in scope wins, and the extern prelude is consulted
+    // last. Reading the crate names first drew an edge into an unrelated
+    // sibling crate whenever a local module happened to carry its name —
+    // `config`, `log` and `utils` are both common module names and published
+    // crate names — and did so without the importing package declaring any
+    // dependency on it.
+    //
+    // In edition 2015 an unanchored path is absolute from the crate root
+    // instead: `use registry::write;` in `src/client.rs` names
+    // `src/registry.rs`, and rustc rejects that same line from 2018 on. A
+    // crate with no manifest keeps the 2018 reading, which is what a bare
+    // tree of `.rs` files most likely is.
+    const unanchoredFrom =
+      importingCrate?.edition === "2015" && own ? own.moduleDir : ownModuleDir;
+    const local = resolveRustModulePath(unanchoredFrom, segments, null, fileSet);
+    if (local) return local;
+
+    const crate = crateNamed(head);
+    if (crate?.libRoot) {
+      return resolveRustModulePath(
+        rustModuleDir(crate.libRoot, true),
+        segments.slice(1),
+        crate.libRoot,
+        fileSet,
+      );
+    }
+    return null;
+  })();
+
+  // A file never imports itself. `use crate::db::Connection;` written inside
+  // `#[cfg(test)] mod tests` in `db.rs` names that very file, and so does a
+  // `super::` path that climbs back to its own module: recorded as an edge,
+  // each becomes a node depending on itself.
+  return target === relSourceFile ? null : target;
 }
 
 /**

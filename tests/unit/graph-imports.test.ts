@@ -538,6 +538,108 @@ use crate::{
 
       expect(specs).toEqual(["crate::alpha", "crate::beta::Gamma"]);
     });
+
+    it("ignores comments written between the leaves of a use group", () => {
+      const specs = specsOf(`
+use crate::{
+    // the one we need
+    models::User,
+    /* and this one */ helpers::format,
+};
+`);
+
+      expect(specs).toEqual(["crate::models::User", "crate::helpers::format"]);
+    });
+
+    it("names the module a raw identifier escapes, not its escape", () => {
+      const specs = specsOf(`
+pub mod r#async;
+use crate::r#type::Kind;
+use crate::r#match::Pattern as r#final;
+`);
+
+      // `use` declarations are read before `mod` ones, hence the order.
+      expect(specs).toEqual(["crate::type::Kind", "crate::match::Pattern", "async"]);
+    });
+
+    it("takes the file of a mod from its path attribute", () => {
+      const specs = specsOf(`
+#[path = "elsewhere/moved.rs"]
+mod moved;
+#[cfg(test)]
+#[path = "fixtures/support.rs"]
+mod support;
+mod conventional;
+`);
+
+      expect(specs).toEqual(["elsewhere/moved.rs", "fixtures/support.rs", "conventional"]);
+    });
+
+    it("extracts an extern crate declaration", () => {
+      const specs = specsOf(`
+extern crate serde;
+#[macro_use]
+extern crate log;
+extern crate my_lib as shorthand;
+`);
+
+      expect(specs).toEqual(["serde", "log", "my_lib"]);
+    });
+
+    it("places a mod declared inside an inline module under that module", () => {
+      const specs = specsOf(`
+mod outer {
+    mod inner;
+    mod deeper {
+        mod leaf;
+    }
+}
+mod beside;
+`);
+
+      expect(specs).toEqual(["self::outer::inner", "self::outer::deeper::leaf", "beside"]);
+    });
+
+    it("counts an inline module as a level a super:: path climbs", () => {
+      const specs = specsOf(`
+use super::sibling::Thing;
+
+#[cfg(test)]
+mod tests {
+    use super::helper;
+    use super::super::sibling::Other;
+}
+`);
+
+      // At file level `super` reaches the parent module; the same word inside
+      // `mod tests` reaches the file itself, so it takes one more to leave it.
+      expect(specs).toEqual(["super::sibling::Thing", "self::helper", "super::sibling::Other"]);
+    });
+
+    it("records nothing for a glob import of the module a test block sits in", () => {
+      const specs = specsOf(`
+#[cfg(test)]
+mod tests {
+    use super::*;
+}
+`);
+
+      // `use super::*;` inside `mod tests` names the file it is written in.
+      expect(specs).toEqual([]);
+    });
+
+    it("leaves a crate-anchored path alone inside an inline module", () => {
+      const specs = specsOf(`
+mod tests {
+    use crate::db::Connection;
+    use serde::Deserialize;
+}
+`);
+
+      // `crate::` counts from the crate root, which no inline module moves;
+      // and a bare head may name another crate, which rebasing would lose.
+      expect(specs).toEqual(["crate::db::Connection", "serde::Deserialize"]);
+    });
   });
 
   // ── Go ─────────────────────────────────────────────────────────────────
