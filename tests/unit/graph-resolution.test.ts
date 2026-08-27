@@ -2126,6 +2126,30 @@ describe("graph-resolution", () => {
       ).toBeNull();
     });
 
+    it("keeps a leading :: out of the local modules for a bare head too", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/config.rs": "",
+        "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
+        "crates/config/src/lib.rs": "",
+      });
+
+      // `use ::config;` beside `mod config;`: the marker says the head names a
+      // crate, and it says it in the one shape where the local module would
+      // otherwise win outright — a head with nothing below it.
+      expect(
+        resolveRustImport(
+          "::config",
+          "crates/app/src/lib.rs",
+          fileSet,
+          crates,
+          new Set(["config"]),
+        ),
+      ).toBe("crates/config/src/lib.rs");
+    });
+
     it("keeps an edition 2015 unanchored path out of the declaration gate", () => {
       const crates = rustProject({
         // No edition key: Cargo reads 2015, and there the path below is
