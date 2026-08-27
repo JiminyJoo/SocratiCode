@@ -595,6 +595,20 @@ describe("buildCodeGraph — Rust crate resolution", () => {
       ].join("\n"),
       "crates/cli/src/holder_user/holder.rs": "pub mod child;",
       "crates/cli/src/holder_user/holder/child.rs": "pub struct Thing;",
+      // The attribute moves the file and keeps the name: `moved` is what the
+      // paths below say, `renamed.rs` is where it lives, and its own child
+      // sits beside that file — `src/deeper.rs`, which is where rustc looks.
+      "crates/cli/src/mover.rs": [
+        '#[path = "renamed.rs"]',
+        "mod moved;",
+        "",
+        "use moved::Item;",
+        "use moved::deeper::Deep;",
+        "",
+        "pub fn take(a: Item, b: Deep) -> (Item, Deep) { (a, b) }",
+      ].join("\n"),
+      "crates/cli/src/renamed.rs": "pub mod deeper;\n\npub struct Item;",
+      "crates/cli/src/deeper.rs": "pub struct Deep;",
     });
     roots.push(dir);
     graph = await buildCodeGraph(dir);
@@ -670,6 +684,15 @@ describe("buildCodeGraph — Rust crate resolution", () => {
     expect(
       edge("crates/cli/src/holder_user.rs", "crates/cli/src/holder_user/holder/child.rs"),
     ).toBe(true);
+  });
+
+  it("follows a path through a module the attribute moved", () => {
+    // The declaration's own edge, and then the two the paths draw: one to the
+    // moved file, one to the child sitting beside it. Before the declaration
+    // carried its file, the paths found no `src/moved.rs` and drew nothing —
+    // or, in a workspace holding a library of that name, drew into it.
+    expect(edge("crates/cli/src/mover.rs", "crates/cli/src/renamed.rs")).toBe(true);
+    expect(edge("crates/cli/src/mover.rs", "crates/cli/src/deeper.rs")).toBe(true);
   });
 
   it("follows a module declared with a dependency's name", () => {

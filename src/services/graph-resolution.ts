@@ -1675,7 +1675,8 @@ export function resolveRustImport(
   relSourceFile: string,
   fileSet: Set<string>,
   crates: RustCrate[],
-  declaredMods?: Set<string>,
+  declaredMods?: Map<string, string>,
+  isDeclaration?: boolean,
 ): string | null {
   const own = rustRootForFile(crates, relSourceFile);
   const isRoot = own?.root === relSourceFile;
@@ -1748,6 +1749,25 @@ export function resolveRustImport(
   // existing caller behaves as before.
   const declaredHere = declaredMods === undefined || declaredMods.has(head);
 
+  // Where the declaration put that module's file, when it moved it. A
+  // `#[path = "custom.rs"] mod foo;` names `foo` and files it under
+  // `custom.rs`, and the name alone reaches neither: `src/foo.rs` does not
+  // exist, so the path fell through to the crate of that name and drew an edge
+  // into an unrelated library. What rustc does with the children is the other
+  // half — they sit BESIDE the file the attribute names, `src/inner.rs` and
+  // not `src/custom/inner.rs`, which E0583 states outright on 1.70.0 and
+  // 1.98.0.
+  const declaredFile = ((): string | null => {
+    const spec = declaredMods?.get(head);
+    if (!spec || !spec.endsWith(".rs")) return null;
+    const fromInline = spec.startsWith("self/");
+    const base = fromInline ? ownModuleDir : path.dirname(relSourceFile);
+    const declared = toForwardSlash(
+      path.normalize(path.join(base, fromInline ? spec.slice("self/".length) : spec)),
+    );
+    return fileSet.has(declared) ? declared : null;
+  })();
+
   // In edition 2015 an unanchored path is absolute from the crate root, so it
   // names a module of the crate rather than one in this file's scope — and no
   // declaration in this file is required, or expected.
@@ -1767,16 +1787,32 @@ export function resolveRustImport(
     // cargo 1.70.0 and 1.98.0 that line reaches the dependency with the file
     // sitting right there.
     if (segments.length === 1 && !["crate", "self", "super"].includes(head)) {
-      // A declaration always counts from the declaring file. A bare `use foo;`
-      // counts from the crate root in 2015, and in 2018 needs the declaration.
-      const from = declaredHere
-        ? ownModuleDir
-        : rootRelative
-          ? own.moduleDir
-          : null;
+      if (global) return crateNamed(head)?.libRoot ?? null;
+      // A declaration is answered by the declaration: from the declaring
+      // file's own module directory, or from wherever `#[path]` filed it. It
+      // is never a crate, so it never falls through to one.
+      if (isDeclaration) {
+        return declaredFile ?? resolveRustModulePath(ownModuleDir, [head], null, fileSet);
+      }
+      // A `use foo;` in edition 2015 counts from the crate root even when this
+      // very file declares `foo` — checked on 1.70.0 and 1.98.0, where
+      // `use foo::Nested;` beside `mod foo;` is E0432 while `use foo::AtRoot;`
+      // reaches the root's module. Telling the two apart takes knowing which
+      // of them wrote the specifier, which is why the caller now says so — and
+      // a caller that says nothing keeps the older reading, where a bare head
+      // is tried from the file's own directory whatever the edition.
       const local =
-        global || from === null ? null : resolveRustModulePath(from, [head], null, fileSet);
+        rootRelative && isDeclaration === false
+          ? resolveRustModulePath(own.moduleDir, [head], null, fileSet)
+          : declaredHere
+            ? (declaredFile ?? resolveRustModulePath(ownModuleDir, [head], null, fileSet))
+            : null;
       if (local) return local;
+      // A name this file declares as a module is not a crate, whatever the
+      // manifest carries: rustc reads the module. Falling through drew an edge
+      // into a same-named library whenever the module's own file was somewhere
+      // the name alone could not reach — which is every `#[path]`.
+      if (declaredMods?.has(head)) return null;
       return crateNamed(head)?.libRoot ?? null;
     }
 
@@ -1853,12 +1889,29 @@ export function resolveRustImport(
     // `client.rs` — checked on cargo 1.70.0 and 1.98.0. Gating that on a
     // declaration in the importing file would drop the edge on every 2015
     // crate, which is every crate whose manifest omits the key.
+    // A head the declaration moved is answered from where it moved it, and its
+    // own children from the directory that file sits in — `src/inner.rs` for a
+    // module filed at `src/custom.rs`, which is what E0583 asks for.
+    if (!global && declaredFile) {
+      const below = resolveRustModulePath(
+        toForwardSlash(path.dirname(declaredFile)),
+        segments.slice(1),
+        declaredFile,
+        fileSet,
+      );
+      if (below) return below;
+    }
+
     const unanchoredFrom = rootRelative ? own.moduleDir : ownModuleDir;
     const local =
       global || (!rootRelative && !declaredHere)
         ? null
         : resolveRustModulePath(unanchoredFrom, segments, null, fileSet);
     if (local) return local;
+
+    // A name this file declares as a module is not a crate; see the same guard
+    // on the single-segment branch.
+    if (!global && declaredMods?.has(head)) return null;
 
     const crate = crateNamed(head);
     if (crate?.libRoot) {
@@ -1906,7 +1959,8 @@ export function resolveImport(
   elixirModuleMap?: Map<string, string[]>,
   phpFqcnMap?: Map<string, string[]>,
   rustCrates?: RustCrate[],
-  rustDeclaredMods?: Set<string>,
+  rustDeclaredMods?: Map<string, string>,
+  rustIsDeclaration?: boolean,
 ): string | null {
   // Skip obvious external/stdlib modules. Go is excluded from this
   // pre-check because its external classifier in `isExternalModule`
@@ -2223,6 +2277,7 @@ export function resolveImport(
         fileSet,
         rustCrates ?? [],
         rustDeclaredMods,
+        rustIsDeclaration,
       );
     }
 

@@ -2119,10 +2119,51 @@ describe("graph-resolution", () => {
       // cannot do: there the `mod serde;` declaration draws the same edge, so
       // the edge stays whatever the unanchored path resolves to.
       expect(
-        resolveRustImport("serde::Local", "src/lib.rs", fileSet, crates, new Set(["serde"])),
+        resolveRustImport("serde::Local", "src/lib.rs", fileSet, crates, new Map([["serde", "serde"]])),
       ).toBe("src/serde.rs");
       expect(
-        resolveRustImport("serde::Local", "src/lib.rs", fileSet, crates, new Set()),
+        resolveRustImport("serde::Local", "src/lib.rs", fileSet, crates, new Map()),
+      ).toBeNull();
+    });
+
+    it("reaches a module the attribute moved, and its children beside that file", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/foo"]\n',
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/custom.rs": "",
+        "crates/app/src/inner.rs": "",
+        // A library carrying the module's name, which is what the path used to
+        // land on once the name alone found no file.
+        "crates/foo/Cargo.toml": '[package]\nname = "foo"\nedition = "2021"\n',
+        "crates/foo/src/lib.rs": "",
+      });
+
+      // `#[path = "custom.rs"] mod foo;` — the name is `foo`, the file is
+      // `custom.rs`, and the declaration carries both.
+      const declared = new Map([["foo", "custom.rs"]]);
+
+      expect(
+        resolveRustImport("foo::Item", "crates/app/src/lib.rs", fileSet, crates, declared),
+      ).toBe("crates/app/src/custom.rs");
+
+      // The children sit beside that file, not under a directory named after
+      // it: rustc says `src/inner.rs` with E0583, on 1.70.0 and 1.98.0.
+      expect(
+        resolveRustImport("foo::inner::Thing", "crates/app/src/lib.rs", fileSet, crates, declared),
+      ).toBe("crates/app/src/inner.rs");
+
+      // The hand that makes this fail if the declared file is dropped: with
+      // the name alone the path found nothing and fell through to the
+      // same-named library.
+      expect(
+        resolveRustImport(
+          "foo::Item",
+          "crates/app/src/lib.rs",
+          fileSet,
+          crates,
+          new Map([["foo", "foo"]]),
+        ),
       ).toBeNull();
     });
 
@@ -2145,7 +2186,7 @@ describe("graph-resolution", () => {
           "crates/app/src/lib.rs",
           fileSet,
           crates,
-          new Set(["config"]),
+          new Map([["config", "config"]]),
         ),
       ).toBe("crates/config/src/lib.rs");
     });
@@ -2165,13 +2206,21 @@ describe("graph-resolution", () => {
       // 1.98.0. The gate is a 2018 rule: applied here it would drop the edge
       // on every crate whose manifest omits the edition key.
       expect(
-        resolveRustImport("registry::write", "src/client.rs", fileSet, crates, new Set()),
+        resolveRustImport("registry::write", "src/client.rs", fileSet, crates, new Map()),
       ).toBe("src/registry.rs");
       // And a bare head in the same position, which arrives in the shape a
       // declaration does.
-      expect(resolveRustImport("registry", "src/client.rs", fileSet, crates, new Set())).toBe(
-        "src/registry.rs",
-      );
+      // `false` says this is a `use` and not a `mod` declaration: the two
+      // arrive as the same string, and in 2015 they count from different
+      // places — `use foo::Nested;` beside `mod foo;` is E0432 on 1.70.0 and
+      // 1.98.0, while `use foo::AtRoot;` reaches the root's module.
+      expect(
+        resolveRustImport("registry", "src/client.rs", fileSet, crates, new Map(), false),
+      ).toBe("src/registry.rs");
+      // And the declaration in the same position still counts from the file.
+      expect(
+        resolveRustImport("registry", "src/deep.rs", fileSet, crates, new Map(), true),
+      ).toBeNull();
     });
 
     it("leaves a single-segment path on the crate when no declaration names it", () => {
@@ -2190,10 +2239,10 @@ describe("graph-resolution", () => {
       // declaration may reach the file. cargo 1.70.0 and 1.98.0 compile
       // `use bar;` against the dependency with that orphan sitting there.
       expect(
-        resolveRustImport("bar", "crates/app/src/lib.rs", fileSet, crates, new Set()),
+        resolveRustImport("bar", "crates/app/src/lib.rs", fileSet, crates, new Map()),
       ).toBe("crates/bar/src/lib.rs");
       expect(
-        resolveRustImport("bar", "crates/app/src/lib.rs", fileSet, crates, new Set(["bar"])),
+        resolveRustImport("bar", "crates/app/src/lib.rs", fileSet, crates, new Map([["bar", "bar"]])),
       ).toBe("crates/app/src/bar.rs");
     });
 

@@ -1023,13 +1023,15 @@ export async function buildCodeGraph(
     // compiles with `foo` in scope, and at the file's own level a name
     // declared inside an inline block reaches the dependency instead, or
     // fails with E0432 when there is none.
-    // Only a declaration carries a declared name, so asking for the name is
-    // the whole question — pairing it with `isModuleDeclaration` would add a
-    // condition no tree can make false, and a guard nothing can fail is a
-    // guard nobody can check.
-    const declaredMods = new Set<string>();
+    // The map carries the file with the name, because half the declarations
+    // move it: `#[path = "custom.rs"] mod foo;` names `foo` and files it at
+    // `custom.rs`, and a resolver holding only the name looks for `src/foo.rs`,
+    // finds nothing, and falls through to a library called `foo` if the
+    // workspace has one — an edge into an unrelated crate. Where the
+    // declaration does not move anything, the value is the name itself.
+    const declaredMods = new Map<string, string>();
     for (const imp of importInfos) {
-      if (imp.declaredName) declaredMods.add(imp.declaredName);
+      if (imp.declaredName) declaredMods.set(imp.declaredName, imp.moduleSpecifier);
     }
 
     for (const imp of importInfos) {
@@ -1038,7 +1040,7 @@ export async function buildCodeGraph(
       // Try to resolve to a project file
       // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
       const resolutionLanguage = imp.isCssImport ? "css" : language;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, declaredMods);
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, declaredMods, imp.isModuleDeclaration === true);
       if (resolved) {
         node.dependencies.push(resolved);
 
