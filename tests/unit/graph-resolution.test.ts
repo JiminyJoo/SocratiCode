@@ -2189,6 +2189,28 @@ describe("graph-resolution", () => {
       ).toBe("src/tests/moved.rs");
     });
 
+    it("does not read a file whose name begins with self as the inline form", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/self_check.rs": "",
+      });
+
+      // `#[path = "self_check.rs"] mod checks;` is the ordinary form: the
+      // marker for the inline one is the `self/` head, separator included.
+      // Matching on `self` alone cut five characters off this path and looked
+      // for `heck.rs`.
+      expect(
+        resolveRustImport(
+          "checks::run",
+          "src/lib.rs",
+          fileSet,
+          crates,
+          new Map([["checks", "self_check.rs"]]),
+        ),
+      ).toBe("src/self_check.rs");
+    });
+
     it("keeps a leading :: out of the local modules for a bare head too", () => {
       const crates = rustProject({
         "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
