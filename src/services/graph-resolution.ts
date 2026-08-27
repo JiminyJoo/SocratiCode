@@ -1700,6 +1700,11 @@ export function resolveRustImport(
     return fileSet.has(declared) ? declared : null;
   }
 
+  // `use ::config::Item;` says the head names a crate and not a module in
+  // scope — it is how a file that also has a local `config` reaches the other
+  // one. Since a local module otherwise wins, the marker has to survive.
+  const global = specifier.startsWith("::");
+
   const segments = specifier
     .split("::")
     .map((segment) => segment.trim())
@@ -1743,7 +1748,7 @@ export function resolveRustImport(
     // shape, so the local module is tried first and the crate name second:
     // only one of the two exists in any tree that compiles.
     if (segments.length === 1 && !["crate", "self", "super"].includes(head)) {
-      const local = resolveRustModulePath(ownModuleDir, [head], null, fileSet);
+      const local = global ? null : resolveRustModulePath(ownModuleDir, [head], null, fileSet);
       if (local) return local;
       return crateNamed(head)?.libRoot ?? null;
     }
@@ -1797,7 +1802,7 @@ export function resolveRustImport(
     // tree of `.rs` files most likely is.
     const unanchoredFrom =
       importingCrate?.edition === "2015" && own ? own.moduleDir : ownModuleDir;
-    const local = resolveRustModulePath(unanchoredFrom, segments, null, fileSet);
+    const local = global ? null : resolveRustModulePath(unanchoredFrom, segments, null, fileSet);
     if (local) return local;
 
     const crate = crateNamed(head);

@@ -539,6 +539,36 @@ use crate::{
       expect(specs).toEqual(["crate::alpha", "crate::beta::Gamma"]);
     });
 
+    it("keeps the module a group leaf names when that leaf is renamed", () => {
+      const specs = specsOf(`
+use crate::config::{self as cfg, Config};
+use crate::helpers::{* };
+`);
+
+      // `{self as cfg}` names the same module `{self}` does; comparing the
+      // leaf before removing the alias dropped the import altogether.
+      expect(specs).toEqual(["crate::config", "crate::config::Config", "crate::helpers"]);
+    });
+
+    it("keeps the leading :: that says the head is a crate", () => {
+      const specs = specsOf(`
+use ::config::Item;
+use ::serde::{Serialize, Deserialize};
+`);
+
+      expect(specs).toEqual(["::config::Item", "::serde::Serialize", "::serde::Deserialize"]);
+    });
+
+    it("finds a path attribute with a comment between it and the mod", () => {
+      const specs = specsOf(`
+#[path = "elsewhere/moved.rs"]
+// kept here because the generator writes it there
+mod moved;
+`);
+
+      expect(specs).toEqual(["elsewhere/moved.rs"]);
+    });
+
     it("ignores comments written between the leaves of a use group", () => {
       const specs = specsOf(`
 use crate::{

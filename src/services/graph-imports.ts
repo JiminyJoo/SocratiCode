@@ -256,7 +256,13 @@ function stripRawIdent(segment: string): string {
  * rather than something under it.
  */
 function rustUseLeafPath(leaf: string): string {
-  const segments = leaf
+  const trimmed = leaf.trim();
+  // A leading `::` says the head names a crate, never a module in scope. The
+  // marker is kept because the resolver now prefers a local module, and
+  // dropping it turned `use ::config::Item;` into an edge at a local
+  // `config.rs` that the source explicitly said not to look at.
+  const global = trimmed.startsWith("::");
+  const segments = trimmed
     .replace(/\s+as\s+(?:r#)?\w+\s*$/, "")
     .split("::")
     .map((segment) => stripRawIdent(segment.trim()))
@@ -264,7 +270,13 @@ function rustUseLeafPath(leaf: string): string {
   while (segments.length > 0 && ["self", "*"].includes(segments[segments.length - 1])) {
     segments.pop();
   }
-  return segments.join("::");
+  if (segments.length === 0) return "";
+  return global ? `::${segments.join("::")}` : segments.join("::");
+}
+
+/** A group leaf with its alias removed, which is what says whether it is `self`. */
+function rustLeafHead(part: string): string {
+  return part.replace(/\s+as\s+(?:r#)?\w+\s*$/, "").trim();
 }
 
 /**
@@ -369,7 +381,11 @@ function rustPathFromInline(path: string, inline: string[]): string | null {
  */
 function rustPathAttribute(node: SgNodeLike): string | null {
   let previous = node.prev();
-  while (previous?.kind() === "attribute_item") {
+  // Comments count as siblings too, and one written between the attribute and
+  // the `mod` it belongs to would otherwise end the walk before the attribute
+  // is seen — a comment above a relocated module is exactly where someone
+  // explains why it was relocated.
+  while (previous && (previous.kind() === "attribute_item" || previous.kind().includes("comment"))) {
     const match = previous.text().match(/^#\[\s*path\s*=\s*"([^"]+)"\s*\]$/);
     if (match) return match[1];
     previous = previous.prev();
@@ -410,8 +426,10 @@ export function expandRustUseTree(tree: string): string[] {
     }
     // `self` and `*` expand to nothing, so the group's own prefix is what the
     // leaf named: `use crate::a::{self, b}` imports `crate::a` as well as
-    // `crate::a::b`.
-    if ((part === "self" || part === "*") && prefix) paths.push(prefix);
+    // `crate::a::b`. The alias has to come off first — `{self as cfg}` is the
+    // same leaf, and comparing the raw text dropped the whole import.
+    const head = rustLeafHead(part);
+    if ((head === "self" || head === "*") && prefix) paths.push(prefix);
   }
   return paths;
 }

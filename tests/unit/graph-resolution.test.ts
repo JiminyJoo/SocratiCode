@@ -1979,6 +1979,23 @@ describe("graph-resolution", () => {
         .toBe("crates/app/src/config.rs");
     });
 
+    it("keeps a leading :: out of the local modules", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "crates/app/src/lib.rs": "",
+        "crates/app/src/config.rs": "",
+        "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
+        "crates/config/src/lib.rs": "",
+      });
+
+      // Without the marker this is the same path as `config::Settings`, which
+      // the local module answers — and the leading `::` is written precisely
+      // to say it should not.
+      expect(resolveRustImport("::config::Settings", "crates/app/src/lib.rs", fileSet, crates))
+        .toBe("crates/config/src/lib.rs");
+    });
+
     it("follows a dependency renamed in the manifest to the crate it points at", () => {
       const crates = rustProject({
         "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/core"]\n',
