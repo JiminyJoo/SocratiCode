@@ -2167,6 +2167,28 @@ describe("graph-resolution", () => {
       ).toBeNull();
     });
 
+    it("reaches a module an attribute inside an inline block moved", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        "src/lib.rs": "",
+        "src/tests/moved.rs": "",
+      });
+
+      // Written inside `mod tests { #[path = "moved.rs"] mod fixtures; }`, the
+      // attribute counts from the file's own module directory and one level
+      // deeper per inline block — which extractImports marks with a `self/`
+      // head, since nothing in the path itself tells the two forms apart.
+      expect(
+        resolveRustImport(
+          "fixtures::build",
+          "src/lib.rs",
+          fileSet,
+          crates,
+          new Map([["fixtures", "self/tests/moved.rs"]]),
+        ),
+      ).toBe("src/tests/moved.rs");
+    });
+
     it("keeps a leading :: out of the local modules for a bare head too", () => {
       const crates = rustProject({
         "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',

@@ -726,3 +726,52 @@ describe("buildCodeGraph — Rust crate resolution", () => {
     ).toBe(true);
   });
 });
+
+// ── Edition 2015: a declaration and a use of the same name are different ──
+// They arrive at the resolver as the same string, `foo`, and count from
+// different places: the declaration from the declaring file's own directory,
+// the use from the crate root. Measured on cargo 1.70.0 and 1.98.0 —
+// `use foo::Nested;` beside `mod foo;` in `src/deep/mod.rs` is E0432, while
+// `use foo::AtRoot;` compiles. Only a fixture driven through buildCodeGraph
+// can show that the two are told apart, since that is where the difference is
+// read off the source.
+describe("buildCodeGraph — Rust edition 2015 declaration and use", () => {
+  const roots: string[] = [];
+  let graph: Awaited<ReturnType<typeof buildCodeGraph>>;
+
+  beforeAll(async () => {
+    ensureDynamicLanguages();
+    const dir = writeLayout({
+      // No edition key: Cargo reads 2015.
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\n',
+      "src/lib.rs": ["mod deep;", "mod foo;"].join("\n"),
+      "src/foo.rs": "pub struct AtRoot;",
+      "src/deep/mod.rs": [
+        "mod foo;",
+        "use foo::AtRoot;",
+        "",
+        "pub fn take() -> AtRoot { AtRoot }",
+      ].join("\n"),
+      "src/deep/foo.rs": "pub struct Nested;",
+    });
+    roots.push(dir);
+    graph = await buildCodeGraph(dir);
+  });
+
+  afterAll(() => {
+    for (const r of roots) {
+      try { fs.rmSync(r, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  const edge = (source: string, target: string): boolean =>
+    graph.edges.some((e) => e.source === source && e.target === target);
+
+  it("files the declaration beside the declaring file", () => {
+    expect(edge("src/deep/mod.rs", "src/deep/foo.rs")).toBe(true);
+  });
+
+  it("sends the use to the crate root's module of that name", () => {
+    expect(edge("src/deep/mod.rs", "src/foo.rs")).toBe(true);
+  });
+});
