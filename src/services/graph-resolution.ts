@@ -1385,7 +1385,24 @@ export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): Ru
     // package on 2018 rules, and a `[[bin]]` declared beside an undeclared
     // file in `src/bin/` then handed the file a crate root Cargo never gives
     // it. Old manifests are exactly the ones that omit the key.
-    const edition = typeof pkg?.edition === "string" ? pkg.edition : "2015";
+    //
+    // `edition.workspace = true` is not a missing key: the member inherits
+    // `[workspace.package] edition`, and `pkg.edition` is the table
+    // `{ workspace: true }` rather than a string. Read as a plain key only,
+    // every member of every workspace that centralises its edition — the
+    // recommended layout — fell back to 2015, which turns off autodiscovery
+    // next to a declared `[[bin]]` and reads unanchored `use` paths from the
+    // crate root instead of the module directory. Verified with cargo 1.70,
+    // 1.85 and 1.98: the member compiles `async fn`, and `cargo metadata`
+    // reports edition 2021 for it; with the key omitted entirely, the same
+    // member reports 2015 and rejects `async fn` — inheritance happens only
+    // when the member asks for it.
+    const wsPackage = enclosingWs ? asTable(enclosingWs.table.package) : null;
+    const inheritsEdition = isTable(pkg?.edition) && pkg.edition.workspace === true;
+    const inheritedEdition =
+      inheritsEdition && typeof wsPackage?.edition === "string" ? wsPackage.edition : null;
+    const edition =
+      typeof pkg?.edition === "string" ? pkg.edition : (inheritedEdition ?? "2015");
     const is2015 = edition === "2015";
 
     const declaredLib = declaredTargetPath(manifest?.lib);

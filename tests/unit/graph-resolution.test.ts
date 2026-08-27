@@ -1377,6 +1377,57 @@ describe("graph-resolution", () => {
       ]);
     });
 
+    it("inherits the edition a workspace declares for its members", () => {
+      // `edition.workspace = true` is a table, not a string, so reading the
+      // key as a plain string dropped the member to 2015 — and 2015 turns
+      // autodiscovery off next to a declared `[[bin]]`, so `due.rs` stopped
+      // being a crate root at all. Cargo 1.70, 1.85 and 1.98 all keep it.
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["app"]\n\n[workspace.package]\nedition = "2021"\n',
+        "app/Cargo.toml":
+          '[package]\nname = "app"\nedition.workspace = true\n\n[[bin]]\nname = "uno"\npath = "src/bin/uno.rs"\n',
+        "app/src/lib.rs": "",
+        "app/src/bin/uno.rs": "",
+        "app/src/bin/due.rs": "",
+      });
+
+      const member = crates.find((crate) => crate.dir === "app");
+      expect(member?.edition).toBe("2021");
+      expect(member?.roots).toContain("app/src/bin/due.rs");
+    });
+
+    it("keeps a member that asks for no edition on the 2015 rules", () => {
+      // The other hand of the test above: inheritance happens only when the
+      // member spells it out. With the key absent, Cargo reads 2015 — and
+      // then the declared `[[bin]]` does turn autodiscovery off, which is
+      // what makes the assertion above mean something.
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["app"]\n\n[workspace.package]\nedition = "2021"\n',
+        "app/Cargo.toml":
+          '[package]\nname = "app"\n\n[[bin]]\nname = "uno"\npath = "src/bin/uno.rs"\n',
+        "app/src/lib.rs": "",
+        "app/src/bin/uno.rs": "",
+        "app/src/bin/due.rs": "",
+      });
+
+      const member = crates.find((crate) => crate.dir === "app");
+      expect(member?.edition).toBe("2015");
+      expect(member?.roots).not.toContain("app/src/bin/due.rs");
+    });
+
+    it("keeps a member's own edition over the one the workspace declares", () => {
+      const crates = rustProject({
+        "Cargo.toml":
+          '[workspace]\nmembers = ["app"]\n\n[workspace.package]\nedition = "2021"\n',
+        "app/Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n',
+        "app/src/lib.rs": "",
+      });
+
+      expect(crates.find((crate) => crate.dir === "app")?.edition).toBe("2015");
+    });
+
     it("takes the library path a manifest declares over the conventional one", () => {
       const crates = rustProject({
         "Cargo.toml": '[package]\nname = "odd"\n\n[lib]\npath = "lib/entry.rs"\n',
@@ -1681,6 +1732,25 @@ describe("graph-resolution", () => {
       // src/bin/helper.rs and not the library's src/helper.rs.
       expect(resolveRustImport("crate::helper", "src/bin/tool.rs", fileSet, crates))
         .toBe("src/bin/helper.rs");
+    });
+
+    it("does not let a root's directory capture a file whose name merely begins with it", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\n',
+        "src/lib.rs": "",
+        "src/helper.rs": "",
+        "src/bin/tool.rs": "",
+        "src/bindings.rs": "",
+      });
+
+      // `src/bindings.rs` belongs to the library. Its path begins with the
+      // string "src/bin", but not with the directory "src/bin/" — comparing
+      // the prefix without the separator hands the file the binary's root,
+      // and `crate::helper` then looks for `src/bin/helper.rs`, which is not
+      // the file the library declares. The guard is one character wide, so
+      // nothing else in the suite fails when it is removed.
+      expect(resolveRustImport("crate::helper", "src/bindings.rs", fileSet, crates))
+        .toBe("src/helper.rs");
     });
 
     it("prefers the crate whose directory holds the importing file", () => {

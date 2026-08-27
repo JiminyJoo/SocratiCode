@@ -502,8 +502,21 @@ describe("buildCodeGraph — Rust crate resolution", () => {
     const dir = writeLayout({
       "Cargo.toml": '[workspace]\nmembers = ["crates/cli", "crates/core"]\n',
 
-      "crates/core/Cargo.toml": '[package]\nname = "app-core"\nedition = "2021"\n',
-      "crates/core/src/lib.rs": ["pub mod store;", "", "pub use store::Store;"].join("\n"),
+      "crates/core/Cargo.toml":
+        '[package]\nname = "app-core"\nedition = "2021"\n\n[dependencies]\nserde = "1"\n',
+      // `serde` names both a dependency and a module this file declares. The
+      // declaration is what rustc resolves the path through, so the edge into
+      // the local module has to be drawn — a resolver that answers "no edge"
+      // to every path carrying a dependency's name would pass the third-party
+      // test below and fail here.
+      "crates/core/src/lib.rs": [
+        "pub mod store;",
+        "pub mod serde;",
+        "",
+        "pub use store::Store;",
+        "pub use serde::Local;",
+      ].join("\n"),
+      "crates/core/src/serde.rs": "pub struct Local;",
       "crates/core/src/store.rs": [
         "mod open;",
         "mod support;",
@@ -534,7 +547,8 @@ describe("buildCodeGraph — Rust crate resolution", () => {
         "}",
       ].join("\n"),
 
-      "crates/cli/Cargo.toml": '[package]\nname = "app-cli"\nedition = "2021"\n',
+      "crates/cli/Cargo.toml":
+        '[package]\nname = "app-cli"\nedition = "2021"\n\n[dependencies]\nserde = "1"\n',
       "crates/cli/src/main.rs": [
         "mod runner;",
         "",
@@ -543,6 +557,12 @@ describe("buildCodeGraph — Rust crate resolution", () => {
         "fn main() { runner::run(); }",
       ].join("\n"),
       "crates/cli/src/runner.rs": ["use serde::Deserialize;", "", "pub fn run() {}"].join("\n"),
+      // A file named after the dependency, sitting right beside the importer
+      // and declared by nobody. Cargo 1.70, 1.85 and 1.98 all agree an
+      // undeclared file is not in the module tree and cannot capture the
+      // path: `use serde::Deserialize;` reaches the crate, and the graph must
+      // draw nothing at all.
+      "crates/cli/src/serde.rs": "pub struct Deserialize;",
     });
     roots.push(dir);
     graph = await buildCodeGraph(dir);
@@ -578,15 +598,29 @@ describe("buildCodeGraph — Rust crate resolution", () => {
   });
 
   it("draws no edge into a crate for a third-party path", () => {
-    // `runner.rs` imports `serde` and nothing else. Asserting that every edge
-    // ends in a `.rs` file would hold on an empty set too — and did, while the
-    // resolver was returning nothing at all; the edges leaving this one file
-    // are what says a third-party path resolved to nothing.
+    // `runner.rs` imports `serde` and nothing else, and `crates/cli/src/serde.rs`
+    // sits right beside it carrying that very name without being declared.
+    // Asserting that every edge ends in a `.rs` file would hold on an empty
+    // set too — and did, while the resolver was returning nothing at all; the
+    // edges leaving this one file are what says the third-party path resolved
+    // to nothing rather than to the same-named file next door.
     const leaving = graph.edges
       .filter((e) => e.source === "crates/cli/src/runner.rs")
       .map((e) => e.target);
 
     expect(leaving).toEqual([]);
+    // Said the other way round, so that a resolver drawing the wrong edge is
+    // named by the assertion that fails.
+    expect(edge("crates/cli/src/runner.rs", "crates/cli/src/serde.rs")).toBe(false);
+  });
+
+  it("follows a module declared with a dependency's name", () => {
+    // The hand that keeps the test above honest: here `serde` is declared with
+    // `pub mod serde;`, so rustc reads `pub use serde::Local;` as the local
+    // module and the edge belongs in the graph. A resolver that answers "no
+    // edge" whenever a path's head matches a dependency passes the test above
+    // and fails this one.
+    expect(edge("crates/core/src/lib.rs", "crates/core/src/serde.rs")).toBe(true);
   });
 
   it("draws no edge at the parent module for a test block's glob import", () => {
