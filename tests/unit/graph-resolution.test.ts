@@ -1849,6 +1849,48 @@ describe("graph-resolution", () => {
       expect(crates[0].roots).toEqual(["src/lib.rs"]);
     });
 
+    it("finds a target declared by name alone at the path Cargo gives that name", () => {
+      // `[[bin]] name = "tool"` with no `path` is resolved by convention from
+      // the name: src/bin/tool.rs, tests/cli.rs, examples/demo.rs,
+      // benches/speed.rs. Edition 2015 is what makes this test able to fail —
+      // there the declarations turn autodiscovery off, so the name is the only
+      // route left to those files. `cargo metadata` reports exactly these five
+      // targets for this manifest on 1.70.0, 1.85.0 and 1.98.0.
+      const crates = rustProject({
+        "Cargo.toml": [
+          '[package]',
+          'name = "app"',
+          'edition = "2015"',
+          '',
+          '[[bin]]',
+          'name = "tool"',
+          '',
+          '[[test]]',
+          'name = "cli"',
+          '',
+          '[[example]]',
+          'name = "demo"',
+          '',
+          '[[bench]]',
+          'name = "speed"',
+          '',
+        ].join("\n"),
+        "src/lib.rs": "",
+        "src/bin/tool.rs": "",
+        "tests/cli.rs": "",
+        "examples/demo.rs": "",
+        "benches/speed.rs": "",
+      });
+
+      expect(crates[0].roots).toEqual([
+        "benches/speed.rs",
+        "examples/demo.rs",
+        "src/bin/tool.rs",
+        "src/lib.rs",
+        "tests/cli.rs",
+      ]);
+    });
+
     it("shuts off autodiscovery for declared target types in edition 2015 but keeps it in 2018+", () => {
       const crates2015 = rustProject({
         "Cargo.toml":
