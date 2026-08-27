@@ -672,6 +672,32 @@ mod tests {
       expect(specs).toEqual([]);
     });
 
+    it("follows a bare head into the inline block that declares it", () => {
+      const specs = specsOf(`
+#[cfg(test)]
+mod tests {
+    mod fixtures;
+    use fixtures::build_store;
+}
+`);
+
+      // `fixtures` is declared right there, so the path goes into the block —
+      // `src/<file>/tests/fixtures.rs` — and not to a file of that name
+      // sitting beside the declaring one.
+      expect(specs).toEqual(["self::tests::fixtures::build_store", "self::tests::fixtures"]);
+    });
+
+    it("takes the directory of an inline module from its own path attribute", () => {
+      const specs = specsOf(`
+#[path = "other_dir"]
+mod outer {
+    pub mod child;
+}
+`);
+
+      expect(specs).toEqual(["self::other_dir::child"]);
+    });
+
     it("leaves a crate-anchored path alone inside an inline module", () => {
       const specs = specsOf(`
 mod tests {

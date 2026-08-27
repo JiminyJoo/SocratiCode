@@ -1801,11 +1801,12 @@ describe("graph-resolution", () => {
       expect(crates2018[0].roots).toEqual(["custom/tool.rs", "src/bin/other.rs", "src/lib.rs"]);
     });
 
-    it("excludes manifests matching [workspace.exclude] from being importable by name", () => {
+    it("keeps a member under [workspace] exclude importable by name", () => {
       const crates = rustProject({
         "Cargo.toml":
           '[workspace]\nmembers = ["crates/*"]\nexclude = ["crates/ignored", "crates/fixtures/*"]\n',
-        "crates/app/Cargo.toml": '[package]\nname = "app"\n',
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\n\n[dependencies]\nignored-crate = { path = "../ignored" }\n',
         "crates/app/src/lib.rs": "",
         "crates/ignored/Cargo.toml": '[package]\nname = "ignored-crate"\n',
         "crates/ignored/src/lib.rs": "",
@@ -1815,15 +1816,14 @@ describe("graph-resolution", () => {
         "standalone/src/lib.rs": "",
       });
 
-      const appCrate = crates.find((c) => c.dir === "crates/app");
-      const ignoredCrate = crates.find((c) => c.dir === "crates/ignored");
-      const fixtureCrate = crates.find((c) => c.dir === "crates/fixtures/demo");
-      const standaloneCrate = crates.find((c) => c.dir === "standalone");
-
-      expect(appCrate?.name).toBe("app");
-      expect(ignoredCrate?.name).toBeNull();
-      expect(fixtureCrate?.name).toBeNull();
-      expect(standaloneCrate?.name).toBe("standalone");
+      // `exclude` keeps a member out of the default set of workspace-wide
+      // commands; it says nothing about who may depend on it. A member can
+      // and does depend on an excluded package by path — built and compiled
+      // to check — so reading `exclude` as "not importable" loses that edge.
+      expect(crates.find((c) => c.dir === "crates/app")?.name).toBe("app");
+      expect(crates.find((c) => c.dir === "crates/ignored")?.name).toBe("ignored_crate");
+      expect(crates.find((c) => c.dir === "crates/fixtures/demo")?.name).toBe("demo_fixture");
+      expect(crates.find((c) => c.dir === "standalone")?.name).toBe("standalone");
     });
 
     it("records renamed dependency aliases in crate aliases map", () => {
@@ -1897,7 +1897,7 @@ describe("graph-resolution", () => {
       expect(spentaCrate?.name).toBe("spenta");
       expect(spentaCrate?.roots).toEqual(["membri/spenta/src/lib.rs"]);
 
-      expect(fuoriCrate?.name).toBeNull();
+      expect(fuoriCrate?.name).toBe("fuori_dal_giro");
       expect(fuoriCrate?.roots).toEqual(["membri/fuori/src/lib.rs"]);
     });
 

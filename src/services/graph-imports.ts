@@ -301,17 +301,41 @@ function stripRustComments(text: string): string {
  * what lets that position be reconstructed; it is empty for the overwhelming
  * majority of declarations, which sit at the top of a file.
  */
-function rustInlineModules(node: SgNodeLike): string[] {
+function rustInlineModules(node: SgNodeLike): InlinePosition {
   const chain: string[] = [];
+  let innermost: SgNodeLike | null = null;
   let current = node.parent();
   while (current) {
     if (current.kind() === "mod_item") {
+      innermost ??= current;
+      // An inline `mod` may carry a `#[path]` of its own, and then it is that
+      // path — not the module's name — that names the directory its children
+      // live in.
+      const declared = rustPathAttribute(current);
       const name = current.field("name")?.text();
-      if (name) chain.unshift(stripRawIdent(name));
+      if (declared) chain.unshift(declared.replace(/\/+$/, ""));
+      else if (name) chain.unshift(stripRawIdent(name));
     }
     current = current.parent();
   }
-  return chain;
+
+  // What the innermost block declares by hand: a path whose head names one of
+  // these is a path into the block, not out to another crate.
+  const declares = new Set<string>();
+  const body = innermost?.field("body");
+  if (body) {
+    for (const child of body.findAll({ rule: { kind: "mod_item" } })) {
+      const name = child.field("name")?.text();
+      if (name) declares.add(stripRawIdent(name));
+    }
+  }
+  return { chain, declares };
+}
+
+/** Where a declaration sits inside inline `mod` blocks, and what they declare. */
+interface InlinePosition {
+  chain: string[];
+  declares: Set<string>;
 }
 
 /** The subset of the ast-grep node API this module reads. */
@@ -321,6 +345,7 @@ interface SgNodeLike {
   parent(): SgNodeLike | null;
   prev(): SgNodeLike | null;
   field(name: string): SgNodeLike | null;
+  findAll(matcher: { rule: { kind: string } }): SgNodeLike[];
 }
 
 /**
@@ -340,11 +365,12 @@ interface SgNodeLike {
  * inside `mod tests`, `use some_crate::Thing;` is how a test reaches another
  * crate of the project, and rebasing it would lose that edge.
  */
-function rustPathFromInline(path: string, inline: string[]): string | null {
-  if (inline.length === 0) return path;
+function rustPathFromInline(path: string, inline: InlinePosition): string | null {
+  const levels = inline.chain;
+  if (levels.length === 0) return path;
   const segments = path.split("::").filter(Boolean);
   if (segments.length === 0) return null;
-  if (segments[0] === "crate") return path;
+  if (segments[0] === "crate" || path.startsWith("::")) return path;
 
   let climbed = 0;
   let rest = segments;
@@ -355,13 +381,18 @@ function rustPathFromInline(path: string, inline: string[]): string | null {
       climbed++;
       rest = rest.slice(1);
     }
-    if (climbed === 0) return path;
+    // A bare head is rebased only when the block itself declares a module by
+    // that name — `mod tests { mod fixtures; use fixtures::build; }` is a path
+    // into the block. Otherwise it is left alone, because the commoner shape
+    // by far is `mod tests { use some_crate::Thing; }`, and rebasing that
+    // would lose the edge to the other crate.
+    if (climbed === 0) return inline.declares.has(segments[0]) ? `self::${levels.join("::")}::${path}` : path;
   }
 
   // Each `super` first consumes an inline level; only what is left of the
   // climb reaches the file system.
-  const remainingClimb = Math.max(0, climbed - inline.length);
-  const prefix = inline.slice(0, Math.max(0, inline.length - climbed));
+  const remainingClimb = Math.max(0, climbed - levels.length);
+  const prefix = levels.slice(0, Math.max(0, levels.length - climbed));
   if (remainingClimb > 0) {
     return [...Array(remainingClimb).fill("super"), ...rest].join("::");
   }
@@ -629,16 +660,17 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
           const declaredPath = rustPathAttribute(typed);
           if (declaredPath) {
             const spec =
-              inline.length === 0
+              inline.chain.length === 0
                 ? declaredPath
-                : `self/${inline.join("/")}/${declaredPath}`;
+                : `self/${inline.chain.join("/")}/${declaredPath}`;
             imports.push({ moduleSpecifier: spec, isDynamic: false });
             continue;
           }
           const name = stripRawIdent(match[1]);
           // Declared inside `mod outer { … }`, the file sits under `outer/`,
           // not beside the declaring file.
-          const spec = inline.length === 0 ? name : ["self", ...inline, name].join("::");
+          const spec =
+            inline.chain.length === 0 ? name : ["self", ...inline.chain, name].join("::");
           imports.push({ moduleSpecifier: spec, isDynamic: false });
         }
         // extern crate serde;  /  #[macro_use] extern crate log as logging;

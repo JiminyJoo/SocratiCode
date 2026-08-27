@@ -1186,9 +1186,8 @@ export interface RustCrate {
   /**
    * The name other crates import it by — `[package] name` with dashes turned
    * into underscores, which is the translation Cargo itself performs. Null for
-   * a manifest that declares no package (a `[workspace]`-only root), no
-   * library target, or an explicit `[workspace.exclude]` member, none of which
-   * anything can import by name.
+   * a manifest that declares no package (a `[workspace]`-only root) or no
+   * library target, neither of which anything can import by name.
    */
   name: string | null;
   /** Project-relative path of the library root module, when the crate has one. */
@@ -1363,27 +1362,9 @@ export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): Ru
     const under = (relative: string): string => (dir === "." ? relative : `${dir}/${relative}`);
 
     const enclosingWs = findEnclosingWorkspace(dir);
-    let isExcludedByWorkspace = false;
     const wsDeps = new Map<string, string>();
 
     if (enclosingWs) {
-      const relToWs =
-        enclosingWs.dir === "."
-          ? dir
-          : dir.startsWith(`${enclosingWs.dir}/`)
-            ? dir.slice(enclosingWs.dir.length + 1)
-            : null;
-
-      if (relToWs !== null && relToWs !== "") {
-        const excludePatterns = patternList(enclosingWs.table.exclude);
-        if (excludePatterns && excludePatterns.length > 0) {
-          const excludeRes = excludePatterns.map((p) => globToRegex(p.replace(/\/+$/, ""), ".*"));
-          if (excludeRes.some((re) => re.test(relToWs))) {
-            isExcludedByWorkspace = true;
-          }
-        }
-      }
-
       const wsDepsTable = asTable(enclosingWs.table.dependencies);
       if (wsDepsTable) {
         for (const [depKey, depVal] of Object.entries(wsDepsTable)) {
@@ -1419,15 +1400,16 @@ export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): Ru
 
     // `[lib] name` overrides the package name for the importable target; both
     // spellings reach the same file, so both are recorded by the caller's map.
-    // An explicitly excluded workspace member cannot be imported by name.
+    //
+    // `[workspace] exclude` does NOT take a package out of the importable set,
+    // however much it looks like it should: it only keeps the member out of
+    // the default set of workspace-wide commands. A member of the workspace
+    // can still depend on an excluded package by path, and does — checked by
+    // building exactly that and watching `cargo check` accept it. Reading
+    // `exclude` as "not importable" lost a real edge.
     const declaredName = typeof lib?.name === "string" ? lib.name : null;
     const packageName = typeof pkg?.name === "string" ? pkg.name : null;
-    const name =
-      isExcludedByWorkspace
-        ? null
-        : libRoot
-          ? ((declaredName ?? packageName)?.replace(/-/g, "_") ?? null)
-          : null;
+    const name = libRoot ? ((declaredName ?? packageName)?.replace(/-/g, "_") ?? null) : null;
 
     const roots = new Set<string>();
     if (libRoot) roots.add(libRoot);
