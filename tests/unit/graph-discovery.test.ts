@@ -563,6 +563,23 @@ describe("buildCodeGraph — Rust crate resolution", () => {
       // path: `use serde::Deserialize;` reaches the crate, and the graph must
       // draw nothing at all.
       "crates/cli/src/serde.rs": "pub struct Deserialize;",
+      // The same name declared one level in, inside an inline block. That
+      // declaration puts `serde` in scope inside `inner` and nowhere else, so
+      // the `use` written at the file's own level still reaches the
+      // dependency — cargo 1.70.0 and 1.98.0 both compile that shape against
+      // the dependency, and fail with E0432 when it is removed. Reading the
+      // declaration as the file's own handed `crates/cli/src/serde.rs` the
+      // capture back.
+      "crates/cli/src/shadow.rs": [
+        "use serde::Deserialize;",
+        "",
+        "mod inner {",
+        "    mod serde;",
+        "}",
+        "",
+        "pub fn shadowed() {}",
+      ].join("\n"),
+      "crates/cli/src/shadow/inner/serde.rs": "pub struct Local;",
     });
     roots.push(dir);
     graph = await buildCodeGraph(dir);
@@ -614,12 +631,32 @@ describe("buildCodeGraph — Rust crate resolution", () => {
     expect(edge("crates/cli/src/runner.rs", "crates/cli/src/serde.rs")).toBe(false);
   });
 
+  it("does not let a module declared inside an inline block claim the file's own scope", () => {
+    // `mod inner { mod serde; }` declares `serde` inside `inner`. The `use`
+    // written at the file's level is outside that block, so it reaches the
+    // dependency and must draw no edge — least of all to the same-named file
+    // sitting beside the importer.
+    expect(edge("crates/cli/src/shadow.rs", "crates/cli/src/serde.rs")).toBe(false);
+    // The declaration itself is still an edge: it names a real file one level
+    // in, which is what keeps this test from passing on "no edges at all".
+    expect(edge("crates/cli/src/shadow.rs", "crates/cli/src/shadow/inner/serde.rs")).toBe(
+      true,
+    );
+  });
+
   it("follows a module declared with a dependency's name", () => {
-    // The hand that keeps the test above honest: here `serde` is declared with
-    // `pub mod serde;`, so rustc reads `pub use serde::Local;` as the local
-    // module and the edge belongs in the graph. A resolver that answers "no
-    // edge" whenever a path's head matches a dependency passes the test above
-    // and fails this one.
+    // Here `serde` is declared with `pub mod serde;`, so the file that carries
+    // a dependency's name is still in the module tree and its edge belongs in
+    // the graph.
+    //
+    // This asserts the declaration, not the `pub use serde::Local;` beside it:
+    // both land on the same file, and the graph's edges are a set, so nothing
+    // here can tell which of the two drew it. The hand that keeps the
+    // third-party test honest — an unanchored path resolving when the module
+    // is declared and not resolving when it is not — is asserted where it can
+    // fail, on `resolveRustImport` itself, in
+    // "lets an unanchored path reach a module the file declares, and only
+    // then".
     expect(edge("crates/core/src/lib.rs", "crates/core/src/serde.rs")).toBe(true);
   });
 

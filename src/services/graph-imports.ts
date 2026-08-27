@@ -18,6 +18,16 @@ export interface ImportInfo {
    * evidence of that in the file.
    */
   isModuleDeclaration?: boolean;
+  /**
+   * The name a module declaration puts in the declaring file's own scope.
+   * Absent when the declaration is written inside an inline `mod` block,
+   * where the name belongs to the block rather than to the file.
+   *
+   * It is not the specifier: `#[path = "custom.rs"] mod foo;` travels as the
+   * path it declares, while the name it brings into scope is `foo`, and it is
+   * `foo` an unanchored `use foo::Item;` in that file may reach.
+   */
+  declaredName?: string;
 }
 
 /**
@@ -666,20 +676,38 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
           // plus a directory per inline level. The `self/` head marks the
           // second form for the resolver.
           const declaredPath = rustPathAttribute(typed);
+          const name = stripRawIdent(match[1]);
+          // The name a declaration brings into scope, which is the module's
+          // name and never its file's: `#[path = "custom.rs"] mod foo;` puts
+          // `foo` in scope, and `use foo::Item;` beside it compiles — checked
+          // on cargo 1.70.0 and 1.98.0. It is carried separately because the
+          // specifier cannot hold it: there it is a path, or an anchored
+          // `self::…` chain. Declared inside an inline block, the name belongs
+          // to that block and not to the file, so nothing is reported.
+          const declaredName = inline.chain.length === 0 ? name : undefined;
           if (declaredPath) {
             const spec =
               inline.chain.length === 0
                 ? declaredPath
                 : `self/${inline.chain.join("/")}/${declaredPath}`;
-            imports.push({ moduleSpecifier: spec, isDynamic: false, isModuleDeclaration: true });
+            imports.push({
+              moduleSpecifier: spec,
+              isDynamic: false,
+              isModuleDeclaration: true,
+              declaredName,
+            });
             continue;
           }
-          const name = stripRawIdent(match[1]);
           // Declared inside `mod outer { … }`, the file sits under `outer/`,
           // not beside the declaring file.
           const spec =
             inline.chain.length === 0 ? name : ["self", ...inline.chain, name].join("::");
-          imports.push({ moduleSpecifier: spec, isDynamic: false, isModuleDeclaration: true });
+          imports.push({
+            moduleSpecifier: spec,
+            isDynamic: false,
+            isModuleDeclaration: true,
+            declaredName,
+          });
         }
         // extern crate serde;  /  #[macro_use] extern crate log as logging;
         //

@@ -1741,14 +1741,31 @@ export function resolveRustImport(
 
   const head = segments[0];
 
+  // Whether the head names a module this very file declares. It gates both
+  // shapes an unanchored path takes — a head on its own and a head with
+  // segments below it — because scope is what decides them, not length.
+  // Left undefined by a caller, it keeps the older, looser reading, so every
+  // existing caller behaves as before.
+  const declaredHere = declaredMods === undefined || declaredMods.has(head);
+
   const target = ((): string | null => {
     // A bare specifier is a `mod foo;` declaration (see extractImports), which
     // names a file in the declaring file's own module directory. `use foo;` —
     // a whole crate, no path — and `extern crate foo;` arrive in the same
     // shape, so the local module is tried first and the crate name second:
     // only one of the two exists in any tree that compiles.
+    //
+    // Which of the two it is, the declaration decides: `mod foo;` puts `foo`
+    // among the names this file declares, `use foo;` does not. Without that
+    // gate an orphan `src/serde.rs` — a file no `mod` names, left by a
+    // refactor — captured `use serde;` and drew an edge rustc does not: on
+    // cargo 1.70.0 and 1.98.0 that line reaches the dependency with the file
+    // sitting right there.
     if (segments.length === 1 && !["crate", "self", "super"].includes(head)) {
-      const local = global ? null : resolveRustModulePath(ownModuleDir, [head], null, fileSet);
+      const local =
+        global || !declaredHere
+          ? null
+          : resolveRustModulePath(ownModuleDir, [head], null, fileSet);
       if (local) return local;
       return crateNamed(head)?.libRoot ?? null;
     }
@@ -1820,7 +1837,6 @@ export function resolveRustImport(
     // looser reading, so every existing caller behaves as before.
     const unanchoredFrom =
       importingCrate?.edition === "2015" && own ? own.moduleDir : ownModuleDir;
-    const declaredHere = declaredMods === undefined || declaredMods.has(head);
     const local =
       global || !declaredHere
         ? null

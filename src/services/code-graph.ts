@@ -1012,11 +1012,21 @@ export async function buildCodeGraph(
     // and the declaration is the only evidence of that in the source: matching
     // a neighbouring file by name instead let a third-party head capture the
     // import whenever a file of that name happened to exist.
+    //
+    // The name comes from the declaration itself and not from its specifier.
+    // Reading the specifier's last segment got both ends wrong: a
+    // `#[path = "custom.rs"] mod foo;` recorded `custom.rs` and lost every
+    // `use foo::Item;` in that file, and a `mod bar;` written inside
+    // `mod outer { … }` recorded `bar` as if the file declared it — which
+    // handed a same-named neighbouring file back the capture this gate exists
+    // to stop. Both checked with cargo 1.70.0 and 1.98.0: the attribute form
+    // compiles with `foo` in scope, and at the file's own level a name
+    // declared inside an inline block reaches the dependency instead, or
+    // fails with E0432 when there is none.
     const declaredMods = new Set<string>();
     for (const imp of importInfos) {
-      if (imp.isModuleDeclaration) {
-        const segments = imp.moduleSpecifier.split("::");
-        declaredMods.add(segments[segments.length - 1]);
+      if (imp.isModuleDeclaration && imp.declaredName) {
+        declaredMods.add(imp.declaredName);
       }
     }
 

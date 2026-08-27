@@ -2108,6 +2108,47 @@ describe("graph-resolution", () => {
         .toBe("crates/config/src/lib.rs");
     });
 
+    it("lets an unanchored path reach a module the file declares, and only then", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nserde = "1"\n',
+        "src/lib.rs": "",
+        "src/serde.rs": "",
+      });
+
+      // Both hands in one place, which is what the graph-level assertion
+      // cannot do: there the `mod serde;` declaration draws the same edge, so
+      // the edge stays whatever the unanchored path resolves to.
+      expect(
+        resolveRustImport("serde::Local", "src/lib.rs", fileSet, crates, new Set(["serde"])),
+      ).toBe("src/serde.rs");
+      expect(
+        resolveRustImport("serde::Local", "src/lib.rs", fileSet, crates, new Set()),
+      ).toBeNull();
+    });
+
+    it("leaves a single-segment path on the crate when no declaration names it", () => {
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/bar"]\n',
+        "crates/app/Cargo.toml":
+          '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nbar = { path = "../bar" }\n',
+        "crates/app/src/lib.rs": "",
+        // An orphan left by a refactor: on disk, in no module tree.
+        "crates/app/src/bar.rs": "",
+        "crates/bar/Cargo.toml": '[package]\nname = "bar"\nedition = "2021"\n',
+        "crates/bar/src/lib.rs": "",
+      });
+
+      // `use bar;` and `mod bar;` arrive in the same shape, and only the
+      // declaration may reach the file. cargo 1.70.0 and 1.98.0 compile
+      // `use bar;` against the dependency with that orphan sitting there.
+      expect(
+        resolveRustImport("bar", "crates/app/src/lib.rs", fileSet, crates, new Set()),
+      ).toBe("crates/bar/src/lib.rs");
+      expect(
+        resolveRustImport("bar", "crates/app/src/lib.rs", fileSet, crates, new Set(["bar"])),
+      ).toBe("crates/app/src/bar.rs");
+    });
+
     it("follows a dependency renamed in the manifest to the crate it points at", () => {
       const crates = rustProject({
         "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/core"]\n',
