@@ -1658,6 +1658,7 @@ export function resolveRustImport(
   relSourceFile: string,
   fileSet: Set<string>,
   crates: RustCrate[],
+  declaredMods?: Set<string>,
 ): string | null {
   const own = rustRootForFile(crates, relSourceFile);
   const isRoot = own?.root === relSourceFile;
@@ -1756,7 +1757,15 @@ export function resolveRustImport(
       // item declared right there — in `foo.rs` beside `foo/`, or in
       // `foo/mod.rs`. Without this the whole `foo.rs`-plus-`foo/` layout, which
       // is the one rustc recommends, lost every `super::` edge out of a child.
-      const parent = rustModuleFile(moduleDir, fileSet);
+      //
+      // The crate root is that module for the top of the tree, and it is named
+      // by neither convention: `src` holds no `src.rs` and no `src/mod.rs`, so
+      // `super::Item` written in `src/foo.rs` — the commonest `super::` there
+      // is — resolved to nothing until the root was checked by name.
+      const parent =
+        own && moduleDir === own.moduleDir
+          ? own.root
+          : rustModuleFile(moduleDir, fileSet);
       return resolveRustModulePath(
         moduleDir,
         rest,
@@ -1782,9 +1791,23 @@ export function resolveRustImport(
     // `src/registry.rs`, and rustc rejects that same line from 2018 on. A
     // crate with no manifest keeps the 2018 reading, which is what a bare
     // tree of `.rs` files most likely is.
+    //
+    // The head must name a module the file actually declares. Matching a
+    // sibling `.rs` file by name alone is a filesystem answer to a question
+    // about scope: it let a third-party head capture the import whenever a
+    // file of that name happened to exist, and in `tests/` — where each file
+    // is its own integration-test crate and none can import another — it drew
+    // an edge Rust cannot express at all. rustc agrees the declaration is the
+    // gate: with `mod log;` present, `use log::item;` reaches the module and
+    // not the dependency. `declaredMods` left undefined keeps the older,
+    // looser reading, so every existing caller behaves as before.
     const unanchoredFrom =
       importingCrate?.edition === "2015" && own ? own.moduleDir : ownModuleDir;
-    const local = global ? null : resolveRustModulePath(unanchoredFrom, segments, null, fileSet);
+    const declaredHere = declaredMods === undefined || declaredMods.has(head);
+    const local =
+      global || !declaredHere
+        ? null
+        : resolveRustModulePath(unanchoredFrom, segments, null, fileSet);
     if (local) return local;
 
     const crate = crateNamed(head);
@@ -1833,6 +1856,7 @@ export function resolveImport(
   elixirModuleMap?: Map<string, string[]>,
   phpFqcnMap?: Map<string, string[]>,
   rustCrates?: RustCrate[],
+  rustDeclaredMods?: Set<string>,
 ): string | null {
   // Skip obvious external/stdlib modules. Go is excluded from this
   // pre-check because its external classifier in `isExternalModule`
@@ -2148,6 +2172,7 @@ export function resolveImport(
         toForwardSlash(path.relative(projectPath, sourceFile)),
         fileSet,
         rustCrates ?? [],
+        rustDeclaredMods,
       );
     }
 

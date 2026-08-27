@@ -10,6 +10,14 @@ export interface ImportInfo {
   moduleSpecifier: string; // The raw import string
   isDynamic: boolean;
   isCssImport?: boolean;   // True when extracted from a CSS/style context
+  /**
+   * True when the specifier comes from a declaration that brings a file into
+   * the module tree — a Rust `mod foo;` — rather than from a path that merely
+   * names something. Rust needs the difference: a module has to be declared
+   * before an unanchored path can reach it, and the declaration is the only
+   * evidence of that in the file.
+   */
+  isModuleDeclaration?: boolean;
 }
 
 /**
@@ -663,7 +671,7 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
               inline.chain.length === 0
                 ? declaredPath
                 : `self/${inline.chain.join("/")}/${declaredPath}`;
-            imports.push({ moduleSpecifier: spec, isDynamic: false });
+            imports.push({ moduleSpecifier: spec, isDynamic: false, isModuleDeclaration: true });
             continue;
           }
           const name = stripRawIdent(match[1]);
@@ -671,7 +679,7 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
           // not beside the declaring file.
           const spec =
             inline.chain.length === 0 ? name : ["self", ...inline.chain, name].join("::");
-          imports.push({ moduleSpecifier: spec, isDynamic: false });
+          imports.push({ moduleSpecifier: spec, isDynamic: false, isModuleDeclaration: true });
         }
         // extern crate serde;  /  #[macro_use] extern crate log as logging;
         //

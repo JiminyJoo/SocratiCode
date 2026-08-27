@@ -1007,13 +1007,26 @@ export async function buildCodeGraph(
       });
     }
 
+    // Which modules this file brings into the tree by declaring them. A Rust
+    // path with an unanchored head can only reach a module the file declares,
+    // and the declaration is the only evidence of that in the source: matching
+    // a neighbouring file by name instead let a third-party head capture the
+    // import whenever a file of that name happened to exist.
+    const declaredMods = new Set<string>();
+    for (const imp of importInfos) {
+      if (imp.isModuleDeclaration) {
+        const segments = imp.moduleSpecifier.split("::");
+        declaredMods.add(segments[segments.length - 1]);
+      }
+    }
+
     for (const imp of importInfos) {
       node.imports.push(imp.moduleSpecifier);
 
       // Try to resolve to a project file
       // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
       const resolutionLanguage = imp.isCssImport ? "css" : language;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates);
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, declaredMods);
       if (resolved) {
         node.dependencies.push(resolved);
 
