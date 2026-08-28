@@ -20,6 +20,7 @@ describe("embedding-config", () => {
     delete process.env.EMBEDDING_DIMENSIONS;
     delete process.env.EMBEDDING_CONTEXT_LENGTH;
     delete process.env.OLLAMA_API_KEY;
+    delete process.env.OLLAMA_MAX_CONNECTIONS;
     delete process.env.OPENAI_API_KEY;
     delete process.env.GOOGLE_API_KEY;
     delete process.env.LMSTUDIO_URL;
@@ -142,6 +143,29 @@ describe("embedding-config", () => {
     });
   });
 
+  describe("OLLAMA_MAX_CONNECTIONS", () => {
+    it("defaults to 4", () => {
+      expect(loadEmbeddingConfig().ollamaMaxConnections).toBe(4);
+    });
+
+    it("honours a custom positive integer", () => {
+      process.env.OLLAMA_MAX_CONNECTIONS = "8";
+      expect(loadEmbeddingConfig().ollamaMaxConnections).toBe(8);
+    });
+
+    it("throws for a non-integer or non-positive value", () => {
+      // A silently-clamped bad value would hide a config typo behind a
+      // working pool of the wrong size; the loader must refuse instead.
+      for (const bad of ["0", "-2", "four", "2.5"]) {
+        resetEmbeddingConfig();
+        process.env.OLLAMA_MAX_CONNECTIONS = bad;
+        expect(() => loadEmbeddingConfig(), bad).toThrow(
+          `Invalid OLLAMA_MAX_CONNECTIONS: "${bad}". Must be a positive integer.`,
+        );
+      }
+    });
+  });
+
   describe("singleton behavior", () => {
     it("caches config after first load", () => {
       const first = loadEmbeddingConfig();
@@ -189,6 +213,7 @@ describe("embedding-config", () => {
         embeddingDimensions: 1024,
         embeddingContextLength: 512,
         ollamaApiKey: "secret",
+        ollamaMaxConnections: 4,
       });
     });
   });
