@@ -27,6 +27,9 @@
  *                          Default for docker mode: http://localhost:11435
  *                          Default for external mode: http://localhost:11434
  *   OLLAMA_API_KEY:        Optional API key for authenticated Ollama proxies.
+ *   OLLAMA_MAX_CONNECTIONS: Max concurrent HTTP connections to Ollama.
+ *                          Positive integer. Default: 4. Requests beyond the
+ *                          cap queue client-side instead of opening sockets.
  *
  * Cloud provider-specific:
  *   OPENAI_API_KEY:        Required for openai provider.
@@ -71,6 +74,13 @@ export interface EmbeddingConfig {
   ollamaMode: OllamaMode;
   /** Ollama API URL (only relevant when embeddingProvider is "ollama"). */
   ollamaUrl: string;
+  /**
+   * Per-origin cap on concurrent HTTP connections to Ollama. Node's default
+   * fetch pool is unbounded, so concurrent embeds from several processes or
+   * overlapping tool calls stack sockets without limit (issue 114); excess
+   * requests queue on the bounded agent instead of opening new connections.
+   */
+  ollamaMaxConnections: number;
   /** LM Studio OpenAI-compatible base URL (only relevant when embeddingProvider is "lmstudio"). */
   lmstudioUrl: string;
   /** LiteLLM proxy OpenAI-compatible base URL (only relevant when embeddingProvider is "litellm"). */
@@ -234,6 +244,14 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
   }
   const embeddingDimensions = rawDimensions;
 
+  const rawMaxConnections = Number(process.env.OLLAMA_MAX_CONNECTIONS || 4);
+  if (!Number.isInteger(rawMaxConnections) || rawMaxConnections <= 0) {
+    throw new Error(
+      `Invalid OLLAMA_MAX_CONNECTIONS: "${process.env.OLLAMA_MAX_CONNECTIONS}". Must be a positive integer.`,
+    );
+  }
+  const ollamaMaxConnections = rawMaxConnections;
+
   const contextLengthEnv = process.env.EMBEDDING_CONTEXT_LENGTH;
 
   _config = {
@@ -256,6 +274,7 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
         })()
       : guessContextLength(embeddingModel),
     ollamaApiKey: process.env.OLLAMA_API_KEY || undefined,
+    ollamaMaxConnections,
   };
 
   logger.info("Embedding config loaded", {
@@ -263,6 +282,7 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
     ...(embeddingProvider === "ollama" ? {
       ollamaMode: _config.ollamaMode,
       ollamaUrl: _config.ollamaUrl,
+      ollamaMaxConnections: _config.ollamaMaxConnections,
     } : {}),
     ...(embeddingProvider === "lmstudio" ? {
       lmstudioUrl: _config.lmstudioUrl,

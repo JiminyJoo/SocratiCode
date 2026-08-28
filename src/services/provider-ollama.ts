@@ -8,6 +8,7 @@
  */
 
 import { Ollama } from "ollama";
+import { Agent, fetch as undiciFetch } from "undici";
 import type { InfraProgressCallback } from "./docker.js";
 import { ensureOllamaContainerReady, isDockerAvailable, isOllamaImagePresent, isOllamaRunning, isQdrantRunning } from "./docker.js";
 import { getEmbeddingConfig, setResolvedOllamaMode } from "./embedding-config.js";
@@ -18,14 +19,66 @@ import { logger } from "./logger.js";
 
 let ollamaClient: Ollama | null = null;
 let ollamaClientHost: string | null = null;
+let ollamaClientConnections: number | null = null;
+let ollamaDispatcher: Agent | null = null;
 
 function getClient(): Ollama {
   const config = getEmbeddingConfig();
-  if (!ollamaClient || ollamaClientHost !== config.ollamaUrl) {
-    ollamaClient = new Ollama({ host: config.ollamaUrl });
+  if (
+    !ollamaClient ||
+    ollamaClientHost !== config.ollamaUrl ||
+    ollamaClientConnections !== config.ollamaMaxConnections
+  ) {
+    // An orphaned pool keeps its idle sockets until they time out, so close
+    // the previous dispatcher whenever the client is rebuilt.
+    const previous = ollamaDispatcher;
+    if (previous) {
+      previous.close().catch((err: unknown) => {
+        logger.debug("Closing previous Ollama dispatcher failed", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+    // Node's default fetch pool has no per-origin connection cap, so
+    // concurrent embeds from several server processes or overlapping tool
+    // calls stack sockets to Ollama without limit (issue 114). A bounded
+    // undici Agent caps them; requests beyond the cap queue on the agent.
+    // The Agent must be paired with undici's own fetch: handing it to the
+    // built-in fetch fails its dispatcher handler validation.
+    const dispatcher = new Agent({
+      connections: config.ollamaMaxConnections,
+      keepAliveTimeout: 30_000,
+      keepAliveMaxTimeout: 30_000,
+    });
+    ollamaDispatcher = dispatcher;
+    ollamaClient = new Ollama({
+      host: config.ollamaUrl,
+      // undici's Response type predates the global one (no .bytes()), so the
+      // wrapper cannot satisfy `typeof fetch` structurally; the runtime shape
+      // is what the ollama client consumes and matches.
+      fetch: ((input: Parameters<typeof undiciFetch>[0], init?: Parameters<typeof undiciFetch>[1]) =>
+        undiciFetch(input, { ...init, dispatcher })) as unknown as typeof fetch,
+    });
     ollamaClientHost = config.ollamaUrl;
+    ollamaClientConnections = config.ollamaMaxConnections;
   }
   return ollamaClient;
+}
+
+/** Drop the cached client and drain its connection pool. */
+export function resetOllamaClient(): void {
+  const previous = ollamaDispatcher;
+  ollamaClient = null;
+  ollamaClientHost = null;
+  ollamaClientConnections = null;
+  ollamaDispatcher = null;
+  if (previous) {
+    previous.close().catch((err: unknown) => {
+      logger.debug("Closing Ollama dispatcher failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
 }
 
 // ── Availability checks ─────────────────────────────────────────────────
