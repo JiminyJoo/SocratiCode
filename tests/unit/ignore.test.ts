@@ -144,6 +144,31 @@ describe("ignore", () => {
       expect(shouldIgnore(ig, "tools/env/lib/dep.py")).toBe(true);
     });
 
+    it("keeps a source directory holding a file named conda-meta", () => {
+      // Each marker only counts in the shape its own tool writes it. Conda
+      // writes a directory; a plain file of that name is somebody's source
+      // tree, and reading mere existence made the whole directory vanish —
+      // cargo compiled `src/engine/mod.rs` while the graph had no such node.
+      fixture = createFixtureProject("ignore-conda-marker-is-a-file");
+      fs.mkdirSync(path.join(fixture.root, "src", "engine"), { recursive: true });
+      fs.writeFileSync(path.join(fixture.root, "src", "engine", "conda-meta"), "not a directory\n");
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "src/engine/mod.rs")).toBe(false);
+    });
+
+    it("keeps a source directory holding a directory named pyvenv.cfg", () => {
+      // The mirror image: PEP 405 writes a file, so a directory of that name is
+      // not a virtualenv either. Stated as its own case because the two markers
+      // are read by two separate calls, and one can be corrected without the
+      // other.
+      fixture = createFixtureProject("ignore-pyvenv-marker-is-a-directory");
+      fs.mkdirSync(path.join(fixture.root, "src", "cfg", "pyvenv.cfg"), { recursive: true });
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "src/cfg/loader.rs")).toBe(false);
+    });
+
     it("matches an environment directory whose name reads as a wildcard", () => {
       // gitignore syntax reads `[` as a character class, so a directory
       // honestly named `env[3]` produced a pattern matching none of its own

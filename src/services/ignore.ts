@@ -133,6 +133,31 @@ function escapeIgnorePattern(literal: string): string {
 }
 
 /**
+ * What the path is, or null when the question cannot be answered.
+ *
+ * The `throwIfNoEntry` option only covers a missing entry; an unreadable parent
+ * directory still throws EACCES, and the `existsSync` this replaced threw for
+ * nothing at all. A marker we cannot stat is simply not a marker.
+ */
+function statOrNull(candidate: string): fs.Stats | null {
+  try {
+    return fs.statSync(candidate, { throwIfNoEntry: false }) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether the path is a file, answering false for a directory or nothing. */
+function isFile(candidate: string): boolean {
+  return statOrNull(candidate)?.isFile() ?? false;
+}
+
+/** Whether the path is a directory, answering false for a file or nothing. */
+function isDirectory(candidate: string): boolean {
+  return statOrNull(candidate)?.isDirectory() ?? false;
+}
+
+/**
  * Walk the subdirectories once, collecting what the tree itself says should be
  * ignored: the rules of every nested .gitignore, and every environment
  * directory holding installed libraries.
@@ -172,10 +197,12 @@ function scanNestedIgnoreSources(
     // Two markers, because two tools build these directories: `pyvenv.cfg` for
     // a PEP 405 virtualenv, `conda-meta/` for a conda environment. Both hold
     // installed libraries and neither is source.
-    if (
-      fs.existsSync(path.join(dirPath, "pyvenv.cfg")) ||
-      fs.existsSync(path.join(dirPath, "conda-meta"))
-    ) {
+    //
+    // Each marker is checked in the shape its tool actually writes — a file for
+    // one, a directory for the other. Merely existing is not enough: a source
+    // directory holding a file named `conda-meta` would otherwise disappear
+    // whole, and a discarded source file costs far more than a kept one.
+    if (isFile(path.join(dirPath, "pyvenv.cfg")) || isDirectory(path.join(dirPath, "conda-meta"))) {
       const relDir = path.relative(rootPath, dirPath).split(path.sep).join("/");
       if (relDir) ig.add(`${escapeIgnorePattern(relDir)}/`);
       continue;
