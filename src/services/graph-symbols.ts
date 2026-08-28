@@ -10,6 +10,7 @@
 import { Lang, parse } from "@ast-grep/napi";
 import { getLanguageFromExtension } from "../constants.js";
 import type { SymbolEdge, SymbolKind, SymbolNode } from "../types.js";
+import { analyzeElixirTemplate, isElixirTemplateExtension } from "./elixir-templates.js";
 import { logger } from "./logger.js";
 
 /** Result of extracting symbols + raw call sites from a file. */
@@ -136,6 +137,9 @@ export function extractSymbolsAndCalls(
   };
 
   try {
+    if (isElixirTemplateExtension(ext)) {
+      return extractFromElixirTemplate(source, ext, relativePath, moduleSymbol);
+    }
     if (
       langKey === Lang.JavaScript ||
       langKey === Lang.TypeScript ||
@@ -179,6 +183,9 @@ export function extractSymbolsAndCalls(
     if (langKey === "dart") {
       return extractFromDart(source, relativePath, language, moduleSymbol);
     }
+    if (langKey === "elixir") {
+      return extractFromElixir(source, relativePath, language, moduleSymbol);
+    }
     // Svelte, Vue and others fall through to the regex fallback.
     return extractFromRegex(source, relativePath, language, moduleSymbol);
   } catch (err) {
@@ -195,6 +202,159 @@ export function extractSymbolsAndCalls(
     }
     return { symbols: [moduleSymbol], rawCalls: [] };
   }
+}
+
+// ── Elixir ───────────────────────────────────────────────────────────────
+
+function extractFromElixir(
+  source: string,
+  file: string,
+  language: string,
+  moduleSym: SymbolNode,
+): ExtractedSymbols {
+  const root = parse("elixir" as unknown as Lang, source).root();
+  const symbols: SymbolNode[] = [moduleSym];
+  const scopes: ScopeFrame[] = [];
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const childrenOf = (node: any): any[] => {
+    try {
+      return node.children();
+    } catch {
+      return [];
+    }
+  };
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const targetOf = (node: any): any | null => {
+    try {
+      return node.field("target") ?? null;
+    } catch {
+      return null;
+    }
+  };
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const targetName = (node: any): string | null => {
+    const target = targetOf(node);
+    return target?.kind() === "identifier" ? target.text() : null;
+  };
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const calleeName = (node: any): string | null => {
+    const target = targetOf(node);
+    if (target?.kind() === "identifier") return target.text();
+    if (target?.kind() !== "dot") return null;
+    const children = childrenOf(target);
+    if (children[0]?.kind() !== "alias") return null;
+    return [...children].reverse().find((child) => child.kind() === "identifier")?.text() ?? null;
+  };
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const nodeKey = (node: any): string => {
+    const range = node.range();
+    return `${range.start.line}:${range.start.column}:${range.end.line}:${range.end.column}`;
+  };
+  const addSymbol = (
+    name: string,
+    qualifiedName: string,
+    kind: SymbolKind,
+    startLine: number,
+    endLine: number,
+  ): void => {
+    const symbol: SymbolNode = {
+      id: makeId(file, qualifiedName, startLine),
+      name, qualifiedName, kind, file, line: startLine, endLine, language,
+    };
+    symbols.push(symbol);
+    scopes.push({ name: qualifiedName, startLine, endLine, symbolId: symbol.id });
+  };
+
+  const calls = safeFindAll(root, "call");
+  const modules: Array<{ name: string; startLine: number; endLine: number }> = [];
+  for (const node of calls) {
+    if (targetName(node) !== "defmodule") continue;
+    const args = childrenOf(node).find((child) => child.kind() === "arguments");
+    const rawName = args ? safeFindAll(args, "alias")[0]?.text() : null;
+    if (!rawName) continue;
+    const range = node.range();
+    const startLine = range.start.line + 1;
+    const endLine = range.end.line + 1;
+    const owner = modules
+      .filter((module) => startLine >= module.startLine && endLine <= module.endLine)
+      .sort((a, b) => b.startLine - a.startLine)[0];
+    const name = owner && !rawName.includes(".") ? `${owner.name}.${rawName}` : rawName;
+    addSymbol(name, name, "module", startLine, endLine);
+    modules.push({ name, startLine, endLine });
+  }
+
+  for (const node of calls) {
+    const visibility = targetName(node);
+    if (visibility !== "def" && visibility !== "defp") continue;
+    const name = node.text().match(/^(?:def|defp)\s+([a-z_]\w*[!?]?)/)?.[1];
+    if (!name) continue;
+    const range = node.range();
+    const startLine = range.start.line + 1;
+    const endLine = range.end.line + 1;
+    const owner = modules
+      .filter((module) => startLine >= module.startLine && endLine <= module.endLine)
+      .sort((a, b) => b.startLine - a.startLine)[0];
+    addSymbol(name, owner ? `${owner.name}.${name}` : name, "function", startLine, endLine);
+  }
+
+  const definitionMacros = new Set([
+    "def", "defp", "defmodule", "defstruct", "defguard", "defguardp", "defmacro", "defmacrop",
+    "defdelegate", "defprotocol", "defimpl",
+  ]);
+  const definitionsWithHeads = new Set([
+    "def", "defp", "defguard", "defguardp", "defmacro", "defmacrop", "defdelegate",
+  ]);
+  const definitionHeads = new Set<string>();
+  for (const node of calls) {
+    if (!definitionsWithHeads.has(targetName(node) ?? "")) continue;
+    const args = childrenOf(node).find((child) => child.kind() === "arguments");
+    const firstArgument = args ? childrenOf(args)[0] : null;
+    const head = firstArgument?.kind() === "binary_operator" ? firstArgument.field("left") : firstArgument;
+    if (head?.kind() === "call") definitionHeads.add(nodeKey(head));
+  }
+
+  const ignoredCalls = new Set([
+    ...definitionMacros,
+    "alias", "import", "require", "use",
+    "if", "unless", "for", "with", "case", "cond", "receive", "try", "quote", "unquote",
+  ]);
+  const rawCalls: ExtractedSymbols["rawCalls"] = [];
+  for (const node of calls) {
+    const name = calleeName(node);
+    if (
+      !name ||
+      ignoredCalls.has(name) ||
+      definitionHeads.has(nodeKey(node)) ||
+      node.parent()?.kind() === "unary_operator"
+    ) continue;
+    const line = node.range().start.line + 1;
+    rawCalls.push({
+      callerId: findCallerId(scopes, line, moduleSym.id),
+      calleeName: name,
+      callSite: { file, line },
+    });
+  }
+
+  return { symbols, rawCalls };
+}
+
+function extractFromElixirTemplate(
+  source: string,
+  ext: string,
+  file: string,
+  moduleSym: SymbolNode,
+): ExtractedSymbols {
+  const analysis = analyzeElixirTemplate(source, ext);
+  if (!analysis) {
+    logger.debug("Invalid HEEx/EEx template AST; skipping symbols and calls", { file });
+    return { symbols: [moduleSym], rawCalls: [] };
+  }
+
+  const rawCalls: ExtractedSymbols["rawCalls"] = analysis.elixirSource
+    ? extractFromElixir(analysis.elixirSource, file, moduleSym.language, moduleSym).rawCalls
+      .map((call) => ({ ...call, callerId: moduleSym.id }))
+    : [];
+  return { symbols: [moduleSym], rawCalls };
 }
 
 // ── Lua (namespace tables: function T.f(), local function f(), T.f = function()) ──

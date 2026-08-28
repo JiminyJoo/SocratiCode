@@ -23,6 +23,7 @@ import {
 import type { FileChunk } from "../types.js";
 import { ensureDynamicLanguages, getAstGrepLang, rebuildGraph, removeGraph } from "./code-graph.js";
 import { ensureArtifactsIndexed, loadConfig, removeAllArtifacts } from "./context-artifacts.js";
+import { analyzeElixirTemplate, ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir-templates.js";
 import { generateEmbeddings, prepareDocumentText } from "./embeddings.js";
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
@@ -283,6 +284,7 @@ const TOP_LEVEL_KINDS: Record<string, string[]> = {
   // starting on the same line. Both kinds are listed so the overlap-merge in
   // findAstBoundaries fuses each signature/body pair into one region.
   dart:       ["class_definition", "mixin_declaration", "enum_declaration", "extension_declaration", "type_alias", "function_signature", "function_body"],
+  elixir:     ["call"],
 };
 
 /** Minimum lines for a chunk to stand on its own (otherwise merge with neighbors) */
@@ -314,7 +316,7 @@ function findAstBoundaries(source: string, lang: Lang | string): AstRegion[] {
         // Only top-level nodes (depth 1 from root, or depth 2 for namespace/module wrappers)
         const parent = node.parent();
         const grandparent = parent?.parent();
-        const isTopLevel = !parent || parent.kind() === "program" || parent.kind() === "source_file"
+        const isTopLevel = !parent || parent.kind() === "program" || parent.kind() === "source" || parent.kind() === "source_file"
           || parent.kind() === "translation_unit" || parent.kind() === "module"
           || parent.kind() === "export_statement" || parent.kind() === "decorated_definition"
           || parent.kind() === "compilation_unit"
@@ -492,9 +494,11 @@ export function chunkFileContent(
     }]);
   }
 
-  // Try AST-aware chunking for supported languages
+  // Try AST-aware chunking for supported languages and mixed Elixir templates.
   const astLang = getAstGrepLang(ext);
-  const regions = astLang ? findAstBoundaries(content, astLang) : [];
+  const regions = isElixirTemplateExtension(ext)
+    ? (analyzeElixirTemplate(content, ext)?.regions ?? [])
+    : astLang ? findAstBoundaries(content, astLang) : [];
 
   if (regions.length > 0) {
     return applyCharCap(chunkByAstRegions(filePath, relativePath, lines, language, regions));
@@ -781,6 +785,9 @@ export async function indexProject(
   // ── Phase 1: Scan and chunk files ──
   progress.phase = "scanning files";
   const files = await getIndexableFiles(resolvedPath, extraExtensions);
+  if (files.some((file) => isElixirTemplateExtension(path.extname(file)))) {
+    await ensureElixirTemplateParsers();
+  }
   progress.filesTotal = files.length;
   onProgress?.(`Found ${files.length} indexable files`);
 
@@ -1092,6 +1099,9 @@ export async function updateProjectIndex(
   // ── Phase 1: Scan files and identify changes ──
   progress.phase = "scanning for changes";
   const currentFiles = await getIndexableFiles(resolvedPath, extraExtensions);
+  if (currentFiles.some((file) => isElixirTemplateExtension(path.extname(file)))) {
+    await ensureElixirTemplateParsers();
+  }
   progress.filesTotal = currentFiles.length;
   onProgress?.(`Found ${currentFiles.length} indexable files, scanning for changes...`);
   const currentFileSet = new Set(currentFiles);

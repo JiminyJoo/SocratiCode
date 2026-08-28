@@ -6,15 +6,16 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { Lang, registerDynamicLanguage } from "@ast-grep/napi";
 import { graphCollectionName, projectIdFromPath } from "../config.js";
-import { EXTENSION_LANGUAGE_MAP, EXTRA_EXTENSIONS, getLanguageFromExtension, MAX_GRAPH_FILE_BYTES, toForwardSlash } from "../constants.js";
+import { ELIXIR_TEMPLATE_EXTENSIONS, EXTENSION_LANGUAGE_MAP, EXTRA_EXTENSIONS, getLanguageFromExtension, MAX_GRAPH_FILE_BYTES, toForwardSlash } from "../constants.js";
 import type {
   CodeGraph, CodeGraphEdge, CodeGraphNode,
   SymbolEdge, SymbolGraphFilePayload, SymbolGraphMeta, SymbolNode, SymbolRef,
 } from "../types.js";
+import { ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir-templates.js";
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
-import { buildCsNamespaceMap, buildDartPackageMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpPsr4Map, buildPythonManifests, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
+import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpPsr4Map, buildPythonManifests, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
 import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
@@ -549,6 +550,7 @@ export function ensureDynamicLanguages(): void {
       ["php",     "@ast-grep/lang-php"],
       ["lua",     "@ast-grep/lang-lua"],
       ["dart",    "@ast-grep/lang-dart"],
+      ["elixir",  "@ast-grep/lang-elixir"],
     ];
 
     for (const [name, pkg] of langPackages) {
@@ -613,6 +615,7 @@ const EXTENSION_TO_AST_GREP_LANG: Record<string, Lang | string> = {
   ".php": "php",
   ".swift": "swift",
   ".dart": "dart",
+  ".ex": "elixir", ".exs": "elixir",
   ".lua": "lua",
   ".sh": "bash", ".bash": "bash", ".zsh": "bash",
   // Composite languages (parsed via HTML + script re-parse)
@@ -650,8 +653,9 @@ export function getAstGrepLang(
  * Get all source files in a project for graph analysis, with the detected
  * extension of every extensionless file admitted by content detection.
  *
- * Includes files with known AST grammars and any extra extensions. Extensionless
- * files are head-read here to decide admission, and the extension that decision
+ * Includes files with known AST grammars, mixed Elixir templates handled by their
+ * dedicated parsers, and any extra extensions. Extensionless files are head-read
+ * here to decide admission, and the extension that decision
  * used is returned in `detectedExts` so the build pass can reuse it instead of
  * reading the head again.
  *
@@ -709,14 +713,14 @@ export async function getGraphableFiles(
         await walk(fullPath);
       } else if (entry.isFile()) {
         const ext = path.extname(entry.name).toLowerCase();
-        // Include if AST grammar is available OR if it's an extra extension
-        if (getAstGrepLang(ext) !== null || extras.has(ext)) {
+        // Mixed Elixir templates use dedicated parsers, not the Elixir grammar.
+        if (getAstGrepLang(ext) !== null || extras.has(ext) || ELIXIR_TEMPLATE_EXTENSIONS.has(ext)) {
           files.push(relPath);
         } else if (ext === "" && (includeDotFiles || !entry.name.startsWith("."))) {
           // Extensionless: admit only when detection yields a grammar-bearing
           // canonical extension. `.txt`-detected files stay out of the graph:
-          // we don't start adding grammar-less extensionless leaf nodes (extra-
-          // extension files remain the only grammar-less nodes, as before).
+          // we don't start adding grammar-less extensionless leaf nodes (only
+          // extra-extension files and mixed Elixir templates are grammar-less).
           // Extensionless dotfiles are skipped unless INCLUDE_DOT_FILES, to stay
           // consistent with the index (see includeDotFiles above).
           const detected = await resolveExtensionlessExtension(fullPath);
@@ -756,6 +760,9 @@ export async function buildCodeGraph(
   const aliases = await loadPathAliases(resolvedPath);
   const { files, detectedExts } = await getGraphableFiles(resolvedPath, extraExtensions);
   const fileSet = new Set(files);
+  if (files.some((file) => isElixirTemplateExtension(path.extname(file)))) {
+    await ensureElixirTemplateParsers();
+  }
 
   if (progress) {
     progress.filesTotal = files.length;
@@ -856,9 +863,15 @@ export async function buildCodeGraph(
     return roots;
   };
 
+  // Elixir module names do not imply paths. Resolve directives against
+  // in-project `defmodule` declarations.
+  const hasElixir = files.some((f) => [".ex", ".exs"].includes(path.extname(f).toLowerCase()));
+  const elixirModuleMap = hasElixir ? buildElixirModuleMap(fileSet, resolvedPath) : undefined;
+
   for (const relPath of files) {
     let ext = path.extname(relPath).toLowerCase();
     let lang = getAstGrepLang(ext);
+    const isElixirTemplate = isElixirTemplateExtension(ext);
     const wasExtensionless = ext === "";
 
     // Extensionless entries carry the extension discovery detected when it
@@ -877,10 +890,10 @@ export async function buildCodeGraph(
       lang = detectedLang;
     }
 
-    // Files with no AST grammar (extra extensions) are included as leaf nodes
-    // so they can be targets of import edges from other files, but we skip
+    // Extra extensions with no parser are included as leaf nodes so they can be
+    // targets of import edges, but we skip
     // import extraction since we can't parse them.
-    if (!lang) {
+    if (!lang && !isElixirTemplate) {
       const absolutePath = path.join(resolvedPath, relPath);
       if (!nodesMap.has(relPath)) {
         nodesMap.set(relPath, {
@@ -955,12 +968,12 @@ export async function buildCodeGraph(
     // as plaintext.
     node.language = language;
 
-    // Extract imports using ast-grep
-    const importInfos = extractImports(source, lang, ext);
+    const extractionLang = lang ?? "elixir-template";
+    const importInfos = extractImports(source, extractionLang, ext);
 
     // Extract symbols & raw call sites in the same pass
     try {
-      const extracted = extractSymbolsAndCalls(source, lang, ext, relPath);
+      const extracted = extractSymbolsAndCalls(source, extractionLang, ext, relPath);
       symbolsByFile.set(relPath, extracted.symbols);
       outgoingCallsByFile.set(relPath, rawCallsToUnresolvedEdges(extracted.rawCalls));
     } catch (err) {
@@ -976,7 +989,7 @@ export async function buildCodeGraph(
       // Try to resolve to a project file
       // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
       const resolutionLanguage = imp.isCssImport ? "css" : language;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath));
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap);
       if (resolved) {
         node.dependencies.push(resolved);
 

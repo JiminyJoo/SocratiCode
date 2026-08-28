@@ -5,6 +5,7 @@ import path from "node:path";
 import { parse as parseToml, type TomlTable, type TomlValue } from "smol-toml";
 import { toForwardSlash } from "../constants.js";
 import type { PathAliases } from "./graph-aliases.js";
+import { extractSymbolsAndCalls } from "./graph-symbols.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
 
 // ── Module resolution ────────────────────────────────────────────────────
@@ -274,6 +275,30 @@ export interface GoModuleInfo {
   modulePath: string;
   moduleDir: string;
   packageMap: Map<string, string>;
+}
+
+/** Map each in-project Elixir `defmodule` name to its files, deterministically. */
+export function buildElixirModuleMap(fileSet: Set<string>, projectPath: string): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  for (const file of [...fileSet].filter((f) => [".ex", ".exs"].includes(path.extname(f).toLowerCase())).sort()) {
+    let source: string;
+    try {
+      source = readFileSync(path.join(projectPath, file), "utf8");
+    } catch {
+      continue;
+    }
+    const symbols = extractSymbolsAndCalls(source, "elixir", path.extname(file), file).symbols;
+    for (const symbol of symbols) {
+      if (symbol.kind !== "module" || symbol.name === "<module>") continue;
+      const files = map.get(symbol.qualifiedName);
+      if (files) {
+        if (!files.includes(file)) files.push(file);
+      } else {
+        map.set(symbol.qualifiedName, [file]);
+      }
+    }
+  }
+  return map;
 }
 
 /**
@@ -987,6 +1012,7 @@ export function resolveImport(
   phpPsr4Map?: Map<string, string[]>,
   dartPackageMap?: Map<string, string>,
   pythonImportRoots?: string[],
+  elixirModuleMap?: Map<string, string[]>,
 ): string | null {
   // Skip obvious external/stdlib modules. Go is excluded from this
   // pre-check because its external classifier in `isExternalModule`
@@ -1343,6 +1369,10 @@ export function resolveImport(
         return resolveRelativePath(libPath, projectPath, projectPath, fileSet, [".dart"]);
       }
       return resolveRelativePath(moduleSpecifier, sourceDir, projectPath, fileSet, [".dart"]);
+    }
+
+    case "elixir": {
+      return elixirModuleMap?.get(moduleSpecifier)?.[0] ?? null;
     }
 
     case "lua": {
