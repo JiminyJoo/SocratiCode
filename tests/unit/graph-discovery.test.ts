@@ -1149,6 +1149,38 @@ describe("buildCodeGraph — Rust edges rustc rejects", () => {
     ).toBe(true);
   });
 
+  it("ignores a [patch] aimed at a git remote rather than at the registry", async () => {
+    // `[patch]` is keyed by the source it redirects, and only the entry under
+    // `crates-io` touches a dependency written as a version. A section keyed by
+    // a git URL redirects *that* remote, so a `log = "0.4"` taken from the
+    // registry is untouched by it and cargo keeps building the registry crate —
+    // verified on 1.98.0, where the dep-info names neither the local directory
+    // nor anything under it.
+    //
+    // The same manifest with `crates-io` in place of the URL is the gemello
+    // above, which does draw the edge: one token apart, opposite answers.
+    // Nothing proved this half — removing the line that checks the source left
+    // the whole battery green.
+    const graph = await graphOf({
+      "Cargo.toml": [
+        '[workspace]\nmembers = ["crates/app", "crates/log"]\nresolver = "2"\n',
+        '[patch."https://github.com/rust-lang/log"]\nlog = { path = "crates/log" }\n',
+      ].join("\n"),
+      "crates/app/Cargo.toml":
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlog = "0.4"\n',
+      "crates/app/src/lib.rs": "use log::marker;\n\npub fn shout() -> marker::Local { marker::Local }",
+      "crates/log/Cargo.toml": '[package]\nname = "log"\nversion = "0.4.34"\nedition = "2021"\n',
+      "crates/log/src/lib.rs": "pub mod marker { pub struct Local; }",
+    });
+
+    // The file the edge would land on has to be in the graph, or a broken graph
+    // satisfies this assertion by drawing nothing at all.
+    expect(graph.nodes.some((n) => n.relativePath === "crates/log/src/lib.rs")).toBe(true);
+    expect(
+      graph.edges.some((e) => e.source === "crates/app/src/lib.rs" && e.target === "crates/log/src/lib.rs"),
+    ).toBe(false);
+  });
+
   it("ignores a [patch] a workspace member declares for itself", async () => {
     // Cargo says so out loud — "patch for the non root package will be ignored,
     // specify patch at the workspace root" — and then fails the build with
