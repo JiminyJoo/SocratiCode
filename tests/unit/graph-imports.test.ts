@@ -871,6 +871,52 @@ mod tests {
       expect(specs).toEqual([]);
     });
 
+    // Whether a bare head written inside an inline block may reach the file's
+    // own declarations. It travels as `fromInlineBlock`, not in the specifier,
+    // which is identical under both readings — an assertion on the string would
+    // pass either way and prove nothing.
+    const blockedOf = (source: string, spec: string): boolean | undefined =>
+      extractImports(source, "rust", ".rs").find((i) => i.moduleSpecifier === spec)?.fromInlineBlock;
+
+    it("does not take a glob from another crate as the anchor", () => {
+      // `use ::other::{*};` reaches outside this crate, so it brings in nothing
+      // the file declares and cannot anchor a bare head. The leading `::` says
+      // so, and stripping the prefix before the check is what let a group of
+      // that shape read as an anchor — the same capture the marker exists to
+      // prevent, in its braced spelling.
+      const source = `
+mod helper;
+
+mod tests {
+    use ::other::{*};
+    use helper::build;
+}
+`;
+
+      expect(specsOf(source)).toContain("::other");
+      expect(blockedOf(source, "helper::build")).toBe(true);
+    });
+
+    it("counts the supers of a glob against the depth it is written at", () => {
+      // One `super` leaves an inline block and lands on the file; written two
+      // blocks deep the same word lands halfway, and brings in nothing the file
+      // declares. Only a glob carrying exactly as many `super`s as there are
+      // levels reaches the file's own scope — dropping that count let a shallow
+      // glob anchor a head it cannot see.
+      const source = `
+mod helper;
+
+mod outer {
+    mod inner {
+        use super::*;
+        use helper::build;
+    }
+}
+`;
+
+      expect(blockedOf(source, "helper::build")).toBe(true);
+    });
+
     it("follows a bare head into the inline block that declares it", () => {
       const specs = specsOf(`
 #[cfg(test)]

@@ -1149,6 +1149,40 @@ describe("buildCodeGraph — Rust edges rustc rejects", () => {
     ).toBe(true);
   });
 
+  it("does not fall through to a crate when the declared module's file is missing", async () => {
+    // The gate that stops a declaration from becoming an edge into a library of
+    // the same name. `mod log;` says `log` is this file's module, whatever the
+    // manifest carries — so if its file cannot be found, the answer is nothing,
+    // not the crate. rustc agrees loudly: a `#[path]` at a file that does not
+    // exist is E0583, and the build never reaches the dependency.
+    //
+    // Nothing held this: removing the gate left the battery green, and the edge
+    // it draws is the exact shape #118 exists to close — a plausible file in
+    // the project captured by a name that belongs to a dependency.
+    const graph = await graphOf({
+      "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/log"]\nresolver = "2"\n',
+      "crates/app/Cargo.toml":
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlog = { path = "../log" }\n',
+      // The declaration names a file that is not there, so the module has no
+      // file at all — and `use log::marker;` below must reach neither.
+      // A single-segment `use`, because that is the shape the gate answers: a
+      // longer path is resolved by walking the module tree and never reaches
+      // the crate fallback at all.
+      "crates/app/src/lib.rs": '#[path = "nowhere.rs"]\nmod log;\n\nuse log;\n\npub fn go() -> u32 { 1 }',
+      "crates/log/Cargo.toml": '[package]\nname = "log"\nversion = "0.1.0"\nedition = "2021"\n',
+      "crates/log/src/lib.rs": "pub mod marker { pub struct Local; }",
+    });
+
+    // The crate's file is in the graph, so the absence is about the gate and
+    // not about a target that was never there.
+    expect(graph.nodes.some((n) => n.relativePath === "crates/log/src/lib.rs")).toBe(true);
+    expect(
+      graph.edges.some(
+        (e) => e.source === "crates/app/src/lib.rs" && e.target === "crates/log/src/lib.rs",
+      ),
+    ).toBe(false);
+  });
+
   it("reaches the file a literal include! pastes in", async () => {
     // `include!` is in the Reference like the `#[path]` this resolver already
     // reads, so it passes the admission rule in `graph-imports.ts`: the
