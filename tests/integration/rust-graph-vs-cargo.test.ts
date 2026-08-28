@@ -56,7 +56,11 @@ const write = (root: string, rel: string, body: string): void => {
   fs.writeFileSync(full, body);
 };
 
-describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info", () => {
+// The condition is in the name because a skip is silent otherwise: vitest
+// prints the title and nothing about why, and a suite that quietly stops
+// running reads exactly like a suite that passes. In CI it cannot skip — the
+// `rust-graph-vs-cargo` job checks `rustc --version` before it gets here.
+describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info (needs cargo on PATH)", () => {
   let root: string;
   let read: Set<string>;
 
@@ -103,11 +107,23 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info", () => {
     // `lib.rs` above, which only compiles because `include!` puts it there.
     write(root, "src/pasted.rs", "fn pasted() -> u32 {\n    4\n}\n");
 
-    execFileSync("cargo", ["check", "--offline", "--quiet"], {
-      cwd: root,
-      stdio: "ignore",
-      timeout: 120_000,
-    });
+    // `--offline` because the crate declares no dependencies: nothing here
+    // should ever reach the network, and asking for it makes that a failure
+    // instead of a slow success.
+    try {
+      execFileSync("cargo", ["check", "--offline", "--quiet"], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 120_000,
+      });
+    } catch (err) {
+      // Without this the failure surfaces as a bare non-zero exit from
+      // `beforeAll`, which says nothing about the crate that would not build —
+      // and the whole oracle rests on that build.
+      const details = err instanceof Error && "stderr" in err ? String(err.stderr) : String(err);
+      throw new Error(`the fixture crate did not compile, so there is no oracle:\n${details}`);
+    }
 
     read = sourcesRustcRead(root);
   }, 180_000);
