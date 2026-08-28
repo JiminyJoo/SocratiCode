@@ -107,6 +107,86 @@ describe("ignore", () => {
       expect(ig.ignores("packages/sub/data.bak")).toBe(true);
     });
 
+    it("ignores a virtualenv at the project root", () => {
+      fixture = createFixtureProject("ignore-venv-root");
+      const ig = createIgnoreFilter(fixture.root);
+
+      expect(shouldIgnore(ig, "venv/lib/python3.12/site-packages/dep.py")).toBe(true);
+      expect(shouldIgnore(ig, "env/lib/python3.12/site-packages/dep.py")).toBe(true);
+    });
+
+    it("ignores a virtualenv nested anywhere, by its pyvenv.cfg", () => {
+      // `venv` and `env` match at the project root only, because at any depth
+      // they also delete real source: `clap_complete/src/env/` is compiled by
+      // cargo and was not even a node of the graph. What the anchoring gives
+      // up is covered by the proof instead of the name — PEP 405 puts a
+      // `pyvenv.cfg` at the root of every virtualenv.
+      fixture = createFixtureProject("ignore-venv-nested");
+      fs.mkdirSync(path.join(fixture.root, "backend", "venv", "lib"), { recursive: true });
+      fs.writeFileSync(
+        path.join(fixture.root, "backend", "venv", "pyvenv.cfg"),
+        "home = /usr\nversion = 3.12.0\n",
+      );
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "backend/venv/lib/dep.py")).toBe(true);
+    });
+
+    it("ignores a nested conda environment, by its conda-meta directory", () => {
+      // The other tool that builds one of these. A conda environment carries no
+      // `pyvenv.cfg`, so recognising only that marker left `tools/env/` — a
+      // directory of installed libraries — read as source once `env` stopped
+      // matching at any depth.
+      fixture = createFixtureProject("ignore-conda-nested");
+      fs.mkdirSync(path.join(fixture.root, "tools", "env", "conda-meta"), { recursive: true });
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "tools/env/lib/dep.py")).toBe(true);
+    });
+
+    it("matches an environment directory whose name reads as a wildcard", () => {
+      // gitignore syntax reads `[` as a character class, so a directory
+      // honestly named `env[3]` produced a pattern matching none of its own
+      // files, and the environment stayed in the tree.
+      fixture = createFixtureProject("ignore-venv-brackets");
+      fs.mkdirSync(path.join(fixture.root, "sub", "env[3]", "lib"), { recursive: true });
+      fs.writeFileSync(
+        path.join(fixture.root, "sub", "env[3]", "pyvenv.cfg"),
+        "home = /usr\nversion = 3.12.0\n",
+      );
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "sub/env[3]/lib/dep.py")).toBe(true);
+    });
+
+    it("keeps a nested module named env, which carries no pyvenv.cfg", () => {
+      // The case the anchoring exists for: in Rust `env` is an ordinary module
+      // name. `pub mod env;` sits two lines below `pub mod engine;` in
+      // clap_complete, and only the second one used to draw its edges.
+      fixture = createFixtureProject("ignore-nested-env-module");
+      fs.mkdirSync(path.join(fixture.root, "crate", "src", "env"), { recursive: true });
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "crate/src/env/mod.rs")).toBe(false);
+      expect(shouldIgnore(ig, "crate/src/env/shells.rs")).toBe(false);
+    });
+
+    it("finds a virtualenv even with RESPECT_GITIGNORE=false", () => {
+      // A virtualenv is not a project preference: it is a directory of
+      // installed libraries, and turning .gitignore off is no reason to start
+      // reading them as source.
+      process.env.RESPECT_GITIGNORE = "false";
+      fixture = createFixtureProject("ignore-venv-no-gitignore");
+      fs.mkdirSync(path.join(fixture.root, "backend", "venv", "lib"), { recursive: true });
+      fs.writeFileSync(
+        path.join(fixture.root, "backend", "venv", "pyvenv.cfg"),
+        "home = /usr\nversion = 3.12.0\n",
+      );
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "backend/venv/lib/dep.py")).toBe(true);
+    });
+
     it("reads .socraticodeignore if present", () => {
       fixture = createFixtureProject("ignore-socraticode");
 

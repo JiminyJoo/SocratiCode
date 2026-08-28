@@ -18,8 +18,20 @@ const DEFAULT_IGNORE_PATTERNS = [
   "__pycache__",
   "*.pyc",
   ".venv",
-  "venv",
-  "env",
+  // Anchored, unlike the rest: `venv` and `env` are a virtualenv's names at the
+  // root of a project, and ordinary module names anywhere below it. Unanchored
+  // they matched at any depth and quietly deleted source — `clap_complete/src/env/`
+  // is compiled by cargo and listed in its dep-info, yet was not even a node of
+  // the graph, while `pub mod engine;` two lines above it drew its edges; the
+  // same for `tracing-subscriber/src/filter/env/`. In a 245-crate registry
+  // sample they are the only two, which is the point: the loss is total for the
+  // crate it hits and invisible everywhere else.
+  //
+  // A virtualenv nested deeper stays out by the two routes that already cover
+  // it: `.venv`, the common spelling, is still matched at any depth, and a
+  // checked-in project lists its own in `.gitignore`, which this filter reads.
+  "/venv",
+  "/env",
   ".tox",
   "target",
   "_build",
@@ -86,12 +98,15 @@ export function createIgnoreFilter(projectPath: string): Ignore {
       const content = fs.readFileSync(rootGitignore, "utf-8");
       ig.add(content);
     }
-
-    // Find and process nested .gitignore files
-    findNestedGitignores(projectPath, projectPath, ig);
   } else {
     logger.debug("Skipping .gitignore processing (RESPECT_GITIGNORE=false)");
   }
+
+  // The same walk finds the nested .gitignore files and the virtualenvs, and it
+  // runs whether or not .gitignore is respected: a virtualenv is not a project
+  // preference, it is a directory of installed libraries that no reading of the
+  // tree should call source.
+  scanNestedIgnoreSources(projectPath, projectPath, ig, respectGitignore);
 
   // .socraticodeignore
   const socraticodeignorePath = path.join(projectPath, ".socraticodeignore");
@@ -106,10 +121,38 @@ export function createIgnoreFilter(projectPath: string): Ignore {
 }
 
 /**
- * Recursively find .gitignore files in subdirectories and add their rules
- * with proper relative path prefixing.
+ * A literal path as a gitignore pattern that matches it and nothing else.
+ *
+ * The syntax reads `*`, `?` and `[` as wildcards, so a directory honestly named
+ * `env[3]` became a character class and matched none of its own files. A
+ * leading `!` or `#` changes what the whole line means, and both are legal in a
+ * directory name.
  */
-function findNestedGitignores(rootPath: string, currentPath: string, ig: Ignore): void {
+function escapeIgnorePattern(literal: string): string {
+  return literal.replace(/[[\]*?\\!#]/g, (character) => `\\${character}`);
+}
+
+/**
+ * Walk the subdirectories once, collecting what the tree itself says should be
+ * ignored: the rules of every nested .gitignore, and every environment
+ * directory holding installed libraries.
+ *
+ * A virtualenv is recognised by the `pyvenv.cfg` PEP 405 puts at its root, not
+ * by its directory's name. The name alone cannot do it: `venv` and `env` are
+ * also ordinary module names, and matching them at any depth deleted real
+ * source — `clap_complete/src/env/`, which cargo compiles, was not even a node.
+ * They are matched at the project root only now, and the proof covers what that
+ * anchoring gives up: a virtualenv nested deeper, whatever it is called.
+ *
+ * The extra cost is one `existsSync` per directory visited, in a walk that was
+ * already making one for `.gitignore`.
+ */
+function scanNestedIgnoreSources(
+  rootPath: string,
+  currentPath: string,
+  ig: Ignore,
+  readGitignores: boolean,
+): void {
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(currentPath, { withFileTypes: true });
@@ -121,6 +164,23 @@ function findNestedGitignores(rootPath: string, currentPath: string, ig: Ignore)
     if (!entry.isDirectory()) continue;
 
     const dirName = entry.name;
+    const dirPath = path.join(currentPath, dirName);
+
+    // Checked before the skip list below, which would otherwise walk past a
+    // `venv/` without ever looking inside it.
+    //
+    // Two markers, because two tools build these directories: `pyvenv.cfg` for
+    // a PEP 405 virtualenv, `conda-meta/` for a conda environment. Both hold
+    // installed libraries and neither is source.
+    if (
+      fs.existsSync(path.join(dirPath, "pyvenv.cfg")) ||
+      fs.existsSync(path.join(dirPath, "conda-meta"))
+    ) {
+      const relDir = path.relative(rootPath, dirPath).split(path.sep).join("/");
+      if (relDir) ig.add(`${escapeIgnorePattern(relDir)}/`);
+      continue;
+    }
+
     // Skip directories we know should be ignored
     if (dirName === "node_modules" || dirName === ".git" || dirName === ".svn" ||
         dirName === ".hg" || dirName === "dist" || dirName === "build" ||
@@ -129,10 +189,9 @@ function findNestedGitignores(rootPath: string, currentPath: string, ig: Ignore)
       continue;
     }
 
-    const dirPath = path.join(currentPath, dirName);
     const gitignorePath = path.join(dirPath, ".gitignore");
 
-    if (fs.existsSync(gitignorePath)) {
+    if (readGitignores && fs.existsSync(gitignorePath)) {
       const content = fs.readFileSync(gitignorePath, "utf-8");
       const relDir = path.relative(rootPath, dirPath).split(path.sep).join("/");
 
@@ -157,7 +216,7 @@ function findNestedGitignores(rootPath: string, currentPath: string, ig: Ignore)
     }
 
     // Recurse into subdirectory
-    findNestedGitignores(rootPath, dirPath, ig);
+    scanNestedIgnoreSources(rootPath, dirPath, ig, readGitignores);
   }
 }
 
