@@ -1128,6 +1128,27 @@ describe("buildCodeGraph — Rust edges rustc rejects", () => {
     ).toBe(true);
   });
 
+  it("reaches a project crate a [replace] sends a registry name to", async () => {
+    // `[replace]` is the older spelling of the same redirection, keyed by name
+    // and version instead of by source. Cargo still honours it, so the graph
+    // reads it too — and nothing proved that until now: deleting the line that
+    // reads it left all 1313 proofs green.
+    const graph = await graphOf({
+      "Cargo.toml": [
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        '[dependencies]\nlog = "0.4.34"\n',
+        '[replace]\n"log:0.4.34" = { path = "local-log" }\n',
+      ].join("\n"),
+      "src/lib.rs": "use log::marker;\n\npub fn go() -> marker::Local { marker::Local }",
+      "local-log/Cargo.toml": '[package]\nname = "log"\nversion = "0.4.34"\nedition = "2021"\n',
+      "local-log/src/lib.rs": "pub mod marker { pub struct Local; }",
+    });
+
+    expect(
+      graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "local-log/src/lib.rs"),
+    ).toBe(true);
+  });
+
   it("ignores a [patch] a workspace member declares for itself", async () => {
     // Cargo says so out loud — "patch for the non root package will be ignored,
     // specify patch at the workspace root" — and then fails the build with
