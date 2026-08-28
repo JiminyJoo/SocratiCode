@@ -559,6 +559,31 @@ use ::serde::{Serialize, Deserialize};
       expect(specs).toEqual(["::config::Item", "::serde::Serialize", "::serde::Deserialize"]);
     });
 
+    it("keeps the leading :: when the group opens on it", () => {
+      // `::{…}` carries the marker in the group prefix and nowhere else.
+      // Stripping the trailing `::` left the empty string, which reads the same
+      // as a group with no prefix, and the path resolved into the local module
+      // again — the capture the marker exists to prevent.
+      const specs = specsOf(`
+use ::{corelib::marker};
+use ::{corelib::marker, log::Level};
+`);
+
+      expect(specs).toEqual([
+        "::corelib::marker",
+        "::corelib::marker",
+        "::log::Level",
+      ]);
+    });
+
+    it("leaves a group with no prefix alone", () => {
+      // The guard above must not turn every prefix-less group into a global
+      // path: `use {a, b};` names two paths in the file's own scope.
+      const specs = specsOf("use {alpha, beta::Gamma};");
+
+      expect(specs).toEqual(["alpha", "beta::Gamma"]);
+    });
+
     it("finds a path attribute with a comment between it and the mod", () => {
       const specs = specsOf(`
 #[path = "elsewhere/moved.rs"]
@@ -603,6 +628,180 @@ mod conventional;
 `);
 
       expect(specs).toEqual(["elsewhere/moved.rs", "fixtures/support.rs", "conventional"]);
+    });
+
+    it("takes the file of a mod from a cfg_attr path attribute", () => {
+      // The platform-abstraction idiom, and the Rust Reference's own example:
+      // the module `sys` is `unix.rs` here and `windows.rs` there, and
+      // `src/sys.rs` is never read. Reading only the bare form both drew an
+      // edge to that unread file and missed the one carrying the crate body.
+      //
+      // One path per named file, because the graph does not fix a target or a
+      // feature set — the same reading `#[cfg(…)] mod` already gets.
+      //
+      // Nearest the `mod` first: the attributes are walked backwards from it,
+      // which is where a lone `#[path]` was already read from.
+      //
+      // The plain name closes the list, because a `cfg_attr` applies only where
+      // its condition holds and where none does the module is the file its name
+      // implies — `errno`'s own `src/sys.rs` is written for exactly that case.
+      const specs = specsOf(`
+#[cfg_attr(unix, path = "unix.rs")]
+#[cfg_attr(windows, path = "windows.rs")]
+mod sys;
+`);
+
+      expect(specs).toEqual(["windows.rs", "unix.rs", "sys"]);
+    });
+
+    it("reads the declarations written inside a macro invocation", () => {
+      // tree-sitter keeps a macro body as an unparsed token tree, so nothing in
+      // it was a node and half of tokio's `mod` declarations — 256 of 535 —
+      // were invisible, along with 348 `use`. Expansion happens before name
+      // resolution: what is written in there is a declaration like any other.
+      const specs = specsOf(`
+mod plain;
+
+cfg_io_util! {
+    mod async_buf_read_ext;
+    pub use async_buf_read_ext::AsyncBufReadExt;
+
+    mod buf_reader;
+}
+`);
+
+      expect(specs).toContain("plain");
+      expect(specs).toContain("async_buf_read_ext");
+      expect(specs).toContain("buf_reader");
+      expect(specs).toContain("async_buf_read_ext::AsyncBufReadExt");
+    });
+
+    it("does not read a macro body as a module level of its own", () => {
+      // The body is unwrapped in place, so what encloses it still counts and
+      // the macro itself does not: `mod x;` inside `cfg_windows! { … }` written
+      // in `mod inner { … }` names `inner/x`, not `cfg_windows/x` and not `x`.
+      const specs = specsOf(`
+mod inner {
+    cfg_windows! {
+        mod named_pipe;
+    }
+}
+`);
+
+      expect(specs).toEqual(["self::inner::named_pipe"]);
+    });
+
+    it("reads a #[path] declaration written inside a macro invocation", () => {
+      // tokio's `atomic_u64.rs` writes exactly this, twice: the module is
+      // always `imp`, and only the attribute says which file it is.
+      const specs = specsOf(`
+cfg_has_atomic_u64! {
+    #[path = "atomic_u64_native.rs"]
+    mod imp;
+}
+
+cfg_not_has_atomic_u64! {
+    #[path = "atomic_u64_as_mutex.rs"]
+    mod imp;
+}
+`);
+
+      expect(specs).toEqual(["atomic_u64_native.rs", "atomic_u64_as_mutex.rs"]);
+    });
+
+    it("does not read a macro body written as an expression", () => {
+      // A proc-macro's `quote! { … }` builds the tokens its *caller* will get:
+      // the module is declared there, not here. Checked on cargo 1.98.0 with a
+      // `compile_error!` in `src/generated.rs` — the crate builds clean and its
+      // dep-info names `src/lib.rs` alone, while the graph had drawn the file
+      // as a dependency, twice.
+      //
+      // The rule is read off the tree, not off the macro's name: a body holds
+      // items only where the invocation itself may be one. Both spellings are
+      // checked, the method receiver and the tail expression — the second is
+      // the idiom of every `fn … -> TokenStream`, and it is the reason a block
+      // does not count as an item position.
+      for (const body of [
+        "    quote! {\n        mod generated;\n        pub use generated::Thing;\n    }\n    .into()",
+        "    quote! {\n        mod generated;\n        pub use generated::Thing;\n    }",
+      ]) {
+        const specs = specsOf(`
+use quote::quote;
+
+pub fn emit() -> TokenStream {
+${body}
+}
+`);
+
+        expect(specs, `body: ${body}`).not.toContain("generated");
+        expect(specs, `body: ${body}`).not.toContain("generated::Thing");
+      }
+    });
+
+    it("reads a macro body written where an item may stand", () => {
+      // The other side of the same rule, in the two places that count: the file
+      // itself and a `mod` body. An `impl` body counts too — tokio writes a
+      // `cfg_unstable! { fn … { use …; } }` in one.
+      const specs = specsOf(`
+cfg_a! {
+    mod at_file;
+}
+
+mod holder {
+    cfg_b! {
+        mod in_mod;
+    }
+}
+
+impl Thing {
+    cfg_c! {
+        fn f() { use crate::in_impl::Marker; }
+    }
+}
+`);
+
+      expect(specs).toContain("at_file");
+      expect(specs).toContain("self::holder::in_mod");
+      expect(specs).toContain("crate::in_impl::Marker");
+    });
+
+    it("leaves a parenthesised macro invocation alone", () => {
+      // Only `{}` is unwrapped: a `()` or `[]` invocation carries an
+      // expression, not items. `automod::dir!("tests/builder")` names modules
+      // that are nowhere written, and no reading of the source can find them.
+      const specs = specsOf(`
+mod real;
+automod::dir!("tests/builder");
+let v = vec![1, 2, 3];
+`);
+
+      expect(specs).toEqual(["real"]);
+    });
+
+    it("does not report a declaration twice when it sits outside every macro", () => {
+      // The unwrapped source is re-read whole, so everything the first pass
+      // found comes back with it. Subtracting as a multiset is what keeps the
+      // existing edges, repeats included, exactly as they were.
+      const specs = specsOf(`
+mod outside;
+cfg_io_util! {
+    mod inside;
+}
+`);
+
+      expect(specs.filter((s) => s === "outside")).toHaveLength(1);
+      expect(specs.filter((s) => s === "inside")).toHaveLength(1);
+    });
+
+    it("reads a cfg_attr that names no path as naming none", () => {
+      // Only `path` is picked out of what a `cfg_attr` would apply; a
+      // `cfg_attr` carrying anything else leaves the module on convention.
+      const specs = specsOf(`
+#[cfg_attr(docsrs, doc(cfg(feature = "full")))]
+mod plain;
+`);
+
+      expect(specs).toEqual(["plain"]);
     });
 
     it("marks a path attribute written inside an inline module", () => {

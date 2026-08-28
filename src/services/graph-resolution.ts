@@ -1215,6 +1215,17 @@ export interface RustCrate {
    * as well as `[workspace.dependencies]` referenced via `workspace = true`.
    */
   aliases?: Record<string, string>;
+  /**
+   * The dependency names this manifest fetches from outside the project — a
+   * registry or a git remote — rather than from a directory of its own.
+   *
+   * A dependency with no `path` is a different crate from a project crate that
+   * happens to carry the same name, and cargo compiles against the fetched one.
+   * `log = "0.4"` beside a workspace member also called `log` drew an edge into
+   * that member: verified on cargo 1.98.0 with a `compile_error!` in the local
+   * crate, which builds clean because rustc never reads it.
+   */
+  externalDeps?: string[];
 }
 
 /** A parsed `Cargo.toml` as this reader consumes it. */
@@ -1226,11 +1237,92 @@ function asTable(value: TomlValue | undefined): CargoTable | null {
   return isTable(value) ? value : null;
 }
 
-/** A declared target's `path`, when the entry carries one. */
+/**
+ * A declared target's `path`, when the entry carries one, in the spelling the
+ * file set uses.
+ *
+ * Cargo accepts `path = "./src/api.rs"` and `path = "src/./api.rs"`; the file
+ * set holds neither, so the raw string never matched and the declaration was
+ * silently dropped. What followed was worse than losing the target: a `[lib]`
+ * declared that way erased the crate's name and roots entirely, so every
+ * sibling depending on it lost its edges, and a `[[bin]]` fell through to
+ * convention and rooted the file one directory too deep — `mod part;` in
+ * `src/tools/tool.rs` reached `src/tools/tool/part.rs` instead of
+ * `src/tools/part.rs`. Verified with cargo 1.98.0: `cargo metadata` reports
+ * the target at the normalized path and `cargo build` compiles against the
+ * sibling, with a `compile_error!` in the deeper file proving it is never read.
+ *
+ * Backslashes are folded first: a manifest written on Windows may spell the
+ * separator that way, and the file set is forward-slashed throughout.
+ */
 function declaredTargetPath(entry: TomlValue | undefined): string | null {
   const table = asTable(entry);
   const declared = table?.path;
-  return typeof declared === "string" ? declared : null;
+  if (typeof declared !== "string") return null;
+  const normalized = toForwardSlash(path.posix.normalize(declared.replace(/\\/g, "/")));
+  // `normalize` turns "" into "." and leaves a trailing slash on a directory;
+  // neither names a file, and passing them on would match nothing anyway.
+  //
+  // Returning null hands the target to convention rather than dropping it, and
+  // that is deliberate. Cargo 1.98.0 refuses such a manifest outright — "path
+  // `…/` for lib `x` is a directory, but a source file was expected" — so no
+  // build exists to mirror and the oracle names no right answer. Dropping the
+  // target is the more expensive of the two wrongs: it takes the crate's name
+  // and roots with it, and every edge its dependents draw.
+  return normalized === "." || normalized === "" ? null : normalized.replace(/\/+$/, "");
+}
+
+/**
+ * The **package names** a manifest sends to a local directory through
+ * `[patch.crates-io]` or the deprecated `[replace]`.
+ *
+ * Such a name reads as a registry dependency where it is declared, and cargo
+ * builds it from the path anyway. `[patch]` is keyed by source, `[replace]` by
+ * package spec (`"log:0.4.0"`), and only an entry carrying a `path` moves the
+ * crate inside the project.
+ *
+ * Package names, not the names the importing crate writes: `alias = { package =
+ * "itoa" }` is patched under `itoa` and imported as `alias`, so the caller has
+ * to translate before matching. And only the `crates-io` source: a
+ * `[patch.crates-io]` does not touch a dependency taken from a git remote,
+ * which cargo keeps fetching — verified on 1.98.0, where the dep-info names the
+ * checkout under `CARGO_HOME/git` and never the local directory.
+ *
+ * **The version is not compared**, and that is a known cost: cargo applies a
+ * patch only when the local crate's version satisfies the requirement, so
+ * `itoa = "1.0.18"` patched by a local `9.9.9` builds against the registry
+ * while this reads the patch as active. Matching it takes a semver
+ * implementation this module does not have, and the reading errs toward the
+ * project's own crate — the same direction the resolver took before any of this
+ * existed.
+ */
+function collectPatchedPaths(manifest: CargoTable | null): Set<string> {
+  const patched = new Set<string>();
+  if (!manifest) return patched;
+
+  const readEntries = (tableValue: TomlValue | undefined): void => {
+    const table = asTable(tableValue);
+    if (!table) return;
+    for (const [key, value] of Object.entries(table)) {
+      if (!isTable(value) || typeof value.path !== "string") continue;
+      // A `[replace]` key carries the version after a colon; a `[patch]` one
+      // does not, and splitting is harmless there.
+      patched.add(key.split(":")[0].replace(/-/g, "_"));
+    }
+  };
+
+  const patchSection = asTable(manifest.patch);
+  if (patchSection) {
+    for (const [source, entries] of Object.entries(patchSection)) {
+      // `[patch."https://github.com/…"]` patches that remote, not the registry,
+      // and a dependency taken from anywhere else is untouched by it.
+      if (source !== "crates-io") continue;
+      readEntries(entries);
+    }
+  }
+  readEntries(manifest.replace);
+
+  return patched;
 }
 
 /**
@@ -1244,6 +1336,9 @@ function declaredTargetPath(entry: TomlValue | undefined): string | null {
 function extractCargoAliases(
   manifest: CargoTable | null,
   wsDeps: Map<string, string>,
+  wsLocalDeps?: Set<string>,
+  externalDeps?: Set<string>,
+  gitDeps?: Set<string>,
 ): Record<string, string> {
   if (!manifest) return {};
   const aliases: Record<string, string> = {};
@@ -1254,6 +1349,18 @@ function extractCargoAliases(
     for (const [depKey, depVal] of Object.entries(table)) {
       const alias = depKey.replace(/-/g, "_");
       if (isTable(depVal)) {
+        // A `path` is what makes a dependency the project's own; anything else
+        // — a version, a git remote — is fetched from outside, whatever the
+        // project happens to hold under the same name. A `workspace = true`
+        // entry inherits the answer from where the workspace declares it.
+        const local =
+          typeof depVal.path === "string" ||
+          (depVal.workspace === true && (wsLocalDeps?.has(alias) ?? false));
+        if (!local) externalDeps?.add(alias);
+        // A git dependency is fetched from its remote whatever
+        // `[patch.crates-io]` says, so it must not be handed back to a local
+        // crate by one.
+        if (typeof depVal.git === "string") gitDeps?.add(alias);
         if (typeof depVal.package === "string") {
           aliases[alias] = depVal.package.replace(/-/g, "_");
         } else if (depVal.workspace === true) {
@@ -1263,6 +1370,8 @@ function extractCargoAliases(
           aliases[alias] = alias;
         }
       } else if (typeof depVal === "string") {
+        // `dep = "1.0"` is a version and nothing else: always from a registry.
+        externalDeps?.add(alias);
         aliases[alias] = alias;
       }
     }
@@ -1339,14 +1448,22 @@ export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): Ru
   }
 
   // Collect all workspace tables to resolve `[workspace] exclude` and `[workspace.dependencies]`.
+  //
+  // The whole manifest travels beside the `[workspace]` table: `[patch]` is a
+  // top-level section of the workspace root, not part of that table, and the
+  // members inherit it.
   const workspaceManifests = parsedManifests
     .filter((m) => m.manifest?.workspace !== undefined && isTable(m.manifest.workspace))
-    .map((m) => ({ dir: m.dir, table: m.manifest?.workspace as CargoTable }));
+    .map((m) => ({
+      dir: m.dir,
+      table: m.manifest?.workspace as CargoTable,
+      root: m.manifest as CargoTable,
+    }));
 
   const findEnclosingWorkspace = (
     dir: string,
-  ): { dir: string; table: CargoTable } | null => {
-    let best: { dir: string; table: CargoTable } | null = null;
+  ): { dir: string; table: CargoTable; root: CargoTable } | null => {
+    let best: { dir: string; table: CargoTable; root: CargoTable } | null = null;
     for (const ws of workspaceManifests) {
       const isAncestor = ws.dir === "." || dir === ws.dir || dir.startsWith(`${ws.dir}/`);
       if (isAncestor && (best === null || ws.dir.length > best.dir.length)) {
@@ -1359,16 +1476,38 @@ export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): Ru
   const crates: RustCrate[] = [];
 
   for (const { dir, manifest } of parsedManifests) {
-    const under = (relative: string): string => (dir === "." ? relative : `${dir}/${relative}`);
+    // Normalized after joining, not before: a declared `path = "../bar/src/lib.rs"`
+    // is legal — cargo builds it — and joining it raw produces
+    // `crates/foo/../bar/src/lib.rs`, which the file set never holds, so the
+    // declaration was dropped and with it the crate's name and roots. The
+    // convention paths passed through here are already clean, so this only ever
+    // changes a declared one.
+    // An absolute path is legal too, and cargo builds it: there is nothing to
+    // join, and joining it would produce `crates/foo//Users/…`. Where it points
+    // inside the project it becomes the project-relative spelling the file set
+    // holds; where it points outside, nothing in the tree can match it and it
+    // falls through to null, which is the right answer for a file that is not
+    // part of the project.
+    const under = (relative: string): string => {
+      if (path.posix.isAbsolute(relative) || path.isAbsolute(relative)) {
+        const rel = path.relative(projectPath, relative);
+        return rel && !rel.startsWith("..") ? toForwardSlash(rel) : toForwardSlash(relative);
+      }
+      return toForwardSlash(path.posix.normalize(dir === "." ? relative : `${dir}/${relative}`));
+    };
 
     const enclosingWs = findEnclosingWorkspace(dir);
     const wsDeps = new Map<string, string>();
+    // Which of the workspace's own dependency entries carry a `path`, which is
+    // what a member's `dep = { workspace = true }` inherits along with the name.
+    const wsLocalDeps = new Set<string>();
 
     if (enclosingWs) {
       const wsDepsTable = asTable(enclosingWs.table.dependencies);
       if (wsDepsTable) {
         for (const [depKey, depVal] of Object.entries(wsDepsTable)) {
           const normKey = depKey.replace(/-/g, "_");
+          if (isTable(depVal) && typeof depVal.path === "string") wsLocalDeps.add(normKey);
           if (isTable(depVal) && typeof depVal.package === "string") {
             wsDeps.set(normKey, depVal.package.replace(/-/g, "_"));
           } else {
@@ -1377,6 +1516,18 @@ export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): Ru
         }
       }
     }
+
+    // `[patch]` sends a name that reads as a registry dependency to a directory
+    // instead, and it is how a workspace makes its members depend on each other
+    // by version. tokio does exactly this for all five of its crates: read as
+    // registry names, 473 real edges went with them.
+    //
+    // Only the workspace root's, or the manifest's own when it belongs to no
+    // workspace. Cargo says so out loud where a member writes one — "patch for
+    // the non root package will be ignored, specify patch at the workspace
+    // root" — and honouring it there drew an edge into a crate the build never
+    // touches.
+    const patchedLocally = collectPatchedPaths(enclosingWs ? enclosingWs.root : manifest);
 
     const pkg = asTable(manifest?.package);
     const lib = asTable(manifest?.lib);
@@ -1533,10 +1684,22 @@ export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): Ru
       }
     }
 
-    const aliases = extractCargoAliases(manifest, wsDeps);
+    const externalDeps = new Set<string>();
+    const gitDeps = new Set<string>();
+    const aliases = extractCargoAliases(manifest, wsDeps, wsLocalDeps, externalDeps, gitDeps);
+    // The patch table names packages, the dependency table names whatever this
+    // crate imports them as: `alias = { package = "itoa" }` is patched under
+    // `itoa` and written as `alias`, so the translation has to happen here.
+    for (const alias of [...externalDeps]) {
+      if (gitDeps.has(alias)) continue;
+      if (patchedLocally.has(aliases[alias] ?? alias)) externalDeps.delete(alias);
+    }
     const crateEntry: RustCrate = { dir, name, libRoot, roots: [...roots].sort(), edition };
     if (Object.keys(aliases).length > 0) {
       crateEntry.aliases = aliases;
+    }
+    if (externalDeps.size > 0) {
+      crateEntry.externalDeps = [...externalDeps].sort();
     }
 
     crates.push(crateEntry);
@@ -1728,6 +1891,13 @@ export function resolveRustImport(
   // importing file — two manifests can carry the same package name, and a
   // workspace member's own name must not resolve into an unrelated checkout.
   const crateNamed = (name: string): RustCrate | null => {
+    // A name the manifest fetches from a registry or a git remote is that
+    // crate, not a project crate of the same name: cargo compiles against what
+    // it fetched, and the local one is never in scope. `log = "0.4"` beside a
+    // workspace member also called `log` drew an edge into the member —
+    // verified on cargo 1.98.0, where a `compile_error!` in it does not stop
+    // the build because rustc never reads the file.
+    if (importingCrate?.externalDeps?.includes(name)) return null;
     // `dep = { package = "real-name" }` renames a dependency for the crate
     // that declares it, and the code then writes the alias. The alias appears
     // in no `[package] name`, so without this the path resolved to nothing —
@@ -1773,16 +1943,31 @@ export function resolveRustImport(
     return fileSet.has(declared) ? declared : null;
   })();
 
-  // In edition 2015 an unanchored path is absolute from the crate root, so it
-  // names a module of the crate rather than one in this file's scope — and no
-  // declaration in this file is required, or expected.
-  const rootRelative = importingCrate?.edition === "2015" && own !== null;
+  // In edition 2015 an unanchored path is absolute from the crate root rather
+  // than relative to this file's scope.
+  //
+  // **That reading is deliberately not acted on for resolution.** Acting on it
+  // means answering a path with no declaration behind it, and every attempt to
+  // bound that produced a fresh way to draw an edge rustc rejects: a bare
+  // `use b;` between two integration-test crates, an undeclared sibling file, a
+  // `mod` declared in a nested block, a virtual workspace's root crate claiming
+  // its members' declarations. Each was found by a reviewer running cargo,
+  // after the previous one was closed.
+  //
+  // So the gate stays on for every edition: resolve what a declaration proves,
+  // and leave the rest unresolved. The cost is one real edge — `use foo::AtRoot;`
+  // in `src/deep/mod.rs` with `mod foo;` in `lib.rs` compiles and draws nothing
+  // — which `main` never drew either, so nothing published regresses. Fewer
+  // edges, none of them wrong, and the remainder is documentation rather than
+  // another round.
+  const edition2015 = importingCrate?.edition === "2015" && own !== null;
 
-  // And so the leading `::` marks an external crate only where the extern
-  // prelude exists. In 2015 it is the same crate root an unanchored path counts
-  // from, and letting the marker through sent the path looking for a workspace
-  // crate of that name — or, finding none, to nothing at all.
-  const global = globalMarker && !rootRelative;
+  // The edition still decides the leading `::`, which is a separate question:
+  // the marker names an external crate only where the extern prelude exists. In
+  // 2015 it is the same crate root an unanchored path counts from, and letting
+  // it through sent the path looking for a workspace crate of that name — or,
+  // finding none, to nothing at all.
+  const global = globalMarker && !edition2015;
 
   const target = ((): string | null => {
     // A bare specifier is a `mod foo;` declaration (see extractImports), which
@@ -1812,12 +1997,9 @@ export function resolveRustImport(
       // of them wrote the specifier, which is why the caller now says so — and
       // a caller that says nothing keeps the older reading, where a bare head
       // is tried from the file's own directory whatever the edition.
-      const local =
-        rootRelative && isDeclaration === false
-          ? resolveRustModulePath(own.moduleDir, [head], null, fileSet)
-          : declaredHere
-            ? (declaredFile ?? resolveRustModulePath(ownModuleDir, [head], null, fileSet))
-            : null;
+      const local = declaredHere
+        ? (declaredFile ?? resolveRustModulePath(ownModuleDir, [head], null, fileSet))
+        : null;
       if (local) return local;
       // A name this file declares as a module is not a crate, whatever the
       // manifest carries: rustc reads the module. Falling through drew an edge
@@ -1913,11 +2095,10 @@ export function resolveRustImport(
       if (below) return below;
     }
 
-    const unanchoredFrom = rootRelative ? own.moduleDir : ownModuleDir;
     const local =
-      global || (!rootRelative && !declaredHere)
+      global || !declaredHere
         ? null
-        : resolveRustModulePath(unanchoredFrom, segments, null, fileSet);
+        : resolveRustModulePath(ownModuleDir, segments, null, fileSet);
     if (local) return local;
 
     // A name this file declares as a module is not a crate; see the same guard

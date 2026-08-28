@@ -2049,7 +2049,7 @@ describe("graph-resolution", () => {
         .toBe("src/area/block/moved.rs");
     });
 
-    it("reads an unanchored path from the crate root in edition 2015", () => {
+    it("leaves an unanchored 2015 path unresolved, a declared limit", () => {
       const crates = rustProject({
         "Cargo.toml": '[package]\nname = "app"\n',
         "src/lib.rs": "",
@@ -2057,10 +2057,15 @@ describe("graph-resolution", () => {
         "src/client.rs": "",
       });
 
-      // `use registry::write;` in `src/client.rs` compiles in 2015 and names
-      // `src/registry.rs`; rustc rejects the same line from 2018 on.
-      expect(resolveRustImport("registry::write", "src/client.rs", fileSet, crates))
-        .toBe("src/registry.rs");
+      // `use registry::write;` in `src/client.rs` does compile in 2015 when
+      // `mod registry;` is written in `lib.rs`, and names `src/registry.rs`.
+      // The edge is left undrawn on purpose: acting on the root-relative
+      // reading means answering a path with no declaration behind it, and every
+      // attempt to bound that drew an edge rustc rejects — a bare `use b;`
+      // between two integration-test crates, an undeclared sibling file, a
+      // `mod` declared in a nested block, a virtual workspace's root crate
+      // claiming its members' declarations. `main` drew nothing here either.
+      expect(resolveRustImport("registry::write", "src/client.rs", fileSet, crates)).toBeNull();
     });
 
     it("reads an unanchored path from the module itself from edition 2018 on", () => {
@@ -2254,7 +2259,7 @@ describe("graph-resolution", () => {
       ).toBe("crates/config/src/lib.rs");
     });
 
-    it("keeps an edition 2015 unanchored path out of the declaration gate", () => {
+    it("holds the declaration gate on in edition 2015 too", () => {
       const crates = rustProject({
         // No edition key: Cargo reads 2015, and there the path below is
         // absolute from the crate root.
@@ -2264,22 +2269,20 @@ describe("graph-resolution", () => {
         "src/client.rs": "",
       });
 
-      // `mod registry;` is written in lib.rs; client.rs declares nothing at
-      // all, and `use registry::write;` compiles there on cargo 1.70.0 and
-      // 1.98.0. The gate is a 2018 rule: applied here it would drop the edge
-      // on every crate whose manifest omits the edition key.
+      // The gate is a 2018 rule that this resolver applies to every edition,
+      // and the reason is the tail behind the alternative: answering a
+      // root-relative path means resolving one no declaration proves, and each
+      // bound put on that turned out to draw an edge rustc rejects. Both
+      // spellings stay unresolved — the multi-segment path and the bare head
+      // that arrives in the shape a declaration does.
       expect(
         resolveRustImport("registry::write", "src/client.rs", fileSet, crates, new Map()),
-      ).toBe("src/registry.rs");
-      // And a bare head in the same position, which arrives in the shape a
-      // declaration does.
+      ).toBeNull();
       // `false` says this is a `use` and not a `mod` declaration: the two
-      // arrive as the same string, and in 2015 they count from different
-      // places — `use foo::Nested;` beside `mod foo;` is E0432 on 1.70.0 and
-      // 1.98.0, while `use foo::AtRoot;` reaches the root's module.
+      // arrive as the same string.
       expect(
         resolveRustImport("registry", "src/client.rs", fileSet, crates, new Map(), false),
-      ).toBe("src/registry.rs");
+      ).toBeNull();
       // And the declaration in the same position still counts from the file.
       expect(
         resolveRustImport("registry", "src/deep.rs", fileSet, crates, new Map(), true),

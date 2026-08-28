@@ -506,6 +506,13 @@ export async function getGraphStatus(projectPath: string): Promise<{
 // ── Register dynamic language grammars ───────────────────────────────────
 
 let dynamicLangsRegistered = false;
+/**
+ * The declaration map a path written inside an inline `mod { … }` block is
+ * answered with: empty, because the file's own declarations are not in that
+ * block's scope. Shared and never written.
+ */
+const EMPTY_DECLARED_MODS: Map<string, string> = new Map();
+
 const loadedDynamicLanguages = new Set<string>();
 const failedDynamicLanguages = new Map<string, string>();
 
@@ -1029,6 +1036,8 @@ export async function buildCodeGraph(
     // finds nothing, and falls through to a library called `foo` if the
     // workspace has one — an edge into an unrelated crate. Where the
     // declaration does not move anything, the value is the name itself.
+    // Shared and never written: one empty map for every inline-block path in
+    // the build, instead of one per import.
     const declaredMods = new Map<string, string>();
     for (const imp of importInfos) {
       if (imp.declaredName) declaredMods.set(imp.declaredName, imp.moduleSpecifier);
@@ -1040,7 +1049,15 @@ export async function buildCodeGraph(
       // Try to resolve to a project file
       // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
       const resolutionLanguage = imp.isCssImport ? "css" : language;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, declaredMods, imp.isModuleDeclaration === true);
+      // A bare path written inside an inline `mod { … }` block is answered
+      // without the file's declarations: they are not in that block's scope,
+      // and handing them over drew an edge rustc rejects with E0432. The map is
+      // emptied rather than omitted — omitting it turns the gate off entirely,
+      // which is the looser reading, not a stricter one. Edition 2015 is
+      // unaffected: there the path is absolute from the crate root and never
+      // consulted the map to begin with.
+      const scopedMods = imp.fromInlineBlock ? EMPTY_DECLARED_MODS : declaredMods;
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, scopedMods, imp.isModuleDeclaration === true);
       if (resolved) {
         node.dependencies.push(resolved);
 

@@ -28,6 +28,18 @@ export interface ImportInfo {
    * `foo` an unanchored `use foo::Item;` in that file may reach.
    */
   declaredName?: string;
+  /**
+   * True when the path was written inside an inline `mod { … }` block and its
+   * head is not a module that block declares. Such a head cannot reach a module
+   * the *file* declares: rustc asks for an anchor first. Checked on cargo
+   * 1.98.0 — `pub mod corelib;` at file level with `use corelib::marker;`
+   * inside `pub mod block { … }` is E0432, "a similar path exists: use
+   * crate::corelib::marker" (`super::` where the block sits deeper).
+   *
+   * It is the mirror of the case already handled the other way round, where a
+   * declaration written inside a block does not count at file level.
+   */
+  fromInlineBlock?: boolean;
 }
 
 /**
@@ -328,8 +340,9 @@ function rustInlineModules(node: SgNodeLike): InlinePosition {
       innermost ??= current;
       // An inline `mod` may carry a `#[path]` of its own, and then it is that
       // path — not the module's name — that names the directory its children
-      // live in.
-      const declared = rustPathAttribute(current);
+      // live in. Where several are named, only one directory can be walked
+      // from: the nearest is taken, the reading a single `#[path]` already got.
+      const declared = rustPathAttributes(current).paths[0] ?? null;
       const name = current.field("name")?.text();
       if (declared) chain.unshift(declared.replace(/\/+$/, ""));
       else if (name) chain.unshift(stripRawIdent(name));
@@ -339,21 +352,112 @@ function rustInlineModules(node: SgNodeLike): InlinePosition {
 
   // What the innermost block declares by hand: a path whose head names one of
   // these is a path into the block, not out to another crate.
+  //
+  // Direct children only. `findAll` walks the whole subtree, so a module
+  // declared two blocks down counted as this block's own: with
+  // `mod nested { pub mod corelib { … } }` inside `outer`, a `use
+  // corelib::marker;` written in `outer` was rebased into the block and drew an
+  // edge to a file rustc never reaches — `error[E0432]: unresolved import
+  // corelib` on rustc 1.98.0, edition 2021. A name declared in a nested block
+  // is in that block's scope, not in this one's, which is the same rule that
+  // keeps a block's declaration out of the file's scope.
   const declares = new Set<string>();
+  let importsEverything = false;
   const body = innermost?.field("body");
   if (body) {
-    for (const child of body.findAll({ rule: { kind: "mod_item" } })) {
-      const name = child.field("name")?.text();
-      if (name) declares.add(stripRawIdent(name));
+    for (const child of body.children()) {
+      if (child.kind() === "mod_item") {
+        const name = child.field("name")?.text();
+        if (name) declares.add(stripRawIdent(name));
+        continue;
+      }
+      // A glob rooted inside the crate puts names in the block that nothing
+      // here can enumerate: `use super::*;` brings in every module the file
+      // declares, and then a bare head inside the block does reach one —
+      // verified on rustc 1.98.0, edition 2021, where the same line is E0432
+      // with the glob removed. Where one appears, the block's scope is not
+      // knowable from the block alone, so nothing is asserted about it.
+      //
+      // The whole path has to be read, not just the trailing `*`. A glob over a
+      // dependency (`use std::collections::*;`) brings in nothing of this
+      // crate, and one over a submodule (`use crate::prelude::*;`) brings in
+      // only what that module re-exports — neither puts the file's own modules
+      // in the block, and treating them as if they did switched the guard off
+      // for any block that happened to contain one. Only the anchor itself
+      // does: `use super::*;` at the first level is the file's own scope, in
+      // whichever of its spellings it is written.
+      if (child.kind() === "use_declaration") {
+        const text = stripRustComments(child.text()).replace(/\s+/g, "");
+        const tree = text.replace(/^(?:pub(?:\([^)]*\))?)?use/, "").replace(/;$/, "");
+        if (namesAnchorGlob(tree, chain.length)) importsEverything = true;
+      }
     }
   }
-  return { chain, declares };
+  return { chain, declares, importsEverything };
+}
+
+/**
+ * True when a `use` tree names the glob that reaches out of `depth` inline
+ * blocks and into the file's own scope: `super::*` from one level down,
+ * `super::super::*` from two, and so on. Any spelling, flat or braced.
+ *
+ * The anchor is what puts the file's own modules into a block's scope, so
+ * finding it is what switches the scope guard off. Reading only the flat
+ * spelling missed the braced ones: `use {super::*};` is a group with no prefix
+ * carrying the anchor inside, `use super::{*};` is the same import written the
+ * other way round, and both compile where the bare head that follows is E0432
+ * without them — checked on cargo 1.98.0, edition 2021, with
+ * `use corelib::sub::Marker;` inside `pub mod block { … }`. The cost of missing
+ * one is a real edge left undrawn.
+ *
+ * **The count matters, and the other anchors are not anchors here.** `self::*`
+ * is the block's own scope, `crate::*` is the crate root, and `super::*` from
+ * two levels down only reaches the block in between. None of them puts the
+ * file's declarations in scope: `use crate::{*};` beside `use sibling::Marker;`
+ * inside `mod inner` in a non-root file is E0432 on cargo 1.98.0, "a similar
+ * path exists: super::sibling::Marker", and reading it as an anchor drew that
+ * rejected import as an edge.
+ *
+ * A group is walked rather than matched: the anchor may sit at any depth
+ * (`use {super::{*}};`), and rebuilding each leaf against its prefix is what
+ * the recursion does.
+ */
+function namesAnchorGlob(tree: string, depth: number): boolean {
+  const trimmed = tree.trim();
+  if (!trimmed) return false;
+
+  const open = trimmed.indexOf("{");
+  if (open === -1) {
+    const flat = trimmed.replace(/\s+/g, "");
+    if (!flat.endsWith("::*")) return false;
+    const segments = flat.slice(0, -3).split("::");
+    return segments.length === depth && segments.every((segment) => segment === "super");
+  }
+
+  const close = trimmed.lastIndexOf("}");
+  if (close < open) return false;
+
+  // A leading `::` marks a crate outside this one, whose glob brings in nothing
+  // the file declares. Only a prefix that is itself an anchor can lead to one.
+  const prefix = trimmed.slice(0, open).replace(/::\s*$/, "").trim();
+  if (prefix.startsWith("::")) return false;
+  for (const part of splitRustUseList(trimmed.slice(open + 1, close))) {
+    if (namesAnchorGlob(prefix ? `${prefix}::${part.trim()}` : part, depth)) return true;
+  }
+  return false;
 }
 
 /** Where a declaration sits inside inline `mod` blocks, and what they declare. */
 interface InlinePosition {
   chain: string[];
   declares: Set<string>;
+  /**
+   * True when the innermost block carries a glob `use`, which puts names in its
+   * scope that cannot be enumerated from the block. A bare head inside such a
+   * block may legitimately reach a module the file declares, so nothing is
+   * asserted about its scope.
+   */
+  importsEverything?: boolean;
 }
 
 /** The subset of the ast-grep node API this module reads. */
@@ -364,6 +468,8 @@ interface SgNodeLike {
   prev(): SgNodeLike | null;
   field(name: string): SgNodeLike | null;
   findAll(matcher: { rule: { kind: string } }): SgNodeLike[];
+  children(): SgNodeLike[];
+  range(): { start: { index: number }; end: { index: number } };
 }
 
 /**
@@ -419,27 +525,118 @@ function rustPathFromInline(path: string, inline: InlinePosition): string | null
 }
 
 /**
- * The file a `#[path = "…"]` attribute points at, relative to the directory
- * the declaring file sits in — never to the directory that file's submodules
- * live in. Both `src/a/b.rs` and `src/a/mod.rs` resolve `#[path = "moved.rs"]`
- * to `src/a/moved.rs`.
+ * The values of the `path = "…"` arguments an attribute writes at its own
+ * level, ignoring anything that only *looks* like one from inside a string.
+ *
+ * Scanning the raw text was enough until a doc string named a path:
+ * `#[cfg_attr(docsrs, doc = r#"override with path = "custom.rs""#)] mod plain;`
+ * compiles by convention against `src/plain.rs` on cargo 1.98.0, and reading
+ * the doc's words as a relocation lost that edge without a trace. Strings are
+ * skipped whole — plain, escaped and raw with any number of hashes — and only
+ * what is left is read.
+ */
+function pathValuesOutsideStrings(text: string): string[] {
+  const values: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+
+    // A raw string opens with `r`, any number of `#`, and a quote; it ends at
+    // the quote followed by the same number of hashes, and nothing inside it
+    // escapes.
+    if (ch === "r") {
+      const raw = /^r(#*)"/.exec(text.slice(i));
+      if (raw) {
+        const closer = `"${raw[1]}`;
+        const end = text.indexOf(closer, i + raw[0].length);
+        i = end === -1 ? text.length : end + closer.length;
+        continue;
+      }
+    }
+
+    if (ch === '"') {
+      // Read the string, and keep it when it is the value of a `path` written
+      // outside any other string — which is what the walk has established by
+      // arriving here.
+      let j = i + 1;
+      let value = "";
+      while (j < text.length && text[j] !== '"') {
+        if (text[j] === "\\") {
+          value += text[j + 1] ?? "";
+          j += 2;
+          continue;
+        }
+        value += text[j];
+        j += 1;
+      }
+      if (/\bpath\s*=\s*$/.test(text.slice(0, i))) values.push(value);
+      i = j + 1;
+      continue;
+    }
+
+    i += 1;
+  }
+  return values;
+}
+
+/**
+ * Every file the `#[path = "…"]` attributes above a `mod` point at, relative to
+ * the directory the declaring file sits in — never to the directory that file's
+ * submodules live in. Both `src/a/b.rs` and `src/a/mod.rs` resolve
+ * `#[path = "moved.rs"]` to `src/a/moved.rs`.
  *
  * Attributes are siblings preceding the `mod` in the tree, and several may
  * stack (`#[cfg(test)]` above `#[path = …]`), so the walk goes back through
- * all of them.
+ * all of them. Nearest first, which is the order a single declaration is read
+ * in when only one path is named.
+ *
+ * **A `#[cfg_attr(…, path = "…")]` names one too**, and reading only the bare
+ * form did real damage in both directions at once. It is the Rust Reference's
+ * own example and the standard platform-abstraction idiom — 12 occurrences in 8
+ * crates of a 141-crate registry sample, among them `libc`, `rustix`, `serde`
+ * and `tempfile`. On `errno` the module `sys` is relocated to `unix.rs` or
+ * `windows.rs` and `src/sys.rs` is never read; unread, the graph drew an edge
+ * to a file rustc ignores and missed the one holding the whole crate body.
+ * Reproduced on cargo 1.98.0 with a `compile_error!` in `src/sys.rs`: the
+ * package builds, and the dep-info lists `src/unix.rs` and no `src/sys.rs`.
+ *
+ * Every named path is returned, and each draws its own edge. That is the
+ * reading the rest of the model already takes: the graph is independent of
+ * which features and target are selected, so a module that is `unix.rs` here
+ * and `windows.rs` there depends on both as far as the tree is concerned.
+ *
+ * `conditional` says whether every path found came from a `cfg_attr`. When it
+ * did, **the convention is still one of the answers**: with the condition
+ * false the attribute is not applied at all and the module is the file its name
+ * implies. `#[cfg_attr(any(), path = "ghost.rs")] mod platform;` compiles
+ * against `src/platform.rs` on cargo 1.98.0, and reading only the named path
+ * lost that edge while drawing one into a file rustc never opens.
  */
-function rustPathAttribute(node: SgNodeLike): string | null {
+function rustPathAttributes(node: SgNodeLike): { paths: string[]; conditional: boolean } {
+  const paths: string[] = [];
+  let conditional = true;
   let previous = node.prev();
   // Comments count as siblings too, and one written between the attribute and
   // the `mod` it belongs to would otherwise end the walk before the attribute
   // is seen — a comment above a relocated module is exactly where someone
   // explains why it was relocated.
   while (previous && (previous.kind() === "attribute_item" || previous.kind().includes("comment"))) {
-    const match = previous.text().match(/^#\[\s*path\s*=\s*"([^"]+)"\s*\]$/);
-    if (match) return match[1];
+    const text = previous.text();
+    const bare = text.match(/^#\[\s*path\s*=\s*"([^"]+)"\s*\]$/);
+    if (bare) {
+      paths.push(bare[1]);
+      // A bare `#[path]` always applies, so the convention never comes back.
+      conditional = false;
+    } else if (/^#\[\s*cfg_attr\s*\(/.test(text)) {
+      // The condition is not read: what it selects depends on the target and
+      // the features, neither of which this graph fixes. Only `path` is picked
+      // out of the attributes the `cfg_attr` would apply — a `#[cfg_attr(unix,
+      // doc = "…")]` names none and contributes nothing.
+      paths.push(...pathValuesOutsideStrings(text));
+    }
     previous = previous.prev();
   }
-  return null;
+  return { paths, conditional: paths.length > 0 && conditional };
 }
 
 /**
@@ -467,11 +664,23 @@ export function expandRustUseTree(tree: string): string[] {
   const close = trimmed.lastIndexOf("}");
   if (close < open) return [];
 
-  const prefix = trimmed.slice(0, open).replace(/::\s*$/, "").trim();
+  // A group written `::{a::b, c::d}` carries the external marker in its prefix
+  // and nowhere else: stripping the trailing `::` leaves the empty string, and
+  // an empty prefix is indistinguishable from a group with no prefix at all
+  // (`use {a, b};`). Read that way, `use ::{log::info};` reached the local
+  // module `log` again — the very capture the leading `::` exists to prevent,
+  // and the same bug the single-path spelling had. `::corelib::{marker}` was
+  // never affected, because there the marker survives inside a non-empty
+  // prefix. Checked on rustc 1.98.0: in edition 2018 the braced global form
+  // resolves to the dependency and `use log::info;` beside `pub mod log;`
+  // is E0432, so the two spellings must not resolve to the same file.
+  const rawPrefix = trimmed.slice(0, open).trim();
+  const global = rawPrefix === "::";
+  const prefix = rawPrefix.replace(/::\s*$/, "").trim();
   const paths: string[] = [];
   for (const part of splitRustUseList(trimmed.slice(open + 1, close))) {
     for (const expanded of expandRustUseTree(part)) {
-      paths.push(prefix ? `${prefix}::${expanded}` : expanded);
+      paths.push(prefix ? `${prefix}::${expanded}` : global ? `::${expanded}` : expanded);
     }
     // `self` and `*` expand to nothing, so the group's own prefix is what the
     // leaf named: `use crate::a::{self, b}` imports `crate::a` as well as
@@ -484,10 +693,172 @@ export function expandRustUseTree(tree: string): string[] {
 }
 
 /**
+ * The Rust source with the head and the braces of every `name! { … }` erased,
+ * so what the invocation wraps is read as the items it is.
+ *
+ * tree-sitter keeps a macro's body as an unparsed token tree, so nothing inside
+ * one is a node and `findAll` walks straight past it. Expansion happens before
+ * name resolution, though, and a `mod x;` written in there is a declaration like
+ * any other: **256 of tokio's 535 `mod` declarations (48%) were invisible**, and
+ * 566 of 3,286 across a 141-crate registry sample, plus 348 `use` in tokio
+ * alone. 59 of the 287 files rustc reads for tokio's lib had no incoming edge,
+ * every one of them declared inside a macro body.
+ *
+ *     cfg_io_util! {          // tokio/src/io/util/mod.rs
+ *         mod async_buf_read_ext;
+ *         …36 declarations the graph did not see
+ *     }
+ *
+ * The rewrite keeps every other character where it was, so what the body sits
+ * inside is unchanged: a macro invoked inside `mod inner { … }` leaves its
+ * declarations inside that block, and the inline-block machinery reads them
+ * from there without knowing a macro was ever involved. **A macro body is not a
+ * module level** — it opens no scope of its own — and blanking the braces
+ * rather than the whole invocation is what says so.
+ *
+ * Only `{}` is unwrapped. A `()` or `[]` invocation carries an expression, not
+ * items, and unwrapping it would feed the parser a fragment that is not one.
+ *
+ * **The limit that stays**: what a macro does with the tokens it is handed is
+ * unknowable from the source. One that expands them declares the modules it
+ * names; one that discards them declares nothing, and both are written the same
+ * way. Reading the body is the answer that is right for the shapes that occur —
+ * `cfg_if!` and the `cfg_*!` family, which is what the 295 invocations carrying
+ * a `mod` in a 245-crate sample are made of — and wrong for a macro that throws
+ * its argument away. Restricting to item positions closes the case that
+ * actually occurs, `quote!`; a discarding macro in item position is left as a
+ * known cost.
+ *
+ * And only where an item may stand. A macro body holds items when the
+ * invocation itself is an item — that is the whole of the rule, and reading it
+ * off the tree keeps the graph from having to know any library by name. Without
+ * it, a proc-macro crate writing
+ *
+ *     quote! {
+ *         mod generated;
+ *     }
+ *     .into()
+ *
+ * had `src/generated.rs` drawn as its dependency, though that module belongs to
+ * whoever invokes the macro and rustc never reads the file here: verified on
+ * cargo 1.98.0 with a `compile_error!` in it, where the crate builds clean and
+ * the dep-info lists `src/lib.rs` alone.
+ *
+ * Returns null when there was nothing to unwrap, which is the common case.
+ */
+function rustSourceWithMacroBodiesInlined(source: string, root: SgNodeLike): string | null {
+  const chars = source.split("");
+  const blank = (at: number): void => {
+    // Newlines stay: a line comment must keep ending where it ended, or what
+    // follows it on the next line is swallowed.
+    if (chars[at] !== "\n" && chars[at] !== "\r") chars[at] = " ";
+  };
+
+  let changed = false;
+  for (const node of root.findAll({ rule: { kind: "macro_invocation" } })) {
+    if (!standsWhereAnItemMay(node)) continue;
+    const text = node.text();
+    const open = text.indexOf("{");
+    if (open === -1) continue;
+    // The last brace has to close the invocation itself. Where it does not, the
+    // delimiter is `(` or `[` and the `{` found above is inside the arguments.
+    const trimmed = text.trimEnd();
+    if (!trimmed.endsWith("}")) continue;
+    const close = text.lastIndexOf("}");
+    if (close <= open) continue;
+
+    const start = node.range().start.index;
+    for (let i = 0; i <= open; i++) blank(start + i);
+    blank(start + close);
+    changed = true;
+  }
+  return changed ? chars.join("") : null;
+}
+
+/**
+ * Whether a node sits where a Rust *item* is written: the file itself, or the
+ * body of a `mod`, `impl` or `trait`.
+ *
+ * A macro invocation anywhere else is an expression, and what it wraps is a
+ * value being built rather than items being declared. That is what keeps a
+ * proc-macro's `quote!` from being read as this crate's own declarations: the
+ * module it names belongs to whoever invokes the macro, and rustc never opens
+ * the file here — verified on cargo 1.98.0 with a `compile_error!` in it, where
+ * the crate builds clean and its dep-info lists `src/lib.rs` alone.
+ *
+ * **A block is not on the list**, though an item may legally be written in one.
+ * The tail expression of a block — a `quote! { … }` returned without a
+ * semicolon, the idiom of every `fn … -> TokenStream` — has `block` for its
+ * parent too, and nothing in the tree tells the two apart. Measured across
+ * ripgrep, tokio and clap, admitting blocks adds not one edge, so the whole of
+ * what it buys is that false one.
+ *
+ * An `impl` body does count, even though no `mod` may be written in one:
+ * tokio's `cfg_unstable! { fn … { use crate::runtime::UnhandledPanic; } }` is
+ * written there, and the `use` inside the function it wraps is a real
+ * dependency.
+ */
+function standsWhereAnItemMay(node: SgNodeLike): boolean {
+  const kind = node.parent()?.kind();
+  return kind === "source_file" || kind === "declaration_list";
+}
+
+/** A key that tells two extracted imports apart, for the multiset below. */
+function importKey(imp: ImportInfo): string {
+  return [
+    imp.moduleSpecifier,
+    imp.isDynamic,
+    imp.isCssImport ?? "",
+    imp.isModuleDeclaration ?? "",
+    imp.declaredName ?? "",
+    imp.fromInlineBlock ?? "",
+  ].join(" ");
+}
+
+/**
+ * The imports of `found` that `already` does not hold, counting repeats.
+ *
+ * The second pass over a macro-unwrapped source re-reads the whole file, so
+ * everything the first pass found comes back with it. Subtracting as a multiset
+ * adds exactly what the macro bodies were hiding and leaves the existing edges —
+ * including their repeats, which consumers count — untouched.
+ */
+function importsNotAlreadyFound(found: ImportInfo[], already: ImportInfo[]): ImportInfo[] {
+  const remaining = new Map<string, number>();
+  for (const imp of already) {
+    const key = importKey(imp);
+    remaining.set(key, (remaining.get(key) ?? 0) + 1);
+  }
+  const fresh: ImportInfo[] = [];
+  for (const imp of found) {
+    const key = importKey(imp);
+    const left = remaining.get(key) ?? 0;
+    if (left > 0) remaining.set(key, left - 1);
+    else fresh.push(imp);
+  }
+  return fresh;
+}
+
+/**
+ * How many times a Rust source is re-read after unwrapping macro bodies.
+ *
+ * One pass covers what is written in a file; a second catches a macro that only
+ * became visible when the one around it was unwrapped. The bound is what keeps
+ * a pathological file from being re-parsed without end — it is not a limit
+ * anything real has been seen to reach.
+ */
+const RUST_MACRO_UNWRAP_PASSES = 2;
+
+/**
  * Extract import statements from source code using ast-grep.
  * Returns raw module specifiers for each language's import syntax.
  */
-export function extractImports(source: string, lang: Lang | string, ext: string): ImportInfo[] {
+export function extractImports(
+  source: string,
+  lang: Lang | string,
+  ext: string,
+  unwrapPassesLeft: number = RUST_MACRO_UNWRAP_PASSES,
+): ImportInfo[] {
   const imports: ImportInfo[] = [];
   const langKey = String(lang);
 
@@ -650,7 +1021,25 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
           const inline = rustInlineModules(node as unknown as SgNodeLike);
           for (const spec of expandRustUseTree(match[1])) {
             const fromInline = rustPathFromInline(spec, inline);
-            if (fromInline) imports.push({ moduleSpecifier: fromInline, isDynamic: false });
+            if (!fromInline) continue;
+            // A bare head inside a block, left alone by the rebase above, is
+            // either another crate or nothing — never a module the file
+            // declares. Marking it here is what keeps the resolver from
+            // answering it with the file's own declarations.
+            const head = fromInline.replace(/^::/, "").split("::")[0];
+            const bareInsideBlock =
+              inline.chain.length > 0 &&
+              !inline.importsEverything &&
+              !fromInline.startsWith("::") &&
+              !fromInline.startsWith("self::") &&
+              !fromInline.startsWith("super::") &&
+              !fromInline.startsWith("crate::") &&
+              !inline.declares.has(head);
+            imports.push({
+              moduleSpecifier: fromInline,
+              isDynamic: false,
+              ...(bareInsideBlock ? { fromInlineBlock: true } : {}),
+            });
           }
         }
         // mod foo;  /  pub mod foo;  /  pub(crate) mod foo;  /  mod r#async;
@@ -675,7 +1064,7 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
           // inline block resolves it against that file's own module directory
           // plus a directory per inline level. The `self/` head marks the
           // second form for the resolver.
-          const declaredPath = rustPathAttribute(typed);
+          const { paths: declaredPaths, conditional } = rustPathAttributes(typed);
           const name = stripRawIdent(match[1]);
           // The name a declaration brings into scope, which is the module's
           // name and never its file's: `#[path = "custom.rs"] mod foo;` puts
@@ -685,18 +1074,31 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
           // `self::…` chain. Declared inside an inline block, the name belongs
           // to that block and not to the file, so nothing is reported.
           const declaredName = inline.chain.length === 0 ? name : undefined;
-          if (declaredPath) {
-            const spec =
-              inline.chain.length === 0
-                ? declaredPath
-                : `self/${inline.chain.join("/")}/${declaredPath}`;
-            imports.push({
-              moduleSpecifier: spec,
-              isDynamic: false,
-              isModuleDeclaration: true,
-              declaredName,
-            });
-            continue;
+          if (declaredPaths.length > 0) {
+            // The name the declaration brings into scope is carried by exactly
+            // one of the specifiers, because the map it feeds holds one file
+            // per name. An unconditional `#[path]` takes it — that file is the
+            // module, full stop. Where every path is conditional the convention
+            // takes it instead: the map also answers this file's own
+            // declaration, and pointing it at a conditional path made
+            // `mod platform;` resolve to `ghost.rs` and lose `platform.rs`.
+            const nameGoesToConvention = conditional;
+            for (const [index, declaredPath] of declaredPaths.entries()) {
+              const spec =
+                inline.chain.length === 0
+                  ? declaredPath
+                  : `self/${inline.chain.join("/")}/${declaredPath}`;
+              imports.push({
+                moduleSpecifier: spec,
+                isDynamic: false,
+                isModuleDeclaration: true,
+                declaredName: index === 0 && !nameGoesToConvention ? declaredName : undefined,
+              });
+            }
+            // Every path came from a `cfg_attr`, so the condition may be false
+            // and leave the module where its name puts it. That file is one of
+            // the answers too, and it falls through to the convention below.
+            if (!conditional) continue;
           }
           // Declared inside `mod outer { … }`, the file sits under `outer/`,
           // not beside the declaring file.
@@ -706,7 +1108,9 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
             moduleSpecifier: spec,
             isDynamic: false,
             isModuleDeclaration: true,
-            declaredName,
+            // Claimed above by an unconditional `#[path]`, which is the module
+            // whatever its name says; a conditional one leaves it here.
+            declaredName: declaredPaths.length > 0 && !conditional ? undefined : declaredName,
           });
         }
         // extern crate serde;  /  #[macro_use] extern crate log as logging;
@@ -719,6 +1123,21 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
           const name = node.field("name")?.text();
           if (name && name !== "self") {
             imports.push({ moduleSpecifier: stripRawIdent(name), isDynamic: false });
+          }
+        }
+
+        // What a macro invocation wraps is read last, on a source with its head
+        // and braces blanked out, and only what the pass above could not see is
+        // kept. See `rustSourceWithMacroBodiesInlined` for why a body has to be
+        // read at all, and why it is not a module level.
+        if (unwrapPassesLeft > 0) {
+          const inlined = rustSourceWithMacroBodiesInlined(
+            source,
+            sgNode as unknown as SgNodeLike,
+          );
+          if (inlined !== null) {
+            const withBodies = extractImports(inlined, lang, ext, unwrapPassesLeft - 1);
+            imports.push(...importsNotAlreadyFound(withBodies, imports));
           }
         }
         break;

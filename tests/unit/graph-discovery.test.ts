@@ -771,7 +771,647 @@ describe("buildCodeGraph — Rust edition 2015 declaration and use", () => {
     expect(edge("src/deep/mod.rs", "src/deep/foo.rs")).toBe(true);
   });
 
-  it("sends the use to the crate root's module of that name", () => {
-    expect(edge("src/deep/mod.rs", "src/foo.rs")).toBe(true);
+  it("leaves the use to the crate root's module unresolved, a declared limit", () => {
+    // In 2015 this path is absolute from the crate root and does compile, but
+    // nothing in the importing file declares it. Drawing it means resolving
+    // what no declaration proves, which is where every wrong edge in this
+    // resolver has come from; `main` draws nothing here either.
+    expect(edge("src/deep/mod.rs", "src/foo.rs")).toBe(false);
+  });
+});
+
+describe("buildCodeGraph — Rust edges rustc rejects", () => {
+  const roots: string[] = [];
+
+  afterAll(() => {
+    for (const r of roots) {
+      try { fs.rmSync(r, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  async function graphOf(layout: Record<string, string>): Promise<Awaited<ReturnType<typeof buildCodeGraph>>> {
+    ensureDynamicLanguages();
+    const dir = writeLayout(layout);
+    roots.push(dir);
+    return buildCodeGraph(dir);
+  }
+
+  it("draws no edge between two integration tests, which are separate crates", async () => {
+    // `cargo check --tests` on this exact layout is `error[E0432]: unresolved
+    // import 'b'`, with the edition key absent and with `edition = "2021"`
+    // alike: two files in `tests/` are separate crates and cannot import each
+    // other under any edition. The 2015 root-relative reading answers from the
+    // crate root without asking for a declaration, which is right for a module
+    // and wrong for another crate's root.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\n',
+      "src/lib.rs": "pub fn nothing() {}",
+      "tests/a.rs": "use b::helper;\n\n#[test]\nfn t() { helper(); }",
+      "tests/b.rs": "pub fn helper() {}",
+    });
+
+    expect(graph.edges.some((e) => e.source === "tests/a.rs" && e.target === "tests/b.rs")).toBe(false);
+  });
+
+  it("reads a declared target path written with a leading ./", async () => {
+    // `cargo metadata` reports the binary at `src/tools/tool.rs`, and `cargo
+    // build` compiles against `src/tools/part.rs` — a `compile_error!` in the
+    // deeper file proves the deeper one is never read. Left unnormalized, the
+    // manifest string matched nothing, the declaration was dropped, and
+    // convention rooted the file one directory too deep.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[[bin]]\nname = "tool"\npath = "./src/tools/tool.rs"\n',
+      "src/tools/tool.rs": "mod part;\n\nfn main() { part::x(); }",
+      "src/tools/part.rs": "pub fn x() {}",
+      "src/tools/tool/part.rs": 'compile_error!("wrong file");',
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/tools/tool.rs" && e.target === "src/tools/part.rs")).toBe(true);
+    expect(graph.edges.some((e) => e.target === "src/tools/tool/part.rs")).toBe(false);
+  });
+
+  it("draws no 2015 edge to a module the crate never declares", async () => {
+    // `use ghost::f;` with `src/ghost.rs` present but declared nowhere is
+    // `error[E0432]: unresolved import 'ghost'` on cargo 1.98.0. The
+    // root-relative reading of edition 2015 needs no declaration in the
+    // importing file, but it still needs one somewhere in the crate; matching a
+    // sibling file by name is a filesystem answer to a question about the
+    // module tree.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\n',
+      "src/lib.rs": "pub mod client;",
+      "src/client.rs": "use ghost::f;\n\npub fn u() { f(); }",
+      "src/ghost.rs": "pub fn f() {}",
+    });
+
+    expect(graph.edges.some((e) => e.target === "src/ghost.rs")).toBe(false);
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/client.rs")).toBe(true);
+  });
+
+  it("names the cost of the gate: one real 2015 edge left undrawn", async () => {
+    // `use foo::AtRoot;` in `src/deep/mod.rs` compiles with `mod foo;` written
+    // in `lib.rs` and nothing in the importing file — checked on cargo 1.98.0.
+    // The edge is real and stays undrawn, which is the price of resolving only
+    // what a declaration proves. It is a price and not a regression: `main`
+    // does not draw it either. Should this ever need closing, it takes the
+    // crate's declarations gathered from an AST, and every one of the wrong
+    // edges listed in `graph-resolution.ts` has to stay closed with it.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\n',
+      "src/lib.rs": "mod deep;\nmod foo;",
+      "src/foo.rs": "pub struct AtRoot;",
+      "src/deep/mod.rs": "use foo::AtRoot;\n\npub fn take() -> AtRoot { AtRoot }",
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/deep/mod.rs" && e.target === "src/foo.rs")).toBe(false);
+    // The declarations themselves still draw theirs.
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/foo.rs")).toBe(true);
+  });
+
+  it("names the cost of the gate: the root-relative path is lost through #[path] too", async () => {
+    // The same price, one step further from the simple case: in 2015 the head
+    // counts from the crate root whatever put the module there, so a `#[path]`
+    // relocation is as good a declaration as a plain `mod`. `use foo::AtRoot;`
+    // in `src/deep/mod.rs` compiles against `src/custom/thing.rs` — checked on
+    // cargo 1.98.0, where renaming the struct in that file is the one token
+    // that flips the build.
+    //
+    // Written only as the simple case, the test said the gate cost less than
+    // it does: whoever weighs closing it has to see every shape of the loss.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "path2015"\nversion = "0.1.0"\nedition = "2015"\n',
+      "src/lib.rs": '#[path = "custom/thing.rs"]\npub mod foo;\npub mod deep;\n',
+      "src/custom/thing.rs": "pub struct AtRoot;",
+      "src/deep/mod.rs": "use foo::AtRoot;\n\npub fn take() -> AtRoot { AtRoot }",
+    });
+
+    expect(
+      graph.edges.some((e) => e.source === "src/deep/mod.rs" && e.target === "src/custom/thing.rs"),
+    ).toBe(false);
+    // The relocation itself still draws its edge.
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/custom/thing.rs")).toBe(
+      true,
+    );
+  });
+
+  it("names the cost of the gate: it applies under a manifest-declared root", async () => {
+    // The crate root is wherever the manifest says, and in 2015 an unanchored
+    // head counts from there. `use helper::AtRoot;` in `src/tools/deep.rs`
+    // compiles against `src/tools/helper.rs`, declared in the `[[bin]]` root
+    // beside it — checked on cargo 1.98.0. The gate drops this one as well.
+    const graph = await graphOf({
+      "Cargo.toml": [
+        '[package]\nname = "bin2015"\nversion = "0.1.0"\nedition = "2015"\n',
+        '[[bin]]\nname = "tool"\npath = "src/tools/tool.rs"\n',
+      ].join("\n"),
+      "src/tools/tool.rs": "mod helper;\nmod deep;\n\nfn main() { let _ = deep::take(); }",
+      "src/tools/helper.rs": "pub struct AtRoot;",
+      "src/tools/deep.rs": "use helper::AtRoot;\n\npub fn take() -> AtRoot { AtRoot }",
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/tools/deep.rs" && e.target === "src/tools/helper.rs")).toBe(
+      false,
+    );
+    // The declared root still reaches both of its modules.
+    expect(graph.edges.some((e) => e.source === "src/tools/tool.rs" && e.target === "src/tools/helper.rs")).toBe(
+      true,
+    );
+  });
+
+  it("draws no edge for a single-segment 2015 use between integration tests", async () => {
+    // The single-segment spelling of the same rule: `use b;` in `tests/a.rs` is
+    // E0432, "no `b` in the root". Guarding only the multi-segment branch left
+    // this one drawing the edge.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\n',
+      "src/lib.rs": "pub fn n() {}",
+      "tests/a.rs": "use b;\n\n#[test]\nfn t() {}",
+      "tests/b.rs": "pub fn helper() {}",
+    });
+
+    expect(graph.edges.some((e) => e.source === "tests/a.rs" && e.target === "tests/b.rs")).toBe(false);
+  });
+
+  it("reads a declared target path that climbs out of the package directory", async () => {
+    // `[lib] path = "../bar/src/lib.rs"` is legal and cargo builds it. Joined
+    // without normalizing it read `crates/foo/../bar/src/lib.rs`, which the file
+    // set never holds, so the declaration was dropped — and with it the crate's
+    // name, its roots, and every edge its dependents draw into it.
+    const graph = await graphOf({
+      "Cargo.toml": '[workspace]\nmembers = ["crates/foo", "crates/bar"]\nresolver = "2"\n',
+      "crates/foo/Cargo.toml": '[package]\nname = "foo"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\npath = "../bar/src/lib.rs"\n',
+      "crates/foo/src/main.rs": "use foo::bar_fn;\n\nfn main() { bar_fn(); }",
+      "crates/bar/Cargo.toml": '[package]\nname = "bar"\nversion = "0.1.0"\nedition = "2021"\n',
+      "crates/bar/src/lib.rs": "pub fn bar_fn() {}",
+    });
+
+    expect(
+      graph.edges.some((e) => e.source === "crates/foo/src/main.rs" && e.target === "crates/bar/src/lib.rs"),
+    ).toBe(true);
+  });
+
+  it("reads a declared target path written as an absolute path", async () => {
+    // Cargo accepts an absolute `path` and builds it. Joined as if it were
+    // relative it produced `crates/foo//Users/…`, matched nothing, and the
+    // crate lost its name and roots along with every edge into it. The fixture
+    // has to build the absolute path at run time, which is why it is written
+    // through a second call rather than as a literal.
+    const dir = writeLayout({
+      "custom/lib.rs": "pub fn from_lib() {}",
+      "src/main.rs": "use app::from_lib;\n\nfn main() { from_lib(); }",
+    });
+    roots.push(dir);
+    fs.writeFileSync(
+      path.join(dir, "Cargo.toml"),
+      `[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\npath = "${path.join(dir, "custom/lib.rs")}"\n`,
+    );
+    const graph = await buildCodeGraph(dir);
+
+    expect(graph.edges.some((e) => e.source === "src/main.rs" && e.target === "custom/lib.rs")).toBe(true);
+  });
+
+  it("does not reach a project crate whose name is a registry dependency", async () => {
+    // `log = "0.4"` names the registry crate, and a workspace member also
+    // called `log` is a different crate that is never in scope. Checked on
+    // cargo 1.98.0: the package builds against `log v0.4.34` from the registry
+    // with a `compile_error!` sitting in the local one, which proves rustc
+    // never reads it — while the graph drew an edge straight into it.
+    const graph = await graphOf({
+      "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/log"]\nresolver = "2"\n',
+      "crates/app/Cargo.toml":
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlog = "0.4"\n',
+      "crates/app/src/lib.rs": "use log::info;\n\npub fn shout() { info!(\"from the registry\"); }",
+      "crates/log/Cargo.toml": '[package]\nname = "log"\nversion = "0.1.0"\nedition = "2021"\n',
+      "crates/log/src/lib.rs": 'compile_error!("never in scope for app");',
+    });
+
+    expect(graph.edges.some((e) => e.target === "crates/log/src/lib.rs")).toBe(false);
+  });
+
+  it("reaches a project crate a [patch] sends a registry name to", async () => {
+    // The same manifest, one section added, and cargo changes its answer with
+    // the graph: `[patch.crates-io] log = { path = … }` builds `log v0.4.34`
+    // from the member. It is how a workspace makes its members depend on each
+    // other by version — tokio patches all five of its crates that way, and
+    // reading the names as registry ones cost 473 real edges there.
+    const graph = await graphOf({
+      "Cargo.toml": [
+        '[workspace]\nmembers = ["crates/app", "crates/log"]\nresolver = "2"\n',
+        '[patch.crates-io]\nlog = { path = "crates/log" }\n',
+      ].join("\n"),
+      "crates/app/Cargo.toml":
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nlog = "0.4"\n',
+      "crates/app/src/lib.rs": "use log::marker;\n\npub fn shout() -> marker::Local { marker::Local }",
+      "crates/log/Cargo.toml": '[package]\nname = "log"\nversion = "0.4.34"\nedition = "2021"\n',
+      "crates/log/src/lib.rs": "pub mod marker { pub struct Local; }",
+    });
+
+    expect(
+      graph.edges.some((e) => e.source === "crates/app/src/lib.rs" && e.target === "crates/log/src/lib.rs"),
+    ).toBe(true);
+  });
+
+  it("ignores a [patch] a workspace member declares for itself", async () => {
+    // Cargo says so out loud — "patch for the non root package will be ignored,
+    // specify patch at the workspace root" — and then fails the build with
+    // `error[E0432]: unresolved import 'log::marker'`, which is the proof that
+    // it compiled against the registry crate. Honouring the member's patch drew
+    // an edge into a crate the build never touches.
+    const graph = await graphOf({
+      "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/log"]\nresolver = "2"\n',
+      "crates/app/Cargo.toml": [
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        '[dependencies]\nlog = "0.4"\n',
+        '[patch.crates-io]\nlog = { path = "../log" }\n',
+      ].join("\n"),
+      "crates/app/src/lib.rs": "use log::marker;\n\npub fn go() -> marker::Local { marker::Local }",
+      "crates/log/Cargo.toml": '[package]\nname = "log"\nversion = "0.4.34"\nedition = "2021"\n',
+      "crates/log/src/lib.rs": "pub mod marker { pub struct Local; }",
+    });
+
+    expect(graph.edges.some((e) => e.target === "crates/log/src/lib.rs")).toBe(false);
+  });
+
+  it("matches a [patch] by package name, not by the alias it is imported as", async () => {
+    // `alias = { package = "itoa" }` is patched under `itoa` and written as
+    // `alias`. Matching the two directly left the alias among the external
+    // names and dropped the edge, though cargo 1.98.0 builds
+    // `itoa v1.0.18 (crates/itoa)` from the member.
+    const graph = await graphOf({
+      "Cargo.toml": [
+        '[workspace]\nmembers = ["crates/app", "crates/itoa"]\nresolver = "2"\n',
+        '[patch.crates-io]\nitoa = { path = "crates/itoa" }\n',
+      ].join("\n"),
+      "crates/app/Cargo.toml": [
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        '[dependencies]\nalias = { package = "itoa", version = "1.0" }\n',
+      ].join("\n"),
+      "crates/app/src/lib.rs": "use alias::marker;\n\npub fn go() -> marker::Local { marker::Local }",
+      "crates/itoa/Cargo.toml": '[package]\nname = "itoa"\nversion = "1.0.18"\nedition = "2021"\n',
+      "crates/itoa/src/lib.rs": "pub mod marker { pub struct Local; }",
+    });
+
+    expect(
+      graph.edges.some((e) => e.source === "crates/app/src/lib.rs" && e.target === "crates/itoa/src/lib.rs"),
+    ).toBe(true);
+  });
+
+  it("does not let a crates-io patch capture a git dependency", async () => {
+    // `[patch.crates-io]` patches that registry and nothing else. Cargo 1.98.0
+    // keeps fetching the git checkout — its dep-info names the clone under
+    // `CARGO_HOME/git` — and the local crate, carrying a `compile_error!`, is
+    // never read, which is what lets the build finish.
+    const graph = await graphOf({
+      "Cargo.toml": [
+        '[workspace]\nmembers = ["crates/app", "crates/itoa"]\nresolver = "2"\n',
+        '[patch.crates-io]\nitoa = { path = "crates/itoa" }\n',
+      ].join("\n"),
+      "crates/app/Cargo.toml": [
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        '[dependencies]\nitoa = { git = "https://example.invalid/itoa" }\n',
+      ].join("\n"),
+      "crates/app/src/lib.rs": "use itoa::marker;\n\npub fn go() -> marker::Remote { marker::Remote }",
+      "crates/itoa/Cargo.toml": '[package]\nname = "itoa"\nversion = "1.0.18"\nedition = "2021"\n',
+      "crates/itoa/src/lib.rs": 'compile_error!("a crates-io patch does not touch a git dependency");',
+    });
+
+    expect(graph.edges.some((e) => e.target === "crates/itoa/src/lib.rs")).toBe(false);
+  });
+
+  it("reaches a project crate declared by path under the same name", async () => {
+    // The other half of the rule: a `path` dependency is the project's own
+    // crate whatever else carries that name on a registry.
+    const graph = await graphOf({
+      "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/log"]\nresolver = "2"\n',
+      "crates/app/Cargo.toml": [
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        '[dependencies]\nlog = { path = "../log" }\n',
+      ].join("\n"),
+      "crates/app/src/lib.rs": "use log::marker;\n\npub fn shout() -> marker::Local { marker::Local }",
+      "crates/log/Cargo.toml": '[package]\nname = "log"\nversion = "0.1.0"\nedition = "2021"\n',
+      "crates/log/src/lib.rs": "pub mod marker { pub struct Local; }",
+    });
+
+    expect(
+      graph.edges.some((e) => e.source === "crates/app/src/lib.rs" && e.target === "crates/log/src/lib.rs"),
+    ).toBe(true);
+  });
+
+  it("draws the edge of a module declared inside a macro body", async () => {
+    // Checked on cargo 1.98.0: the package builds and its dep-info lists
+    // `src/hidden.rs`, which nothing but the macro body declares. Left
+    // unparsed, that file had no incoming edge at all — the shape behind 77 of
+    // tokio's false orphans, where `cfg_io_util! { mod … }` hides 36
+    // declarations in one block.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "macromod"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": [
+        "macro_rules! cfg_thing {",
+        "    ($($item:item)*) => { $($item)* };",
+        "}",
+        "",
+        "cfg_thing! {",
+        "    mod hidden;",
+        "    pub use hidden::Thing;",
+        "}",
+        "",
+        "pub fn make() -> Thing { Thing }",
+      ].join("\n"),
+      "src/hidden.rs": "pub struct Thing;",
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/hidden.rs")).toBe(true);
+  });
+
+  it("keeps a macro body inside the module block that encloses it", async () => {
+    // The body is unwrapped where it stands, so the enclosing `mod inner { … }`
+    // still counts and the macro adds no level: the file is `src/inner/deep.rs`.
+    // Reading the body as a scope of its own would have looked one directory
+    // too far down.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "macroscope"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": [
+        "macro_rules! cfg_thing {",
+        "    ($($item:item)*) => { $($item)* };",
+        "}",
+        "",
+        "pub mod inner {",
+        "    cfg_thing! {",
+        "        pub mod deep;",
+        "    }",
+        "}",
+      ].join("\n"),
+      "src/inner/deep.rs": "pub struct Deep;",
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/inner/deep.rs")).toBe(
+      true,
+    );
+  });
+
+  it("draws every file a conditional path attribute can select", async () => {
+    // Checked on cargo 1.98.0: the package builds on unix and its dep-info
+    // lists `src/lib.rs` and `src/unix.rs`. Read as if the attribute were not
+    // there, the graph got both halves wrong at once — an edge to the file the
+    // name alone implies, and none to the one holding the module's whole body.
+    //
+    // The convention is drawn too, and that is not a leftover: a `cfg_attr`
+    // applies only where its condition holds, and where none does the module is
+    // the file its name implies. `errno` writes exactly this shape, and its
+    // `src/sys.rs` says so in its own first line — "a default sys.rs for
+    // unrecognized targets… if lib.rs doesn't recognize the target, it defaults
+    // to using this file".
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "cfgattr"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": [
+        '#[cfg_attr(unix, path = "unix.rs")]',
+        '#[cfg_attr(windows, path = "windows.rs")]',
+        "mod sys;",
+        "",
+        "pub fn errno() -> i32 { sys::errno() }",
+      ].join("\n"),
+      "src/unix.rs": "pub fn errno() -> i32 { 0 }",
+      "src/windows.rs": "pub fn errno() -> i32 { 1 }",
+      "src/sys.rs": 'compile_error!("unsupported target");',
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/unix.rs")).toBe(true);
+    // All three, because the graph fixes no target: the module is one file
+    // here, another there, and the fallback where neither condition holds.
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/windows.rs")).toBe(true);
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/sys.rs")).toBe(true);
+  });
+
+  it("keeps the convention when a conditional path names a file instead", async () => {
+    // With the condition false the attribute is not applied at all:
+    // `#[cfg_attr(any(), path = "ghost.rs")] mod platform;` compiles against
+    // `src/platform.rs` on cargo 1.98.0, whose dep-info names it and not
+    // `ghost.rs`. Reading only the named path lost that edge outright.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "cfgfalse"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": [
+        '#[cfg_attr(any(), path = "ghost.rs")]',
+        "mod platform;",
+        "",
+        "pub fn go() -> platform::Marker { platform::Marker }",
+      ].join("\n"),
+      "src/platform.rs": "pub struct Marker;",
+      "src/ghost.rs": "pub struct Marker;",
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/platform.rs")).toBe(true);
+  });
+
+  it("keeps the convention for an unconditional path attribute out of it", async () => {
+    // The other side: a bare `#[path]` always applies, so the file its name
+    // implies is never read and must draw nothing — even when it exists.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "barepath"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": '#[path = "moved.rs"]\nmod platform;\n\npub fn go() -> platform::Marker { platform::Marker }',
+      "src/moved.rs": "pub struct Marker;",
+      "src/platform.rs": 'compile_error!("never read: the attribute always applies");',
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/moved.rs")).toBe(true);
+    expect(graph.edges.some((e) => e.target === "src/platform.rs")).toBe(false);
+  });
+
+  it("does not read a path named inside a doc string as a relocation", async () => {
+    // `#[cfg_attr(docsrs, doc = r#"… path = "custom.rs" …"#)] mod plain;`
+    // compiles by convention against `src/plain.rs` on cargo 1.98.0, and its
+    // dep-info never names `custom.rs`. Scanning the attribute's raw text read
+    // the doc's own words as a relocation.
+    //
+    // `src/custom.rs` is in the fixture so the assertion can fail: without a
+    // file there the invented path resolves to nothing and the mistake leaves
+    // no trace in the edges.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "docpath"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": [
+        '#[cfg_attr(docsrs, doc = r#"override with path = "custom.rs" if needed"#)]',
+        "mod plain;",
+        "",
+        "pub fn go() { plain::hi(); }",
+      ].join("\n"),
+      "src/plain.rs": "pub fn hi() {}",
+      "src/custom.rs": 'compile_error!("named only inside a doc string");',
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/plain.rs")).toBe(true);
+    expect(graph.edges.some((e) => e.target === "src/custom.rs")).toBe(false);
+  });
+
+  it("falls back to convention for an empty declared target path", async () => {
+    // `path = ""` names no file, and cargo refuses the manifest outright:
+    // "path `…/` for lib `emptylib` is a directory, but a source file was
+    // expected", the same for a `[[bin]]`. There is no build to mirror, so
+    // there is no right answer to read off the oracle — only a choice between
+    // two wrong ones.
+    //
+    // Convention is the cheaper wrong: dropping the target instead would take
+    // the crate's name and roots with it, and every edge its dependents draw
+    // into it — the regression a `[lib] path = "../…"` already caused once.
+    // The declaration is treated as absent, which is what an empty string
+    // effectively says, and the tree still reads.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "emptylib"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\npath = ""\n',
+      "src/lib.rs": "pub mod part;",
+      "src/part.rs": "pub fn run() {}",
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/part.rs")).toBe(true);
+  });
+
+  it("keeps the inline guard on for a glob over a submodule", async () => {
+    // `use crate::prelude::*;` brings in what that module re-exports, not the
+    // file's own modules: rustc rejects the `use corelib::marker;` beside it
+    // with E0432. Only the anchor itself — `use super::*;` — is the file's
+    // scope, so only that one may switch the guard off.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": [
+        "pub mod corelib;",
+        "pub mod prelude { pub struct Unrelated; }",
+        "",
+        "pub mod block {",
+        "    use crate::prelude::*;",
+        "    use corelib::marker;",
+        "    pub fn f() -> marker::Marker { marker::Marker }",
+        "}",
+      ].join("\n"),
+      "src/corelib.rs": "pub mod marker { pub struct Marker; }",
+    });
+
+    const toCorelib = graph.edges.filter(
+      (e) => e.source === "src/lib.rs" && e.target === "src/corelib.rs",
+    );
+    // Only the one the declaration draws.
+    expect(toCorelib).toHaveLength(1);
+  });
+
+  it("does not treat a nested block's declaration as the enclosing block's", async () => {
+    // `findAll` walks the whole subtree, so `mod corelib` inside `nested`
+    // counted as declared by `outer`, and a bare `use corelib::marker;` in
+    // `outer` was rebased into the block. rustc 1.98.0 rejects that line with
+    // E0432: a name declared in a nested block is in that block's scope only.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": [
+        "pub mod outer {",
+        "    mod nested { pub mod corelib { pub mod marker { pub struct Marker; } } }",
+        "    use corelib::marker;",
+        "    pub fn f() -> marker::Marker { marker::Marker }",
+        "}",
+      ].join("\n"),
+      "src/outer/corelib.rs": 'compile_error!("orphan");',
+    });
+
+    expect(graph.edges.some((e) => e.target === "src/outer/corelib.rs")).toBe(false);
+  });
+
+  it("keeps a block's edge when a glob use puts the name in its scope", async () => {
+    // `use super::*;` brings in every module the file declares, and then the
+    // bare head does reach one — rustc 1.98.0 resolves it, and rejects the same
+    // line with the glob removed. The block's scope is not knowable from the
+    // block alone, so nothing is asserted about it.
+    //
+    // The path reaches a *submodule in its own file*, so the edge it asks for
+    // is one the declaration cannot draw. Written against `src/corelib.rs`
+    // instead, the assertion was answered by `pub mod corelib;` and held
+    // whatever the block did.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": [
+        "pub mod corelib;",
+        "",
+        "pub mod block {",
+        "    use super::*;",
+        "    use corelib::sub::Marker;",
+        "    pub fn f() -> Marker { Marker }",
+        "}",
+      ].join("\n"),
+      "src/corelib/mod.rs": "pub mod sub;",
+      "src/corelib/sub.rs": "pub struct Marker;",
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/corelib/sub.rs")).toBe(true);
+  });
+
+  it("reads the anchor glob through a braced group", async () => {
+    // `use {super::*};` is the anchor written as a group with no prefix, and
+    // `use super::{*};` the same import the other way round. Both compile where
+    // the bare head beside them is E0432 without them — checked on cargo
+    // 1.98.0. Matching only the flat spelling read neither as an anchor, left
+    // the scope guard on, and dropped a real edge.
+    for (const anchor of ["use {super::*};", "use super::{*};", "use {super::{*}};"]) {
+      const graph = await graphOf({
+        "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        "src/lib.rs": [
+          "pub mod corelib;",
+          "",
+          "pub mod block {",
+          `    ${anchor}`,
+          "    use corelib::sub::Marker;",
+          "    pub fn f() -> Marker { Marker }",
+          "}",
+        ].join("\n"),
+        "src/corelib/mod.rs": "pub mod sub;",
+        "src/corelib/sub.rs": "pub struct Marker;",
+      });
+
+      expect(
+        graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/corelib/sub.rs"),
+        `anchor spelled ${anchor}`,
+      ).toBe(true);
+    }
+  });
+
+  it("keeps the inline guard on for a braced glob over a dependency", async () => {
+    // The mirror of the case above, and the reason the group is walked rather
+    // than matched on its trailing `*`: `use {std::collections::*};` is a group
+    // with no prefix carrying a glob that brings in nothing of this crate.
+    // rustc 1.98.0 answers the bare head beside it with E0433, "cannot find
+    // module or crate `corelib` in this scope".
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": [
+        "pub mod corelib;",
+        "",
+        "pub mod block {",
+        "    use {std::collections::*};",
+        "    use corelib::sub::Marker;",
+        "    pub fn f() -> Marker { Marker }",
+        "}",
+      ].join("\n"),
+      "src/corelib/mod.rs": "pub mod sub;",
+      "src/corelib/sub.rs": "pub struct Marker;",
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/corelib/sub.rs")).toBe(false);
+  });
+
+  it("does not let a path inside an inline block reach a module the file declares", async () => {
+    // rustc rejects this with `error[E0432]: unresolved import 'corelib'`,
+    // "help: a similar path exists: super::corelib::marker" — a declaration at
+    // file level is not in the block's scope. The mirror of the case already
+    // handled the other way round. The declaration's own edge stays.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": [
+        "pub mod corelib;",
+        "",
+        "pub mod block {",
+        "    use corelib::marker;",
+        "    pub fn take() -> marker::Marker { marker::Marker }",
+        "}",
+      ].join("\n"),
+      "src/corelib.rs": "pub mod marker { pub struct Marker; }",
+    });
+
+    const toCorelib = graph.edges.filter(
+      (e) => e.source === "src/lib.rs" && e.target === "src/corelib.rs",
+    );
+    // One edge, from `pub mod corelib;`. The `use` inside the block adds none.
+    expect(toCorelib).toHaveLength(1);
   });
 });
