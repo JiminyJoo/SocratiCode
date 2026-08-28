@@ -988,6 +988,60 @@ describe("buildCodeGraph — Rust edges rustc rejects", () => {
     expect(graph.edges.some((e) => e.target === "crates/log/src/lib.rs")).toBe(false);
   });
 
+  it("inherits from the workspace that a dependency is a registry one", async () => {
+    // `log = { workspace = true }` says nothing about where the crate comes
+    // from: the answer is in `[workspace.dependencies]`, and a member that
+    // writes it must read the same one cargo reads. Checked on cargo 1.98.0
+    // with the local crate holding a `compile_error!`: `cargo check -p app`
+    // downloads and builds `log v0.4.34`, and the member is never touched.
+    //
+    // The workspace entry is a table with a version and no `path` on purpose.
+    // Written as the bare string `log = "0.4"` this test passes even on a
+    // resolver that inherits nothing, because a string is not a table and never
+    // reaches the local branch at all — a shape that proves nothing.
+    const graph = await graphOf({
+      "Cargo.toml": [
+        '[workspace]\nmembers = ["crates/app", "crates/log"]\nresolver = "2"\n',
+        '[workspace.dependencies]\nlog = { version = "0.4" }\n',
+      ].join("\n"),
+      "crates/app/Cargo.toml": [
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        "[dependencies]\nlog = { workspace = true }\n",
+      ].join("\n"),
+      "crates/app/src/lib.rs": 'use log::info;\n\npub fn shout() { info!("from the registry"); }',
+      "crates/log/Cargo.toml": '[package]\nname = "log"\nversion = "0.1.0"\nedition = "2021"\n',
+      "crates/log/src/lib.rs": 'compile_error!("never in scope for app");',
+    });
+
+    expect(graph.edges.some((e) => e.target === "crates/log/src/lib.rs")).toBe(false);
+  });
+
+  it("inherits from the workspace that a dependency is a local one", async () => {
+    // The other half, and the token that flips rustc: the same two manifests
+    // with `"0.4"` replaced by `{ path = "crates/log" }` in the workspace
+    // table. Cargo then compiles the member — it is how the `compile_error!`
+    // above was shown to be reachable at all — so the edge has to be drawn.
+    // Without this half the test above passes on a resolver that calls every
+    // inherited dependency external.
+    const graph = await graphOf({
+      "Cargo.toml": [
+        '[workspace]\nmembers = ["crates/app", "crates/log"]\nresolver = "2"\n',
+        '[workspace.dependencies]\nlog = { path = "crates/log" }\n',
+      ].join("\n"),
+      "crates/app/Cargo.toml": [
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        "[dependencies]\nlog = { workspace = true }\n",
+      ].join("\n"),
+      "crates/app/src/lib.rs": "use log::marker;\n\npub fn go() -> marker::Local { marker::Local }",
+      "crates/log/Cargo.toml": '[package]\nname = "log"\nversion = "0.1.0"\nedition = "2021"\n',
+      "crates/log/src/lib.rs": "pub mod marker { pub struct Local; }",
+    });
+
+    expect(
+      graph.edges.some((e) => e.source === "crates/app/src/lib.rs" && e.target === "crates/log/src/lib.rs"),
+    ).toBe(true);
+  });
+
   it("reaches a project crate a [patch] sends a registry name to", async () => {
     // The same manifest, one section added, and cargo changes its answer with
     // the graph: `[patch.crates-io] log = { path = … }` builds `log v0.4.34`
