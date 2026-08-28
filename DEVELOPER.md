@@ -994,7 +994,33 @@ Supports 18+ languages including TypeScript, JavaScript, Python, Java, Kotlin, G
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `resolveImport` | `(specifier, importerPath, projectRoot, fileSet, language) → string \| null` | Resolve module specifier to file path |
+| `resolveImport` | `(specifier, sourceFile, projectPath, fileSet, language, aliases?, jvmSuffixMap?, csNamespaceMap?, goModuleInfo?, phpPsr4Map?, dartPackageMap?, pythonImportRoots?, elixirModuleMap?) → string \| null` | Resolve a module specifier to a project-relative file path; null for external/stdlib modules or a resolution miss |
+| `buildJvmSuffixMap` | `(fileSet) → Map<string, string>` | Java/Kotlin/Scala: class-name suffix → file, for multi-module source layouts |
+| `buildCsNamespaceMap` | `(fileSet, projectPath) → Map<string, string[]>` | C#: `namespace X.Y` declarations → contributing files, resolving `using` directives |
+| `buildGoModuleInfo` | `(fileSet, projectPath) → GoModuleInfo[]` | Go: one entry per `go.mod` (root and nested), package dir → representative file |
+| `buildPhpPsr4Map` | `(projectPath) → Map<string, string[]>` | PHP: PSR-4 prefix → base dirs from every in-repo `composer.json` (`autoload` + `autoload-dev`) |
+| `buildDartPackageMap` | `(projectPath) → Map<string, string>` | Dart: package name → package root from every `pubspec.yaml`; `package:<name>/<rest>` resolves to `<root>/lib/<rest>` |
+| `buildPythonManifests` | `(projectPath) → PythonManifest[]` | Python: one entry per `pyproject.toml` with its import roots and declared uv workspace members |
+| `pythonRootsForFile` | `(manifests, relSourceDir) → string[]` | Python: the import roots that apply to one file, ancestry- and membership-scoped, nearest first |
+| `buildElixirModuleMap` | `(fileSet, projectPath) → Map<string, string[]>` | Elixir: `defmodule` name → declaring files (AST-derived), resolving `alias`/`import`/`require`/`use` |
+| `hasLiteralShellPathShape` | `(specifier) → boolean` | Shell: whether a `source` argument is a literal path worth resolving |
+
+The `GoModuleInfo` and `PythonManifest` interfaces are exported alongside their builders.
+
+The per-language `build*` helpers share one convention. Each is called once per
+graph build in `buildCodeGraph`, behind a `has<Language>` gate so projects
+without that language pay nothing. The manifest-reading ones (`go.mod`,
+`composer.json`, `pubspec.yaml`, `pyproject.toml`) discover their manifests by
+walking the filesystem with the same ignore filter the graphable walk uses,
+never by scanning `fileSet`: manifests have no AST grammar, so they are never
+in `fileSet`, and a `fileSet` scan silently matches nothing (the issue 82
+trap, documented at the Go builder). Each walk also skips one directory
+unconditionally where a generated or vendored manifest would poison the map:
+`vendor/` for Composer, `.dart_tool/` for pubspec, `site-packages/` and
+`dist-packages/` for pyproject. Results thread into `resolveImport` as
+trailing optional parameters, keeping every existing caller
+source-compatible, and duplicate names resolve first-wins in sorted path
+order so edges are deterministic across machines.
 
 ### lock.ts
 
