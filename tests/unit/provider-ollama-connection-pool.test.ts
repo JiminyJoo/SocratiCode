@@ -109,6 +109,17 @@ describe("ollama connection pool", () => {
     expect(opened).toBeLessThanOrEqual(4);
   });
 
+  /** Poll until the open-socket count satisfies `predicate`, or fail loudly. */
+  async function waitForSockets(predicate: (n: number) => boolean): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    while (!predicate(openSockets.size)) {
+      if (Date.now() > deadline) {
+        throw new Error(`open sockets stayed at ${openSockets.size} past the deadline`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
   it("drains the pool on resetOllamaClient", async () => {
     // Idle keep-alive sockets belong to the dispatcher; closing it must
     // release them rather than leaving them to a timeout.
@@ -116,8 +127,7 @@ describe("ollama connection pool", () => {
     await Promise.all(Array.from({ length: 8 }, (_, i) => provider.embed([`d-${i}`])));
     expect(openSockets.size).toBeGreaterThan(0);
     resetOllamaClient();
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(openSockets.size).toBe(0);
+    await waitForSockets((n) => n === 0);
   });
 
   it("rebuilds the pool when the cap changes", async () => {
@@ -130,7 +140,6 @@ describe("ollama connection pool", () => {
     process.env.OLLAMA_MAX_CONNECTIONS = "2";
     resetEmbeddingConfig();
     await Promise.all(Array.from({ length: 8 }, (_, i) => provider.embed([`b-${i}`])));
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    expect(openSockets.size).toBeLessThanOrEqual(2);
+    await waitForSockets((n) => n <= 2);
   });
 });

@@ -30,7 +30,12 @@ function getClient(): Ollama {
     ollamaClientConnections !== config.ollamaMaxConnections
   ) {
     // An orphaned pool keeps its idle sockets until they time out, so close
-    // the previous dispatcher whenever the client is rebuilt.
+    // the previous dispatcher whenever the client is rebuilt. close() stops
+    // the old agent accepting new dispatches immediately and lets in-flight
+    // requests finish, so during a rebuild the old pool only shrinks while
+    // the new one grows: the brief overlap is bounded by the two caps and
+    // resolves itself, and no request is aborted. Serialising the swap would
+    // buy nothing beyond that and would force this accessor async.
     const previous = ollamaDispatcher;
     if (previous) {
       previous.close().catch((err: unknown) => {
