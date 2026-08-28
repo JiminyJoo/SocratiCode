@@ -196,6 +196,24 @@ describe("ignore", () => {
       expect(shouldIgnore(ig, "crate/src/env/shells.rs")).toBe(false);
     });
 
+    it("keeps a nested directory named venv, which carries no pyvenv.cfg", () => {
+      // The twin of the test above, and it was missing: `env` and `venv` were
+      // anchored together in one change, and only `env` had a proof. Putting
+      // `venv` back to matching at any depth left the whole battery green — so
+      // half of that change was undoable in silence.
+      //
+      // `venv` is a plainer directory name than it looks: a Go package, a
+      // fixture directory, a docs folder. The rule is the same either way —
+      // what makes a virtualenv is the `pyvenv.cfg` PEP 405 puts at its root,
+      // not the name — and the test above proves the recognition still works.
+      fixture = createFixtureProject("ignore-nested-venv-directory");
+      fs.mkdirSync(path.join(fixture.root, "pkg", "internal", "venv"), { recursive: true });
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "pkg/internal/venv/loader.go")).toBe(false);
+      expect(shouldIgnore(ig, "pkg/internal/venv/loader_test.go")).toBe(false);
+    });
+
     it("finds a virtualenv even with RESPECT_GITIGNORE=false", () => {
       // A virtualenv is not a project preference: it is a directory of
       // installed libraries, and turning .gitignore off is no reason to start
