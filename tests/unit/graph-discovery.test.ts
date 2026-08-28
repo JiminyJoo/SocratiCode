@@ -1149,6 +1149,125 @@ describe("buildCodeGraph — Rust edges rustc rejects", () => {
     ).toBe(true);
   });
 
+  it("reaches the file a literal include! pastes in", async () => {
+    // `include!` is in the Reference like the `#[path]` this resolver already
+    // reads, so it passes the admission rule in `graph-imports.ts`: the
+    // language guarantees it, and knowing no library is required. Verified on
+    // cargo 1.98.0 — `gen.rs` is in the lib's dep-info, and a `compile_error!`
+    // placed in it fails the build, so rustc genuinely reads it.
+    //
+    // It declares no module: `gen.rs` brings no name into scope, and `use
+    // gen::…` beside it is E0432. What it leaves is an edge, and nothing else.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": 'include!("gen.rs");\n\npub fn go() -> u32 { generated() }\n',
+      "src/gen.rs": "fn generated() -> u32 { 1 }\n",
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/gen.rs")).toBe(true);
+  });
+
+  it("counts an include! from the writing file even inside an inline module", async () => {
+    // The half a `#[path]` does differently, and the reason this is its own
+    // test: a `#[path]` written inside `mod inner { … }` files its target under
+    // `inner/`, an `include!` does not — it pastes text, and the Reference
+    // counts its path from the directory of the file that writes it whatever it
+    // is nested in. Reading it like a `#[path]` would look for `src/inner/gen.rs`
+    // and find nothing.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": 'pub mod inner {\n    include!("gen.rs");\n}\n',
+      "src/gen.rs": "pub fn generated() -> u32 { 1 }\n",
+      // The file the other reading would reach. It exists, so the assertion
+      // below fails rather than passes if the base directory ever changes.
+      "src/inner/gen.rs": "pub fn wrong() -> u32 { 2 }\n",
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/gen.rs")).toBe(true);
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/inner/gen.rs")).toBe(false);
+  });
+
+  it("draws no edge for an include! whose path is built at build time", async () => {
+    // `concat!(env!("OUT_DIR"), …)` names a file that does not exist until
+    // `build.rs` has run, so there is nothing in the tree to point at and
+    // guessing one would be an edge rustc never draws. The admission rule
+    // refuses it for that reason and not for effort.
+    //
+    // The decoy is the point: a file named exactly as the concatenation would
+    // suggest sits in the tree, so a resolver that started stitching the pieces
+    // together would find it and this test would fail.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs": 'include!(concat!(env!("OUT_DIR"), "/generated.rs"));\n',
+      "src/generated.rs": "pub fn decoy() -> u32 { 1 }\n",
+    });
+
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/generated.rs")).toBe(
+      false,
+    );
+  });
+
+  it("does not read an include! written inside a doc comment", async () => {
+    // Nine of these sit in a 1,256-crate registry cache: a doc example showing
+    // how to use the macro, with a path that is illustrative and often names no
+    // file at all. It is the same trap a `path` written in a doc string is, and
+    // reading the AST rather than the text is what keeps it out — the text of a
+    // comment is never a `macro_invocation` node.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+      "src/lib.rs":
+        '//! Example:\n//!\n//! ```\n//! include!("illustrative.rs");\n//! ```\n\npub fn go() -> u32 { 1 }\n',
+      // The file exists, so an implementation reading the raw text would find
+      // it and draw the edge: the absence below is about the reading, not about
+      // a missing target.
+      "src/illustrative.rs": "pub fn shown() -> u32 { 2 }\n",
+    });
+
+    expect(graph.nodes.some((n) => n.relativePath === "src/illustrative.rs")).toBe(true);
+    expect(graph.edges.some((e) => e.source === "src/lib.rs" && e.target === "src/illustrative.rs")).toBe(
+      false,
+    );
+  });
+
+  it("draws no edge for a module a third-party macro generates", async () => {
+    // Not a gap left open by accident: it is the admission rule in
+    // `graph-imports.ts` refusing a case, and this test is what stops the
+    // boundary from moving quietly.
+    //
+    // `automod::dir!("tests/builder")` generates one `mod` per file in that
+    // directory, and the declarations are nowhere in the source. Reading it
+    // means teaching the resolver one third-party macro *and* its expansion
+    // rules — where the path counts from, whether it recurses, which names are
+    // excluded — and once that is in, the criterion is no longer "what the
+    // source says" but "which libraries we happen to know".
+    //
+    // If a future change makes this pass, that is a decision to take on
+    // purpose, in the open, with the rule above rewritten — not a green tick.
+    const graph = await graphOf({
+      "Cargo.toml": '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+      // The written `mod` is the control: same file, same directory level, one
+      // declaration spelled out and one generated. Without it an assertion of
+      // absence proves nothing — a resolver that drew no edge at all here, for
+      // any reason, would satisfy it just as well.
+      "tests/main.rs": 'mod written;\n\nautomod::dir!("tests/cases");\n',
+      "tests/written.rs": "#[test]\nfn written() {}\n",
+      "tests/cases/alpha.rs": "#[test]\nfn alpha() {}\n",
+      "tests/cases/beta.rs": "#[test]\nfn beta() {}\n",
+    });
+
+    expect(
+      graph.edges.some((e) => e.source === "tests/main.rs" && e.target === "tests/written.rs"),
+    ).toBe(true);
+
+    // The generated ones are nodes — they are Rust source and the walk finds
+    // them — so what is missing below is the edge, not the files.
+    expect(graph.nodes.some((n) => n.relativePath === "tests/cases/alpha.rs")).toBe(true);
+    expect(graph.nodes.some((n) => n.relativePath === "tests/cases/beta.rs")).toBe(true);
+    expect(graph.edges.some((e) => e.source === "tests/main.rs" && e.target.startsWith("tests/cases/"))).toBe(
+      false,
+    );
+  });
+
   it("ignores a [patch] aimed at a git remote rather than at the registry", async () => {
     // `[patch]` is keyed by the source it redirects, and only the entry under
     // `crates-io` touches a dependency written as a version. A section keyed by

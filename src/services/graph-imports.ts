@@ -1006,6 +1006,39 @@ export function extractImports(
         break;
       }
 
+      // ── What counts as a Rust declaration, and what does not ─────────────
+      //
+      // Rust can put a module declaration where a reader does not look, and
+      // each way it does is a candidate for this block. **One test decides
+      // every one of them, so this never becomes a list of libraries we happen
+      // to know:**
+      //
+      //     Does the language guarantee it, or does it require knowing a
+      //     library?
+      //
+      // In, because the language guarantees them:
+      //   - a `mod`/`use` written in a macro body — expansion happens before
+      //     name resolution, so what is written there is a declaration. This is
+      //     a fact about the language, not about any particular macro.
+      //   - `#[path]`, and `#[cfg_attr(…, path = …)]`, which the Reference
+      //     documents as the same relocation.
+      //   - `include!("x.rs")` with a literal path, also in the Reference.
+      //
+      // Out, and not for lack of effort:
+      //   - `automod::dir!("tests/x")` and anything like it. Reading it means
+      //     teaching this file one third-party macro *and its expansion rules*
+      //     — where the path counts from, whether the read recurses, which
+      //     names are excluded. It is 92 files on clap and 163 across a
+      //     245-crate sample, and **the size of the number is not what decides**:
+      //     the moment it can, the criterion stops being "what the source says".
+      //     `tests/unit/graph-discovery.test.ts` holds a test that pins this
+      //     refusal, so moving the boundary cannot happen quietly.
+      //   - `include!(concat!(env!("OUT_DIR"), …))` — that file does not exist
+      //     until `build.rs` has run, so no reading of the source can find it.
+      //
+      // A case that passes the test is worth adding however few files it
+      // reaches; one that fails it is refused however many. Whoever adds the
+      // next one: answer the question above first, in the commit message.
       case "rust": {
         // use std::collections::HashMap;  /  pub use crate::config::Config;
         //
@@ -1124,6 +1157,33 @@ export function extractImports(
           if (name && name !== "self") {
             imports.push({ moduleSpecifier: stripRawIdent(name), isDynamic: false });
           }
+        }
+
+        // `include!("gen.rs")` pastes a file's text where it stands. It brings
+        // no name into scope, so it declares no module and carries no
+        // `declaredName` — but the file is a source rustc opens, and cargo
+        // lists it in the dep-info like any other. The Reference resolves the
+        // path against the directory of the file that writes it, which is
+        // already what a `.rs` specifier means to the resolver, inline module
+        // or not: unlike a `#[path]`, an `include!` inside `mod inner { … }`
+        // still counts from the file.
+        //
+        // A literal path only. `include!(concat!(env!("OUT_DIR"), "/x.rs"))`
+        // names a file that does not exist until `build.rs` has run, which no
+        // reading of the source can find — 94 of them across a 1,256-crate
+        // registry cache, against 122 literal ones standing in code.
+        //
+        // Reading the AST rather than the text is also what keeps the
+        // illustrative ones out: an `include!` written inside a doc comment is
+        // part of that comment's node and never a `macro_invocation`, and there
+        // are 9 of those in the same cache.
+        for (const node of sgNode.findAll({ rule: { kind: "macro_invocation" } })) {
+          const invocation = node.text();
+          // Brackets are interchangeable on an invocation, and cargo accepts
+          // all three spellings.
+          const literal = invocation.match(/^\s*include\s*!\s*[([{]\s*"([^"]+\.rs)"\s*[)\]}]/);
+          if (!literal) continue;
+          imports.push({ moduleSpecifier: literal[1], isDynamic: false });
         }
 
         // What a macro invocation wraps is read last, on a source with its head

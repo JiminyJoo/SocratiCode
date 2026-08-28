@@ -86,8 +86,10 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info", () => {
         "",
         "pub mod env;",
         "",
+        "include!(\"pasted.rs\");",
+        "",
         "pub fn all() -> u32 {",
-        "    hidden::value() + platform::value() + env::value()",
+        "    hidden::value() + platform::value() + env::value() + pasted()",
         "}",
         "",
       ].join("\n"),
@@ -97,6 +99,9 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info", () => {
     write(root, "src/under_unix.rs", "pub fn value() -> u32 {\n    2\n}\n");
     write(root, "src/under_windows.rs", "pub fn value() -> u32 {\n    2\n}\n");
     write(root, "src/env/mod.rs", "pub fn value() -> u32 {\n    3\n}\n");
+    // Pasted rather than declared: `pasted()` is called unqualified from
+    // `lib.rs` above, which only compiles because `include!` puts it there.
+    write(root, "src/pasted.rs", "fn pasted() -> u32 {\n    4\n}\n");
 
     execFileSync("cargo", ["check", "--offline", "--quiet"], {
       cwd: root,
