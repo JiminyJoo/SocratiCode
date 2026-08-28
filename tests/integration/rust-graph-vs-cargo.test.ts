@@ -18,8 +18,10 @@ import { buildCodeGraph, ensureDynamicLanguages } from "../../src/services/code-
 //
 // The crate is deliberately dependency-free so the check needs no network, and
 // it carries the shapes that were broken: a `mod` written inside a macro body,
-// a `#[cfg_attr(…, path = …)]` relocation, and a module named `env` — the name
-// the ignore list used to delete at any depth.
+// a `#[cfg_attr(…, path = …)]` relocation, a module named `env` — the name the
+// ignore list used to delete at any depth — and a macro whose body is not items
+// on its own, written inside an inline `mod`, where blanking the braces used to
+// re-parent the rest of the block to file level.
 
 function haveCargo(): boolean {
   try {
@@ -92,8 +94,51 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info (needs ca
         "",
         "include!(\"pasted.rs\");",
         "",
+        // `pick!` has the shape of `cfg_if!`: arms written as an `if` carrying
+        // an attribute, which is not Rust once the head and braces are blanked.
+        // Spelled out here so the crate still depends on nothing.
+        "macro_rules! pick {",
+        "    (if #[cfg($a:meta)] { $($ia:item)* } else if #[cfg($b:meta)] { $($ib:item)* } else { $($ic:item)* }) => {",
+        "        $(#[cfg($a)] $ia)*",
+        "        $(#[cfg(all(not($a), $b))] $ib)*",
+        "        $(#[cfg(all(not($a), not($b)))] $ic)*",
+        "    };",
+        "}",
+        "",
+        "pub mod inner {",
+        "    mod before;",
+        "    pick! {",
+        "        if #[cfg(unix)] {",
+        "            mod arm_a;",
+        "        } else if #[cfg(windows)] {",
+        "            mod arm_b;",
+        "        } else {",
+        "            mod arm_c;",
+        "        }",
+        "    }",
+        "    mod after;",
+        "",
+        "    pub fn value() -> u32 {",
+        "        before::value() + after::value()",
+        "    }",
+        "}",
+        "",
+        // The same shape at file level, where recovery moves nothing and the
+        // declarations stay where rustc reads them. This is the case the guard
+        // is drawn narrowly to keep, so the oracle has to cover it: the arm
+        // this platform builds must be reached.
+        "pick! {",
+        "    if #[cfg(unix)] {",
+        "        mod flat_unix;",
+        "    } else if #[cfg(windows)] {",
+        "        mod flat_windows;",
+        "    } else {",
+        "        mod flat_other;",
+        "    }",
+        "}",
+        "",
         "pub fn all() -> u32 {",
-        "    hidden::value() + platform::value() + env::value() + pasted()",
+        "    hidden::value() + platform::value() + env::value() + pasted() + inner::value()",
         "}",
         "",
       ].join("\n"),
@@ -106,6 +151,22 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info (needs ca
     // Pasted rather than declared: `pasted()` is called unqualified from
     // `lib.rs` above, which only compiles because `include!` puts it there.
     write(root, "src/pasted.rs", "fn pasted() -> u32 {\n    4\n}\n");
+
+    // The block the macro sits in. Its modules live under `src/inner/`, and the
+    // arms are one per platform — only one of them is ever compiled.
+    for (const name of ["before", "after", "arm_a", "arm_b", "arm_c"]) {
+      write(root, `src/inner/${name}.rs`, "pub fn value() -> u32 {\n    5\n}\n");
+    }
+    // The bait, at the level recovery used to re-parent to. A build that
+    // succeeds is the proof rustc never opens these.
+    for (const name of ["arm_a", "arm_b", "arm_c", "after"]) {
+      write(root, `src/${name}.rs`, `compile_error!("src/${name}.rs is never compiled");\n`);
+    }
+    // The file-level arms. Real modules, all three: only one is compiled, and
+    // the graph is expected to draw all of them — it fixes no platform.
+    for (const name of ["flat_unix", "flat_windows", "flat_other"]) {
+      write(root, `src/${name}.rs`, "pub fn value() -> u32 {\n    6\n}\n");
+    }
 
     // `--offline` because the crate declares no dependencies: nothing here
     // should ever reach the network, and asking for it makes that a failure
@@ -136,12 +197,63 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info (needs ca
     }
   });
 
+  // The arm this platform compiles. It is the one file rustc reads that the
+  // graph is not expected to reach: its declaration is written inside a macro
+  // body that is not items on its own, so the body is left unread — the price
+  // of not drawing the three edges the next test names.
+  const compiledArm = process.platform === "win32" ? "src/inner/arm_b.rs" : "src/inner/arm_a.rs";
+
   it("reads a dep-info that names the files rustc opened", () => {
     // Guards the oracle itself: a half-written dep-info would let every
     // assertion below pass by having nothing to check.
     expect(read.has("src/lib.rs")).toBe(true);
     expect(read.has("src/hidden.rs")).toBe(true);
+    expect(read.has(compiledArm)).toBe(true);
     expect(read.size).toBeGreaterThanOrEqual(4);
+  });
+
+  it("draws no edge into the file level a recovered macro body used to spill into", async () => {
+    // `pick!` has `cfg_if!`'s if/else shape, and blanking its head and braces
+    // leaves the parser recovering: it closed `mod inner` after the first arm
+    // and re-parented the rest to file level. The graph drew
+    // `src/lib.rs -> src/arm_b.rs` twice and `src/lib.rs -> src/after.rs`,
+    // three edges into `compile_error!` files that this crate's clean build
+    // proves are never compiled — while `mod after;`, which does belong to the
+    // block, lost the edge it should have had.
+    const graph = await buildCodeGraph(root);
+    const targets = new Set(graph.edges.map((e) => String(e.target)));
+
+    for (const bait of ["src/arm_a.rs", "src/arm_b.rs", "src/arm_c.rs", "src/after.rs"]) {
+      expect(read.has(bait), `${bait} must stay uncompiled for this to be a test`).toBe(false);
+      expect([...targets], `edge into ${bait}`).not.toContain(bait);
+    }
+
+    // The control. Without it this test also passes with macro bodies never
+    // read at all, and with the whole inline-module machinery removed.
+    expect([...targets]).toContain("src/inner/before.rs");
+    expect([...targets]).toContain("src/inner/after.rs");
+    expect([...targets]).toContain("src/hidden.rs");
+  });
+
+  it("still reads the same shape written at file level, where nothing moved", async () => {
+    // The other half of the rule, and the reason the guard tests where recovery
+    // reaches instead of whether an ERROR exists at all. The same `pick!` at
+    // file level leaves an ERROR on the attribute and moves nothing, so the arm
+    // rustc compiles keeps its edge — cargo says which one that is.
+    const graph = await buildCodeGraph(root);
+    const targets = new Set(graph.edges.map((e) => String(e.target)));
+
+    const compiled = process.platform === "win32" ? "src/flat_windows.rs" : "src/flat_unix.rs";
+    expect(read.has(compiled), "cargo must have compiled this arm").toBe(true);
+    expect([...targets]).toContain(compiled);
+
+    // And the arms it does not compile are drawn too: the graph fixes no
+    // platform, so both are dependencies of a build somewhere. Stated here
+    // because it is the reason the test above lists its baits by name instead
+    // of asking for "every file rustc did not read".
+    for (const arm of ["src/flat_unix.rs", "src/flat_windows.rs", "src/flat_other.rs"]) {
+      expect([...targets], `arm ${arm}`).toContain(arm);
+    }
   });
 
   it("reaches every source rustc read, walking from the crate root", async () => {
@@ -164,18 +276,27 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info (needs ca
       }
     }
 
+    // The compiled arm is the declared exception, and naming it rather than
+    // filtering it out is what keeps this test able to fail: anything else
+    // rustc reads and the graph misses still shows up here.
     const missed = [...read].filter((f) => !seen.has(f)).sort();
-    expect(missed).toEqual([]);
+    expect(missed).toEqual([compiledArm]);
   });
 
-  it("draws no edge into a file rustc never opened, apart from the other cfg arm", async () => {
+  it("draws no edge into a file rustc never opened, apart from the other cfg arms", async () => {
     const graph = await buildCodeGraph(root);
-    // The graph fixes no target, so it draws both arms of the `cfg_attr` — the
-    // arm this platform does not build is expected and is the only one.
-    const otherArm = process.platform === "win32" ? "src/under_unix.rs" : "src/under_windows.rs";
+    // The graph fixes neither platform nor feature, so it draws every arm of a
+    // `cfg` choice and not just the one this machine builds: the `cfg_attr`
+    // relocation and the file-level `pick!`. They are listed by name — the
+    // alternative, filtering out everything rustc did not read, would let a
+    // genuinely wrong edge through unnoticed.
+    const otherArms =
+      process.platform === "win32"
+        ? ["src/under_unix.rs", "src/flat_unix.rs", "src/flat_other.rs"]
+        : ["src/under_windows.rs", "src/flat_windows.rs", "src/flat_other.rs"];
     const strangers = graph.edges
-      .map((e) => e.target)
-      .filter((t) => t.endsWith(".rs") && !read.has(t) && t !== otherArm);
+      .map((e) => String(e.target))
+      .filter((t) => t.endsWith(".rs") && !read.has(t) && !otherArms.includes(t));
     expect([...new Set(strangers)]).toEqual([]);
   });
 });

@@ -765,6 +765,179 @@ impl Thing {
       expect(specs).toContain("crate::in_impl::Marker");
     });
 
+    it("still reads a body the parser recovers from without leaving it", () => {
+      // The complement of the test below, and the reason the guard is drawn
+      // around where recovery reaches rather than around the ERROR node.
+      // `cfg_if!` at file level leaves an ERROR on the attribute and moves
+      // nothing: the declarations in the arms are read where they were written,
+      // which is where rustc reads them too.
+      //
+      // Refusing every body that does not parse as items on its own would cost
+      // this case: 449 macro bodies carrying declarations across a 1,256-crate
+      // registry cache do not, and 431 of them stand at file level. `js-sys`,
+      // `backtrace`, `ahash` and `aes` each lose real module edges that way.
+      const specs = specsOf(`
+cfg_if! {
+    if #[cfg(unix)] {
+        mod arm_a;
+        pub use arm_a::Thing;
+    } else {
+        mod arm_b;
+    }
+}
+
+mod after;
+`);
+
+      expect(specs).toContain("arm_a");
+      expect(specs).toContain("arm_b");
+      expect(specs).toContain("arm_a::Thing");
+      expect(specs).toContain("after");
+    });
+
+    it("reads a macro nested inside one, beside a body the parser recovers from", () => {
+      // The second unwrap pass reads a source the first one rewrote, so the
+      // ERROR a kept `cfg_if!` leaves behind is in its input. Counting that
+      // against the pass cost `deep` its edge — a macro one level further in,
+      // with nothing wrong with it, punished for its neighbour.
+      const specs = specsOf(`
+cfg_if! {
+    if #[cfg(unix)] {
+        mod arm_a;
+    } else {
+        mod arm_b;
+    }
+}
+
+outer! {
+    inner! {
+        mod deep;
+    }
+}
+`);
+
+      expect(specs).toContain("deep");
+      expect(specs).toContain("arm_a");
+    });
+
+    it("leaves a body alone when recovery reaches past the macro", () => {
+      // `cfg_if!` writes its arms as `if #[cfg(…)] { … } else { … }`, and an
+      // `if` carrying an attribute is not Rust anywhere. Blanking the head and
+      // the outer braces hands the parser a fragment it recovers from, and
+      // recovery does not stop at the macro: the enclosing `mod` is closed
+      // after the first arm and what follows is re-parented to file level.
+      //
+      // Cargo-verified: a crate with this shape builds clean while the graph
+      // drew `src/lib.rs -> src/arm_b.rs` twice and `src/lib.rs -> src/dopo.rs`
+      // — three edges into files carrying `compile_error!`, one of them a
+      // module that belongs to the block.
+      //
+      // `cfg_io_util!` is the control. Without it an assertion about what is
+      // missing would also pass with body reading turned off entirely.
+      const specs = specsOf(`
+cfg_io_util! {
+    mod control;
+}
+
+mod inner {
+    mod before;
+    cfg_if! {
+        if #[cfg(unix)] {
+            mod arm_a;
+        } else if #[cfg(windows)] {
+            mod arm_b;
+        } else {
+            mod arm_c;
+        }
+    }
+    mod after;
+}
+`);
+
+      expect(specs).toContain("control");
+      expect(specs).toContain("self::inner::before");
+      expect(specs).toContain("self::inner::after");
+      // Not at file level, and not anywhere: the arms stay unread.
+      expect(specs).not.toContain("after");
+      expect(specs.filter((s) => s.includes("arm_"))).toEqual([]);
+    });
+
+    it("gives up only the macro that let recovery out, not the file it is in", () => {
+      // The retry that saves the rest of the file, and nothing was holding it:
+      // a mutation pass found that pinning `insideBlock` to either value left
+      // the whole suite green. What it costs is measurable — the narrow retry
+      // is worth 22 distinct dependencies across the 153 crates of a registry
+      // cache that carry the shape, ahash and dashmap among them, where one
+      // `cfg_if!` written in an `impl` used to take every file-level one with
+      // it.
+      //
+      // Three macros in one file is what it takes to see: a clean one, an
+      // unparsable one at file level, and an unparsable one inside a block.
+      // Only the last is given up.
+      const specs = specsOf(`
+cfg_clean! {
+    mod clean_mod;
+}
+
+cfg_if! {
+    if #[cfg(unix)] {
+        mod file_arm_a;
+    } else {
+        mod file_arm_b;
+    }
+}
+
+mod inner {
+    mod before;
+    cfg_if! {
+        if #[cfg(unix)] {
+            mod arm_a;
+        } else {
+            mod arm_b;
+        }
+    }
+    mod after;
+}
+`);
+
+      expect(specs).toContain("clean_mod");
+      expect(specs).toContain("file_arm_a");
+      expect(specs).toContain("file_arm_b");
+      // The block keeps its own declarations, and the arms inside it stay unread.
+      expect(specs).toContain("self::inner::before");
+      expect(specs).toContain("self::inner::after");
+      expect(specs.filter((s) => s.includes("arm_a") && !s.startsWith("file_"))).toEqual([]);
+    });
+
+    it("leaves the body alone when the file was already failing to parse", () => {
+      // The way back into the defect, found by trying to get around the guard:
+      // if the ERROR nodes a source already had were forgiven, a file carrying
+      // an unresolved merge marker inside the block would have one at the same
+      // index recovery produces — and the damaged pass came back, with
+      // `mod after;` drawn at file level, where rustc never looks for it.
+      //
+      // So nothing is forgiven but the macros actually unwrapped, and a source
+      // broken for its own reasons gets no unwrapping at all.
+      const specs = specsOf(`
+mod inner {
+    mod before;
+    cfg_if! {
+        if #[cfg(unix)] {
+            mod arm_a;
+        } else {
+            mod arm_b;
+        }
+    }
+    mod after;
+<<<<<<< HEAD
+}
+`);
+
+      expect(specs).toContain("self::inner::before");
+      expect(specs).not.toContain("after");
+      expect(specs.filter((s) => s.includes("arm_"))).toEqual([]);
+    });
+
     it("leaves a parenthesised macro invocation alone", () => {
       // Only `{}` is unwrapped: a `()` or `[]` invocation carries an
       // expression, not items. `automod::dir!("tests/builder")` names modules
