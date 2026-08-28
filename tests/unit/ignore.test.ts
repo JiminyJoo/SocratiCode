@@ -3,7 +3,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createIgnoreFilter, shouldIgnore } from "../../src/services/ignore.js";
 import { createFixtureProject, type FixtureProject } from "../helpers/fixtures.js";
 
@@ -196,6 +196,54 @@ describe("ignore", () => {
       expect(shouldIgnore(ig, "crate/src/env/shells.rs")).toBe(false);
     });
 
+    it("does not delete same-named source elsewhere when the environment is at the root", () => {
+      // A gitignore pattern with no slash of its own matches at every depth, and
+      // an environment directly under the root produces exactly that — its
+      // relative path is a bare name. So a root-level `toolbox/` was excluding
+      // `packages/app/toolbox/` too, in any language.
+      //
+      // Every other fixture here sits two levels deep, where the pattern is
+      // anchored by accident and this cannot show. A root-level one is what
+      // catches it, which is why this test exists rather than an assertion
+      // added to one above.
+      fixture = createFixtureProject("ignore-root-env-anchoring");
+      fs.mkdirSync(path.join(fixture.root, "toolbox", "conda-meta"), { recursive: true });
+      fs.mkdirSync(path.join(fixture.root, "packages", "app", "toolbox"), { recursive: true });
+
+      const ig = createIgnoreFilter(fixture.root);
+
+      // The environment itself still goes.
+      expect(shouldIgnore(ig, "toolbox/lib/python3.12/site-packages/dep.py")).toBe(true);
+      // The source that merely shares its name does not.
+      expect(shouldIgnore(ig, "packages/app/toolbox/helper.ts")).toBe(false);
+      expect(shouldIgnore(ig, "packages/app/toolbox/index.ts")).toBe(false);
+    });
+
+    it("excludes an environment nested under a directory named venv", () => {
+      // The walk used to skip any directory called `venv` by name, and turned
+      // back before reaching the marker of a real environment underneath: the
+      // installed libraries of `crates/venv/backend/env/` were indexed, because
+      // the `pyvenv.cfg` that would have excluded them was two levels below the
+      // point the walk gave up.
+      //
+      // It is the same decision as anchoring the default pattern — what makes
+      // an environment is its marker and not its name — and holding one without
+      // the other left the rule true in the list and false in the walk.
+      fixture = createFixtureProject("ignore-env-under-venv");
+      fs.mkdirSync(path.join(fixture.root, "crates", "venv", "backend", "env"), { recursive: true });
+      fs.writeFileSync(
+        path.join(fixture.root, "crates", "venv", "backend", "env", "pyvenv.cfg"),
+        "home = /usr\nversion = 3.12.0\n",
+      );
+
+      const ig = createIgnoreFilter(fixture.root);
+
+      expect(shouldIgnore(ig, "crates/venv/backend/env/lib/dep.py")).toBe(true);
+      // And the source around it stays, which is the half a broader skip would
+      // have taken with it.
+      expect(shouldIgnore(ig, "crates/venv/backend/main.rs")).toBe(false);
+    });
+
     it("keeps a nested directory named venv, which carries no pyvenv.cfg", () => {
       // The twin of the test above, and it was missing: `env` and `venv` were
       // anchored together in one change, and only `env` had a proof. Putting
@@ -212,6 +260,38 @@ describe("ignore", () => {
       const ig = createIgnoreFilter(fixture.root);
       expect(shouldIgnore(ig, "pkg/internal/venv/loader.go")).toBe(false);
       expect(shouldIgnore(ig, "pkg/internal/venv/loader_test.go")).toBe(false);
+    });
+
+    it("does not walk a root-level venv the defaults already exclude", () => {
+      // Review finding. `/venv` and `/env` exclude those names at the root
+      // whether or not a marker is inside, so descending into one looks for a
+      // marker in a directory already gone — and a virtualenv old enough to
+      // have written no `pyvenv.cfg` was walked down to its `site-packages`,
+      // reading `.gitignore` files for nothing. The filter cannot show the
+      // difference; which directories were read can.
+      fixture = createFixtureProject("ignore-root-venv-not-walked");
+      const sitePackages = path.join(fixture.root, "venv", "lib", "python3.12", "site-packages");
+      fs.mkdirSync(sitePackages, { recursive: true });
+      fs.writeFileSync(path.join(sitePackages, ".gitignore"), "*.pyc\n");
+      // A sibling module of the same name one level down is still walked.
+      fs.mkdirSync(path.join(fixture.root, "pkg", "venv"), { recursive: true });
+
+      const read: string[] = [];
+      const readdir = fs.readdirSync;
+      const spy = vi.spyOn(fs, "readdirSync").mockImplementation(((dir: fs.PathLike, opts?: unknown) => {
+        read.push(String(dir));
+        return (readdir as (d: fs.PathLike, o?: unknown) => unknown)(dir, opts);
+      }) as typeof fs.readdirSync);
+      try {
+        const ig = createIgnoreFilter(fixture.root);
+        expect(shouldIgnore(ig, "venv/lib/python3.12/site-packages/dep.py")).toBe(true);
+        expect(shouldIgnore(ig, "pkg/venv/loader.go")).toBe(false);
+      } finally {
+        spy.mockRestore();
+      }
+
+      expect(read.some((dir) => dir.startsWith(path.join(fixture.root, "venv")))).toBe(false);
+      expect(read).toContain(path.join(fixture.root, "pkg", "venv"));
     });
 
     it("finds a virtualenv even with RESPECT_GITIGNORE=false", () => {

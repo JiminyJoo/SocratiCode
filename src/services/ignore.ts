@@ -204,15 +204,44 @@ function scanNestedIgnoreSources(
     // whole, and a discarded source file costs far more than a kept one.
     if (isFile(path.join(dirPath, "pyvenv.cfg")) || isDirectory(path.join(dirPath, "conda-meta"))) {
       const relDir = path.relative(rootPath, dirPath).split(path.sep).join("/");
-      if (relDir) ig.add(`${escapeIgnorePattern(relDir)}/`);
+      // Anchored with a leading slash, because a gitignore pattern carrying no
+      // slash of its own matches that name at **every** depth. An environment
+      // sitting directly under the root produces exactly such a pattern — its
+      // relative path is a bare name — so a root-level `toolbox/` was deleting
+      // `packages/app/toolbox/` too, in any language.
+      //
+      // It also undid this file's own reason for existing: with a root-level
+      // `env/` present, the pattern `env/` came back and excluded
+      // `clap_complete/src/env/mod.rs` again, which is the case the anchoring
+      // of the defaults above was written to keep. Verified against the
+      // installed `ignore` package: `env/` matches that path, `/env/` does not,
+      // and both still catch `env/lib/dep.py` at the root.
+      if (relDir) ig.add(`/${escapeIgnorePattern(relDir)}/`);
       continue;
     }
 
-    // Skip directories we know should be ignored
+    // Skip directories we know should be ignored.
+    //
+    // `venv` is not among them by name any more, and that is the same decision
+    // as anchoring the default patterns rather than a separate one. Skipping it
+    // wherever it stood stopped this walk at any directory so called, so it never reached
+    // the marker of a real environment nested under one:
+    // `crates/venv/backend/env/` had its installed libraries indexed, because
+    // the walk turned back two levels above the `pyvenv.cfg` that would have
+    // excluded them, and a nested `.gitignore` below it stopped being read.
+    //
+    // `.venv` stays: the default patterns ignore that spelling at every depth,
+    // so descending into it would look for a marker in a directory already
+    // gone. The same argument holds for `venv` and `env` directly under the
+    // root, which `/venv` and `/env` above already exclude — a virtualenv old
+    // enough to have written no `pyvenv.cfg` would otherwise be walked to its
+    // `site-packages` reading `.gitignore` files for nothing. Only at the root:
+    // one level down those names are ordinary modules again.
     if (dirName === "node_modules" || dirName === ".git" || dirName === ".svn" ||
         dirName === ".hg" || dirName === "dist" || dirName === "build" ||
-        dirName === "__pycache__" || dirName === ".venv" || dirName === "venv" ||
-        dirName === "target" || dirName === ".gradle" || dirName === ".next") {
+        dirName === "__pycache__" || dirName === ".venv" ||
+        dirName === "target" || dirName === ".gradle" || dirName === ".next" ||
+        (currentPath === rootPath && (dirName === "venv" || dirName === "env"))) {
       continue;
     }
 
