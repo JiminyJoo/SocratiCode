@@ -1042,6 +1042,33 @@ describe("buildCodeGraph — Rust edges rustc rejects", () => {
     ).toBe(true);
   });
 
+  it("inherits nothing where the member declares the dependency itself", async () => {
+    // A member that writes its own entry inherits nothing, even where the
+    // workspace happens to declare the same name with a `path`. Checked on
+    // cargo 1.98.0 with a `compile_error!` in the member: `cargo check -p app`
+    // builds `log v0.4.34` from the registry and stays clean.
+    //
+    // Without the `workspace === true` guard on the inherited answer, the
+    // workspace's entry would decide for a member that never asked — and the
+    // whole point of reading the manifest is that a dependency with no `path`
+    // is a different crate, whatever the project holds under that name.
+    const graph = await graphOf({
+      "Cargo.toml": [
+        '[workspace]\nmembers = ["crates/app", "crates/log"]\nresolver = "2"\n',
+        '[workspace.dependencies]\nlog = { path = "crates/log" }\n',
+      ].join("\n"),
+      "crates/app/Cargo.toml": [
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        '[dependencies]\nlog = { version = "0.4" }\n',
+      ].join("\n"),
+      "crates/app/src/lib.rs": 'use log::info;\n\npub fn shout() { info!("from the registry"); }',
+      "crates/log/Cargo.toml": '[package]\nname = "log"\nversion = "0.1.0"\nedition = "2021"\n',
+      "crates/log/src/lib.rs": 'compile_error!("never in scope for app");',
+    });
+
+    expect(graph.edges.some((e) => e.target === "crates/log/src/lib.rs")).toBe(false);
+  });
+
   it("reaches a project crate a [patch] sends a registry name to", async () => {
     // The same manifest, one section added, and cargo changes its answer with
     // the graph: `[patch.crates-io] log = { path = … }` builds `log v0.4.34`
