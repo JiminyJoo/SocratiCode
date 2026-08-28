@@ -1013,6 +1013,10 @@ describe("buildCodeGraph — Rust edges rustc rejects", () => {
       "crates/log/src/lib.rs": 'compile_error!("never in scope for app");',
     });
 
+    // The absence is the assertion, so the file that would draw the edge has to
+    // be in the graph for the absence to mean anything: a walk that never
+    // reached it would satisfy the line below just as well.
+    expect(graph.nodes.some((n) => n.relativePath === "crates/app/src/lib.rs")).toBe(true);
     expect(graph.edges.some((e) => e.target === "crates/log/src/lib.rs")).toBe(false);
   });
 
@@ -1066,7 +1070,39 @@ describe("buildCodeGraph — Rust edges rustc rejects", () => {
       "crates/log/src/lib.rs": 'compile_error!("never in scope for app");',
     });
 
+    expect(graph.nodes.some((n) => n.relativePath === "crates/app/src/lib.rs")).toBe(true);
     expect(graph.edges.some((e) => e.target === "crates/log/src/lib.rs")).toBe(false);
+  });
+
+  it("inherits a dash-named dependency under the name the source writes", async () => {
+    // Cargo turns dashes into underscores for the importable name, so the
+    // manifest says `my-log` and the source says `my_log`. Both sides of the
+    // inheritance normalise, and nothing proved they normalise the same way:
+    // looking the workspace's answer up under the raw manifest key instead of
+    // the normalised one silently drops the edge, and every other test here
+    // uses a name with no dash, where the two spellings coincide.
+    //
+    // Checked on cargo 1.98.0: `cargo check -p app` compiles the member
+    // `my-log v0.1.0` and then `app`, which imports it as `my_log`.
+    const graph = await graphOf({
+      "Cargo.toml": [
+        '[workspace]\nmembers = ["crates/app", "crates/my-log"]\nresolver = "2"\n',
+        '[workspace.dependencies]\nmy-log = { path = "crates/my-log" }\n',
+      ].join("\n"),
+      "crates/app/Cargo.toml": [
+        '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n',
+        "[dependencies]\nmy-log = { workspace = true }\n",
+      ].join("\n"),
+      "crates/app/src/lib.rs": "use my_log::marker;\n\npub fn go() -> marker::Local { marker::Local }",
+      "crates/my-log/Cargo.toml": '[package]\nname = "my-log"\nversion = "0.1.0"\nedition = "2021"\n',
+      "crates/my-log/src/lib.rs": "pub mod marker { pub struct Local; }",
+    });
+
+    expect(
+      graph.edges.some(
+        (e) => e.source === "crates/app/src/lib.rs" && e.target === "crates/my-log/src/lib.rs",
+      ),
+    ).toBe(true);
   });
 
   it("reaches a project crate a [patch] sends a registry name to", async () => {
