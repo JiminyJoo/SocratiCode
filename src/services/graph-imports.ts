@@ -812,7 +812,7 @@ function importKey(imp: ImportInfo): string {
     imp.isModuleDeclaration ?? "",
     imp.declaredName ?? "",
     imp.fromInlineBlock ?? "",
-  ].join(" ");
+  ].join("\0");
 }
 
 /**
