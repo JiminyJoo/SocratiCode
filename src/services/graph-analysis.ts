@@ -68,6 +68,85 @@ export function isImportResolutionLow(edgeCount: number, importCount?: number): 
 }
 
 /**
+ * Numeric release segments of a version string, or null when it does not read
+ * as one. Any prerelease or build suffix is dropped, so `1.13.0-beta.1` and
+ * `1.13.0` compare equal — deliberately: the question here is whether a graph
+ * predates a shipped resolver, and a prerelease of the same release carries the
+ * same ones.
+ */
+function releaseSegments(version: string): number[] | null {
+  const core = version.trim().replace(/^v/, "").split(/[-+]/)[0];
+  const parts = core.split(".");
+  // No floor check: split always yields at least one element, and the digit
+  // test below is what rejects the empty string it yields for empty input.
+  if (parts.length > 4) return null;
+  if (!parts.every((part) => /^\d+$/.test(part))) return null;
+  return parts.map(Number);
+}
+
+/**
+ * Whether a persisted graph was built by an older release than the one now
+ * serving it.
+ *
+ * A graph is stored once and served unchanged until something rebuilds it, so
+ * an upgrade leaves the old artifact in place: the new binary answers queries
+ * from a graph whose edges were resolved by the old one. Every signal a user
+ * can read says healthy — `codebase_about` reports the new version because that
+ * is the running binary, status reports READY because a graph exists — so a
+ * graph cut before a language's resolver shipped is indistinguishable from that
+ * resolver being broken. That cost a real bug report (issue #120), where a
+ * 27-day-old graph built four days before PSR-4 resolution existed was measured
+ * as a live defect in the current release.
+ *
+ * Returns false when either version is absent or unparseable: a graph persisted
+ * before the stamp existed is unknown rather than stale, which the caller says
+ * in its own words instead of guessing.
+ */
+export function isGraphBuilderStale(
+  builtByVersion: string | undefined,
+  runningVersion: string,
+): boolean {
+  if (!builtByVersion) return false;
+  const built = releaseSegments(builtByVersion);
+  const running = releaseSegments(runningVersion);
+  if (!built || !running) return false;
+  for (let i = 0; i < Math.max(built.length, running.length); i++) {
+    const a = built[i] ?? 0;
+    const b = running[i] ?? 0;
+    if (a !== b) return a < b;
+  }
+  return false;
+}
+
+/**
+ * The `Built by:` lines for `codebase_graph_status`: which build produced the
+ * graph being served, and whether that is the build now answering.
+ *
+ * Warns rather than rebuilding. A rebuild is minutes of work on a large repo
+ * and is the user's call, not a status call's side effect — and the reason to
+ * surface this at all is that the user had no way to tell a stale artifact from
+ * a broken resolver, which a sentence fixes.
+ */
+export function describeGraphBuilder(
+  builtByVersion: string | undefined,
+  runningVersion: string,
+): string[] {
+  if (!builtByVersion) {
+    return [
+      "Built by: unknown (persisted before the builder version was recorded)",
+      `  Run codebase_graph_build to rebuild with v${runningVersion} and confirm this graph reflects the current resolvers.`,
+    ];
+  }
+  if (isGraphBuilderStale(builtByVersion, runningVersion)) {
+    return [
+      `Built by: v${builtByVersion} — STALE, this server is v${runningVersion}`,
+      `  This graph's edges were resolved by the older build, so any resolver fix or language support added since v${builtByVersion} is absent from it. Run codebase_graph_build.`,
+    ];
+  }
+  return [`Built by: v${builtByVersion}`];
+}
+
+/**
  * Get dependencies for a specific file.
  * The input path is normalized to forward slashes so lookups succeed
  * regardless of whether the caller passes `/` or `\` separators.

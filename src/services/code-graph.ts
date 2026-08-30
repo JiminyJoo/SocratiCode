@@ -15,7 +15,7 @@ import { ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
-import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpPsr4Map, buildPythonManifests, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
+import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
 import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
@@ -40,7 +40,7 @@ import {
 } from "./symbol-graph-store.js";
 
 // Re-export analysis functions for external consumers
-export { findCircularDependencies, generateMermaidDiagram, getFileDependencies, getGraphStats, isImportResolutionLow } from "./graph-analysis.js";
+export { describeGraphBuilder, findCircularDependencies, generateMermaidDiagram, getFileDependencies, getGraphStats, isGraphBuilderStale, isImportResolutionLow } from "./graph-analysis.js";
 
 // createRequire needed to load native addon packages in ESM
 const esmRequire = createRequire(import.meta.url);
@@ -450,6 +450,10 @@ export async function getGraphStatus(projectPath: string): Promise<{
   /** Import specifiers captured across all files, resolved or not. Absent on
    * graphs persisted before this field was recorded. */
   importCount?: number;
+  /** SocratiCode version that built this graph, which is not necessarily the
+   * one serving it. Absent on graphs persisted before this field was
+   * recorded. */
+  builtByVersion?: string;
   cached: boolean;
   symbol?: {
     fileCount: number;
@@ -493,6 +497,7 @@ export async function getGraphStatus(projectPath: string): Promise<{
     nodeCount: meta.nodeCount,
     edgeCount: meta.edgeCount,
     importCount: meta.importCount,
+    builtByVersion: meta.builtByVersion,
     cached: graphCache.has(resolved),
     symbol,
   };
@@ -805,8 +810,16 @@ export async function buildCodeGraph(
   // does not happen to mirror the directory layout resolved to null — which is
   // all of them in a Composer monorepo, where each package declares its own
   // PSR-4 root under `packages/<name>/src`.
+  //
+  // The declaration-derived FQCN map backs it up. A package that registers its
+  // namespaces at run time (`$loader->addNamespace(...)`) and declares
+  // `"autoload": {}` has no map to read, so PSR-4 answers nothing for it and
+  // every one of its files stayed orphaned — the WordPress-plugin norm (issue
+  // #120). Consulted only after a PSR-4 miss, so the manifest stays the
+  // authority wherever one exists.
   const hasPhp = files.some((f) => path.extname(f).toLowerCase() === ".php");
   const phpPsr4Map = hasPhp ? buildPhpPsr4Map(resolvedPath) : undefined;
+  const phpFqcnMap = hasPhp ? buildPhpFqcnMap(fileSet, resolvedPath) : undefined;
 
   // Build a namespace lookup map for C# projects. Each `namespace X.Y.Z` block
   // (or file-scoped `namespace X.Y.Z;`) is recorded so `using X.Y.Z;` directives
@@ -989,7 +1002,7 @@ export async function buildCodeGraph(
       // Try to resolve to a project file
       // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
       const resolutionLanguage = imp.isCssImport ? "css" : language;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap);
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap);
       if (resolved) {
         node.dependencies.push(resolved);
 

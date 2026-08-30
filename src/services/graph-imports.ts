@@ -46,6 +46,106 @@ function extractCssImports(source: string): ImportInfo[] {
   return imports;
 }
 
+/**
+ * Split a PHP `use` statement body on the commas that separate its clauses,
+ * leaving the ones inside a `{…}` group alone.
+ *
+ * `use App\{User, Post}, Other\Thing;` is one declaration holding two clauses,
+ * and the group's internal commas separate members of the first clause rather
+ * than clauses of the statement. A plain `split(",")` cannot tell the two
+ * apart, and matching only the first clause is what dropped every name after
+ * the first comma.
+ */
+function splitPhpUseClauses(body: string): string[] {
+  const clauses: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of body) {
+    if (ch === "{") depth++;
+    else if (ch === "}") depth = Math.max(0, depth - 1);
+    else if (ch === "," && depth === 0) {
+      clauses.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  clauses.push(current);
+  return clauses.map((clause) => clause.trim()).filter(Boolean);
+}
+
+/**
+ * Every namespace path a PHP `use` declaration names.
+ *
+ * Handles the single (`use A\B;`), aliased (`use A\B as C;`), grouped
+ * (`use A\{B, C};`) and comma-list (`use A\B, A\C;`) forms, with the
+ * statement-level `function`/`const` modifiers stripped. A leading `\` on a
+ * fully-qualified name is left on the specifier — the resolver strips it, so
+ * `node.imports` keeps reporting what the source actually says.
+ */
+function phpUseSpecifiers(text: string): string[] {
+  const specs: string[] = [];
+  const body = text.replace(/^use\s+(?:function\s+|const\s+)?/, "").replace(/;\s*$/, "");
+
+  for (const clause of splitPhpUseClauses(body)) {
+    // Grouped: A\B\{C, D as E}
+    const group = clause.match(/^([\w\\]+)\\\{([^}]*)\}$/);
+    if (group) {
+      for (const member of group[2].split(",")) {
+        const name = member.trim().split(/\s+as\s+/)[0].trim();
+        if (name) specs.push(`${group[1]}\\${name}`);
+      }
+      continue;
+    }
+    // Single: A\B, \A\B, A\B as C
+    const single = clause.match(/^([\w\\]+)/);
+    if (single) specs.push(single[1].trim());
+  }
+
+  return specs;
+}
+
+/**
+ * The path a PHP `require`/`include` names, or null when it names nothing
+ * statically knowable.
+ *
+ * Two shapes are literal. A quoted path (`require './x.php'`) is taken as
+ * written. `__DIR__ . '/x.php'` and its `dirname(__FILE__)` spelling are
+ * compile-time constants naming the including file's own directory, so they
+ * are equivalent to a source-relative path and are emitted as one — which is
+ * what the resolver's relative branch already knows how to handle. This is
+ * the dominant include idiom in WordPress and in any plugin-style tree that
+ * predates Composer, and the previous regex could not match it: it required a
+ * quote immediately after `require`/`(`, so the `__DIR__ .` prefix killed the
+ * match and the statement produced no specifier at all.
+ *
+ * Anything else stays null rather than being guessed. `require ABSPATH .
+ * '/x.php'` and `require $base . '/x.php'` depend on a value this pass cannot
+ * know, and inventing a path from the literal tail alone would draw an edge to
+ * a file the code may never include.
+ *
+ */
+const PHP_REQUIRE_DIR_JOINED =
+  /(?:require|include)(?:_once)?\s*\(?\s*(?:__DIR__|dirname\s*\(\s*__FILE__\s*\))\s*\.\s*['"]([^'"]+)['"]/;
+const PHP_REQUIRE_QUOTED =
+  /(?:require|include)(?:_once)?\s*[(]?\s*['"]([^'"]+)['"]/;
+
+
+function phpRequireSpecifier(text: string): string | null {
+  const dirRelative = text.match(PHP_REQUIRE_DIR_JOINED);
+  if (dirRelative) {
+    // `__DIR__` is the directory itself, so the literal's leading separator is
+    // a joiner rather than an absolute-path anchor. `./` makes the result
+    // explicitly source-relative for the resolver; `__DIR__ . '/../lib/x.php'`
+    // becomes `./../lib/x.php`, which normalizes to the parent directory.
+    const rest = dirRelative[1].replace(/^\/+/, "");
+    return rest ? `./${rest}` : null;
+  }
+
+  const quoted = text.match(PHP_REQUIRE_QUOTED);
+  return quoted ? quoted[1] : null;
+}
+
 /** Extract JS/TS imports from an ast-grep root node. Shared by JS/TS and Svelte/Vue handlers. */
 function extractJsTsImportsFromNode(sgNode: ReturnType<ReturnType<typeof parse>["root"]>): ImportInfo[] {
   const imports: ImportInfo[] = [];
@@ -330,36 +430,16 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
         // use function App\Helpers\format;
         // use const App\Config\MAX;
         // use App\Models\{User, Post, Comment};
+        // use App\Models\User, App\Models\Post;
         for (const node of sgNode.findAll({ rule: { kind: "namespace_use_declaration" } })) {
-          const text = node.text();
-
-          // Grouped use: use App\Models\{User, Post};
-          const groupMatch = text.match(/^use\s+(?:function\s+|const\s+)?([\w\\]+)\\\{([^}]+)\}/);
-          if (groupMatch) {
-            const prefix = groupMatch[1];
-            const members = groupMatch[2].split(",");
-            for (const member of members) {
-              const name = member.trim().split(/\s+as\s+/)[0].trim();
-              if (name) {
-                imports.push({ moduleSpecifier: `${prefix}\\${name}`, isDynamic: false });
-              }
-            }
-            continue;
-          }
-
-          // Single use: use App\Models\User; or use App\Models\User as Alias;
-          const singleMatch = text.match(/^use\s+(?:function\s+|const\s+)?([\w\\]+)/);
-          if (singleMatch) {
-            imports.push({ moduleSpecifier: singleMatch[1].trim(), isDynamic: false });
+          for (const spec of phpUseSpecifiers(node.text())) {
+            imports.push({ moduleSpecifier: spec, isDynamic: false });
           }
         }
-        // require/require_once/include/include_once
+        // require/require_once/include/include_once, quoted or __DIR__-joined
         for (const node of sgNode.findAll({ rule: { kind: "expression_statement" } })) {
-          const text = node.text();
-          const match = text.match(/(?:require|include)(?:_once)?\s*[(]?\s*['"]([^'"]+)['"]/);
-          if (match) {
-            imports.push({ moduleSpecifier: match[1], isDynamic: false });
-          }
+          const spec = phpRequireSpecifier(node.text());
+          if (spec) imports.push({ moduleSpecifier: spec, isDynamic: false });
         }
         break;
       }

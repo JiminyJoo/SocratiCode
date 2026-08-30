@@ -607,6 +607,105 @@ use const App\\Config\\MAX_RETRIES;
       expect(specs).toContain("App\\Helpers\\formatDate");
       expect(specs).toContain("App\\Config\\MAX_RETRIES");
     });
+
+    it("extracts every name in a comma-separated use list", () => {
+      // Only the first name survived before: the single-use regex matched the
+      // head of the statement and the rest of the list was dropped silently.
+      const source = `<?php
+use App\\Models\\User, App\\Models\\Post;
+use function App\\Helpers\\first, App\\Helpers\\second;
+use App\\Models\\Role as R, App\\Models\\Team as T;
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      expect(specs).toContain("App\\Models\\User");
+      expect(specs).toContain("App\\Models\\Post");
+      expect(specs).toContain("App\\Helpers\\first");
+      expect(specs).toContain("App\\Helpers\\second");
+      expect(specs).toContain("App\\Models\\Role");
+      expect(specs).toContain("App\\Models\\Team");
+    });
+
+    it("does not split a group's members into separate clauses", () => {
+      // A group's internal commas separate members of one clause; the
+      // statement-level commas above separate clauses. Splitting a group on
+      // them yields `App\Models\{Alpha` and `Beta}`, neither of which names
+      // anything. (PHP rejects a group and a further clause in one statement,
+      // so the two forms only ever meet across statements, as here.)
+      const source = `<?php
+use App\\Models\\{Alpha, Beta};
+use App\\Services\\Payments, App\\Services\\Refunds;
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      expect(specs).toEqual([
+        "App\\Models\\Alpha",
+        "App\\Models\\Beta",
+        "App\\Services\\Payments",
+        "App\\Services\\Refunds",
+      ]);
+    });
+
+    it("handles a group split across lines", () => {
+      const source = `<?php
+use App\\Models\\{
+    User,
+    Post,
+};
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      expect(specs).toEqual(["App\\Models\\User", "App\\Models\\Post"]);
+    });
+
+    it("keeps the leading backslash of a fully-qualified use", () => {
+      // Extraction reports what the source says; the resolver strips it.
+      const source = `<?php
+use \\App\\Models\\User;
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      expect(specs).toContain("\\App\\Models\\User");
+    });
+
+    it("extracts __DIR__-joined requires as source-relative paths", () => {
+      // The dominant include idiom outside Composer projects. The old regex
+      // demanded a quote right after require/(, so the __DIR__ prefix killed
+      // the match and these statements yielded nothing at all.
+      const source = `<?php
+require_once __DIR__ . '/inc/util.php';
+include __DIR__ . "/../lib/legacy.php";
+require_once(__DIR__ . '/bootstrap.php');
+require_once dirname(__FILE__) . '/old-school.php';
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      expect(specs).toContain("./inc/util.php");
+      expect(specs).toContain("./../lib/legacy.php");
+      expect(specs).toContain("./bootstrap.php");
+      expect(specs).toContain("./old-school.php");
+    });
+
+    it("extracts a bare require path unchanged", () => {
+      const source = `<?php
+require 'inc/util.php';
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      expect(specs).toContain("inc/util.php");
+    });
+
+    it("ignores a require joined to a constant or variable it cannot know", () => {
+      // ABSPATH and $base are run-time values. Taking the literal tail alone
+      // would invent a path the code may never include.
+      const source = `<?php
+require_once ABSPATH . '/wp-admin/includes/file.php';
+require_once $base . '/config.php';
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      expect(specs).toEqual([]);
+    });
   });
 
   // ── Ruby ───────────────────────────────────────────────────────────────

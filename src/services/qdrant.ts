@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import { createHash } from "node:crypto";
 import { QdrantClient } from "@qdrant/js-client-rest";
-import { QDRANT_API_KEY, QDRANT_COLLECTION_PREFIX, QDRANT_HOST, QDRANT_PORT, QDRANT_URL, resolveQdrantPort } from "../constants.js";
+import { QDRANT_API_KEY, QDRANT_COLLECTION_PREFIX, QDRANT_HOST, QDRANT_PORT, QDRANT_URL, resolveQdrantPort, SOCRATICODE_VERSION } from "../constants.js";
 import type { ArtifactIndexState, CodeGraph, FileChunk, SearchResult } from "../types.js";
 import { getEmbeddingConfig } from "./embedding-config.js";
 import { generateEmbeddings, generateQueryEmbedding, prepareDocumentText } from "./embeddings.js";
@@ -908,6 +908,15 @@ export async function saveGraphData(
           collectionName: graphCollName,
           projectPath,
           lastBuiltAt: new Date().toISOString(),
+          // Which build produced this graph, as opposed to which one is
+          // serving it. A persisted graph is served unchanged across upgrades,
+          // so a graph cut before a resolver shipped keeps answering as if that
+          // resolver did not exist — while `codebase_about` truthfully reports
+          // the new version and status reports READY. Without this field the
+          // two are indistinguishable, and a stale artifact reads as a live
+          // resolver defect (issue #120). Graphs persisted before this field
+          // existed simply omit it.
+          builtByVersion: SOCRATICODE_VERSION,
           nodeCount: graph.nodes.length,
           edgeCount: graph.edges.length,
           importCount,
@@ -957,6 +966,9 @@ export async function getGraphMetadata(graphCollName: string): Promise<{
   edgeCount: number;
   /** Absent on graphs persisted before this field was recorded. */
   importCount?: number;
+  /** SocratiCode version that built this graph. Absent on graphs persisted
+   * before this field was recorded. */
+  builtByVersion?: string;
 } | null> {
   try {
     await ensureMetadataCollection();
@@ -977,6 +989,7 @@ export async function getGraphMetadata(graphCollName: string): Promise<{
       nodeCount: payload?.nodeCount as number,
       edgeCount: payload?.edgeCount as number,
       importCount: payload?.importCount as number | undefined,
+      builtByVersion: payload?.builtByVersion as string | undefined,
     };
   } catch (err) {
     logger.warn("getGraphMetadata failed (returning null)", {

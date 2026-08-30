@@ -2,10 +2,12 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import { describe, expect, it } from "vitest";
 import {
+  describeGraphBuilder,
   findCircularDependencies,
   generateMermaidDiagram,
   getFileDependencies,
   getGraphStats,
+  isGraphBuilderStale,
   isImportResolutionLow,
   LOW_IMPORT_RESOLUTION_MIN_IMPORTS,
 } from "../../src/services/graph-analysis.js";
@@ -406,6 +408,78 @@ describe("graph-analysis", () => {
       // importCount post-dates existing graphs; those print nothing until the
       // next rebuild rather than being guessed at.
       expect(isImportResolutionLow(0, undefined)).toBe(false);
+    });
+  });
+
+  describe("isGraphBuilderStale", () => {
+    it("flags a graph built by an earlier release", () => {
+      // The issue #120 case: a graph cut by v1.10.0 and served by v1.12.0,
+      // four days and one shipped resolver apart, with every visible signal
+      // reporting the server rather than the artifact.
+      expect(isGraphBuilderStale("1.10.0", "1.12.0")).toBe(true);
+      expect(isGraphBuilderStale("1.12.0", "1.12.1")).toBe(true);
+      expect(isGraphBuilderStale("0.9.9", "1.0.0")).toBe(true);
+    });
+
+    it("does not flag a matching or newer builder", () => {
+      expect(isGraphBuilderStale("1.12.0", "1.12.0")).toBe(false);
+      // A downgrade: unusual, but the graph is not missing anything the
+      // running build has.
+      expect(isGraphBuilderStale("1.13.0", "1.12.0")).toBe(false);
+    });
+
+    it("compares segments numerically, not as text", () => {
+      expect(isGraphBuilderStale("1.9.0", "1.10.0")).toBe(true);
+      expect(isGraphBuilderStale("1.10.0", "1.9.0")).toBe(false);
+    });
+
+    it("treats absent segments as zero", () => {
+      expect(isGraphBuilderStale("1.12", "1.12.1")).toBe(true);
+      expect(isGraphBuilderStale("1.12", "1.12.0")).toBe(false);
+    });
+
+    it("says nothing when the stamp is absent on an older persisted graph", () => {
+      // Unknown is not stale. The caller says so in its own words and points
+      // at a rebuild, rather than claiming a version it does not have.
+      expect(isGraphBuilderStale(undefined, "1.12.0")).toBe(false);
+      expect(isGraphBuilderStale("", "1.12.0")).toBe(false);
+    });
+
+    it("says nothing when either version does not read as a release", () => {
+      expect(isGraphBuilderStale("dev", "1.12.0")).toBe(false);
+      expect(isGraphBuilderStale("1.12.0", "unknown")).toBe(false);
+      expect(isGraphBuilderStale("1.2.3.4.5", "1.12.0")).toBe(false);
+    });
+
+    it("ignores prerelease and build suffixes", () => {
+      // A prerelease of a release carries that release's resolvers, so it is
+      // not behind it.
+      expect(isGraphBuilderStale("1.13.0-beta.1", "1.13.0")).toBe(false);
+      expect(isGraphBuilderStale("v1.11.0", "1.12.0+build.7")).toBe(true);
+    });
+  });
+
+  describe("describeGraphBuilder", () => {
+    it("states the builder and nothing more when it matches the server", () => {
+      expect(describeGraphBuilder("1.12.0", "1.12.0")).toEqual(["Built by: v1.12.0"]);
+    });
+
+    it("names both versions and points at a rebuild when the graph is behind", () => {
+      const lines = describeGraphBuilder("1.10.0", "1.12.0");
+      expect(lines[0]).toContain("Built by: v1.10.0");
+      expect(lines[0]).toContain("STALE");
+      expect(lines[0]).toContain("this server is v1.12.0");
+      expect(lines[1]).toContain("codebase_graph_build");
+    });
+
+    it("says unknown, not stale, for a graph persisted before the stamp existed", () => {
+      // The exact case the stamp was added for: claiming a version here would
+      // be inventing one. Saying it is unrecorded, and that a rebuild settles
+      // it, is the whole of what is known.
+      const lines = describeGraphBuilder(undefined, "1.12.0");
+      expect(lines[0]).toContain("unknown");
+      expect(lines[0]).not.toContain("STALE");
+      expect(lines[1]).toContain("codebase_graph_build");
     });
   });
 });

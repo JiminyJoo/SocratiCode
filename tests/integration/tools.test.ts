@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { SOCRATICODE_VERSION } from "../../src/constants.js";
 import { invalidateGraphCache, rebuildGraph } from "../../src/services/code-graph.js";
 import { stopAllWatchers } from "../../src/services/watcher.js";
 import { handleContextTool } from "../../src/tools/context-tools.js";
@@ -201,6 +202,23 @@ describe("graph tool handlers", () => {
         invalidateGraphCache(proj.root);
         proj.cleanup();
       }
+    });
+  });
+
+  describe("codebase_graph_status builder version (#120)", () => {
+    it("reports the version that built the graph now being served", async () => {
+      // A persisted graph outlives the binary that wrote it, and every other
+      // signal in this output describes the server: READY because a graph
+      // exists, and codebase_about's version because that is what is running.
+      // The three rendered forms are unit-tested; what this pins is that the
+      // stamp survives the round trip through storage and reaches the output.
+      const result = await handleGraphTool("codebase_graph_status", {
+        projectPath: fixture.root,
+      });
+
+      expect(result).toContain(`Built by: v${SOCRATICODE_VERSION}`);
+      expect(result).not.toContain("STALE");
+      expect(result).not.toContain("Built by: unknown");
     });
   });
 
