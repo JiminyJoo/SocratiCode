@@ -268,7 +268,7 @@ const PHP_NAMESPACE_SHAPE =
 /**
  * One regex hit in a PHP source file: the name it captured and the offset it
  * was found at. Used for both passes below — the `namespace` declarations and
- * the `class`/`interface`/`trait` ones — because attributing the second
+ * the `class`/`interface`/`trait`/`enum` ones — because attributing the second
  * to the first is purely a matter of comparing their offsets.
  */
 interface PhpSourceMatch {
@@ -329,13 +329,16 @@ export function buildPhpFqcnMap(
   // `namespace Foo\Bar;` (file-scoped) and `namespace Foo\Bar {` (braced).
   const namespaceRegex =
     /^[ \t]*namespace\s+([A-Za-z_\x80-\uFFFF][\w\x80-\uFFFF]*(?:\\[A-Za-z_\x80-\uFFFF][\w\x80-\uFFFF]*)*)\s*[;{]/gm;
+  // Enums are autoloadable and `use`-imported exactly as classes are, so they
+  // belong in a map whose job is answering "which file declares this name".
+  //
   // A declaration starts its line, or follows an opening brace on one — the
   // braced namespace form puts the two together as `namespace A { class B`.
   // Requiring one or the other is what rejects the near-misses: ` * class Foo`
   // in a doc block, `// class Foo`, `"class Foo"` in a string, and the
   // anonymous `new class {}`, none of which declare a name to import.
   const declarationRegex =
-    /(?:^|\{)[ \t]*(?:(?:final|abstract|readonly)\s+)*(?:class|interface|trait)\s+([A-Za-z_\x80-\uFFFF][\w\x80-\uFFFF]*)/gm;
+    /(?:^|\{)[ \t]*(?:(?:final|abstract|readonly)\s+)*(?:class|interface|trait|enum)\s+([A-Za-z_\x80-\uFFFF][\w\x80-\uFFFF]*)/gm;
 
   const phpFiles = [...fileSet]
     .filter((f) => path.extname(f).toLowerCase() === ".php")
@@ -1363,8 +1366,18 @@ export function resolveImport(
               bestPrefix = prefix;
             }
           }
-          if (bestPrefix) {
-            const relative = namespaced.slice(bestPrefix.length).replace(/\\/g, "/");
+          // An exact prefix match leaves nothing to look up: the specifier
+          // names the prefix's own base directory, not a file in it. Composer
+          // rejects a PSR-4 prefix that does not end in a separator, so this
+          // needs a hand-edited manifest — but left unguarded, `use Foo;`
+          // against a `"Foo": "src/"` entry probes the bare directory, and
+          // resolveRelativePath's extension and index fallbacks land it on
+          // `src.php` or `src/index.php`: a wrong edge rather than a missing
+          // one.
+          const relative = bestPrefix
+            ? namespaced.slice(bestPrefix.length).replace(/\\/g, "/")
+            : "";
+          if (bestPrefix && relative) {
             for (const dir of phpPsr4Map.get(bestPrefix) ?? []) {
               const candidate = dir ? `${dir}/${relative}` : relative;
               const hit = resolveRelativePath(candidate, projectPath, projectPath, fileSet, [".php"]);

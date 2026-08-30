@@ -999,7 +999,7 @@ Supports 18+ languages including TypeScript, JavaScript, Python, Java, Kotlin, G
 | `buildCsNamespaceMap` | `(fileSet, projectPath) → Map<string, string[]>` | C#: `namespace X.Y` declarations → contributing files, resolving `using` directives |
 | `buildGoModuleInfo` | `(fileSet, projectPath) → GoModuleInfo[]` | Go: one entry per `go.mod` (root and nested), package dir → representative file |
 | `buildPhpPsr4Map` | `(projectPath) → Map<string, string[]>` | PHP: PSR-4 prefix → base dirs from every in-repo `composer.json` (`autoload` + `autoload-dev`) |
-| `buildPhpFqcnMap` | `(fileSet, projectPath) → Map<string, string[]>` | PHP: declared FQCN (`namespace` + class/interface/trait) → declaring files, consulted after a PSR-4 miss so packages with a runtime autoloader still resolve |
+| `buildPhpFqcnMap` | `(fileSet, projectPath) → Map<string, string[]>` | PHP: declared FQCN (`namespace` + class/interface/trait/enum) → declaring files, consulted after a PSR-4 miss so packages with a runtime autoloader still resolve |
 | `buildDartPackageMap` | `(projectPath) → Map<string, string>` | Dart: package name → package root from every `pubspec.yaml`; `package:<name>/<rest>` resolves to `<root>/lib/<rest>` |
 | `buildPythonManifests` | `(projectPath) → PythonManifest[]` | Python: one entry per `pyproject.toml` with its import roots and declared uv workspace members |
 | `pythonRootsForFile` | `(manifests, relSourceDir) → string[]` | Python: the import roots that apply to one file, ancestry- and membership-scoped, nearest first |

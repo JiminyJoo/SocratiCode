@@ -47,6 +47,7 @@ namespace Acme\\Schema;
 
 interface Storable {}
 trait Timestamps {}
+enum Status: string { case Active = 'active'; }
 `);
     // Two namespaces in one file, braced form.
     write("plugin/src/acme/Mixed.php", `<?php
@@ -92,9 +93,9 @@ class Real {
     expect(resolve("Acme\\Schema\\RoleSchema")).toBe("plugin/src/acme/schema/RoleSchema.php");
   });
 
-  it("registers interfaces and traits alongside classes", () => {
+  it("registers interfaces, traits and enums alongside classes", () => {
     const map = buildPhpFqcnMap(fileSet, root);
-    for (const name of ["Storable", "Timestamps"]) {
+    for (const name of ["Storable", "Timestamps", "Status"]) {
       expect(map.get(`Acme\\Schema\\${name}`)).toEqual(["plugin/src/acme/schema/Contracts.php"]);
     }
   });
@@ -157,6 +158,28 @@ class Real {
       expect(result).not.toBe("elsewhere/Other.php");
     } finally {
       rmSync(decoy, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores a PSR-4 prefix the specifier matches exactly", () => {
+    // A prefix with no trailing separator is not valid PSR-4 and Composer
+    // rejects it, but a hand-edited manifest can carry one. The remainder is
+    // then empty, and probing the bare base directory lands on `src.php` or
+    // `src/index.php` through resolveRelativePath's fallbacks — a wrong edge.
+    const bare = mkdtempSync(path.join(tmpdir(), "php-fqcn-bare-"));
+    try {
+      const set = new Set(["src.php", "src/index.php"]);
+      for (const rel of set) {
+        const abs = path.join(bare, rel);
+        mkdirSync(path.dirname(abs), { recursive: true });
+        writeFileSync(abs, "<?php\n");
+      }
+      expect(resolveImport(
+        "Foo", path.join(bare, "caller.php"), bare, set, "php",
+        undefined, undefined, undefined, undefined, new Map([["Foo", ["src"]]]),
+      )).toBeNull();
+    } finally {
+      rmSync(bare, { recursive: true, force: true });
     }
   });
 

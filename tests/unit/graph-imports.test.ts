@@ -695,6 +695,66 @@ require 'inc/util.php';
       expect(specs).toContain("inc/util.php");
     });
 
+    it("extracts a require in return position", () => {
+      // `return require __DIR__ . '/x.php';` is a return_statement, not an
+      // expression_statement, and it is the standard shape of a config or
+      // route file. Scanning only expression statements dropped all of them.
+      const source = `<?php
+return require __DIR__ . '/config.php';
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      expect(specs).toEqual(["./config.php"]);
+    });
+
+    it("extracts an include from any expression position", () => {
+      // Matching the include expressions themselves rather than a list of
+      // statement kinds means assignment, return, conditional and
+      // error-suppressed forms all come along without being enumerated.
+      const source = `<?php
+$c = include 'assigned.php';
+@include('suppressed.php');
+if (true) { include_once 'conditional.php'; }
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      // Document order, not grouped by construct kind.
+      expect(specs).toEqual(["assigned.php", "suppressed.php", "conditional.php"]);
+    });
+
+    it("does not mistake a method named after the construct for an include", () => {
+      // `require` is a language construct, but nothing stops a method being
+      // named after one, and `$loader->require('x.php')` includes no file.
+      const source = `<?php
+class Loader {
+    public function boot($loader) {
+        $loader->require('not-an-include.php');
+        $loader->include_once("also-not.php");
+        return Registry::require('nope.php');
+    }
+}
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      expect(specs).toEqual([]);
+    });
+
+    it("does not read an include out of a comment or a string", () => {
+      // Both were real: this project's own tests carry Blade directives in
+      // string literals, and its comments say things like "does NOT include
+      // 'event'" — the old statement-text scan turned both into specifiers.
+      const source = `<?php
+// The ENUM does NOT include 'event' before the migration runs.
+function template(): string {
+    return "@include('partials/related-element-hosts')";
+}
+$msg = "remember to include 'legislative_session' here";
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      expect(specs).toEqual([]);
+    });
+
     it("ignores a require joined to a constant or variable it cannot know", () => {
       // ABSPATH and $base are run-time values. Taking the literal tail alone
       // would invent a path the code may never include.

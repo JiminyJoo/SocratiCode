@@ -124,12 +124,38 @@ function phpUseSpecifiers(text: string): string[] {
  * know, and inventing a path from the literal tail alone would draw an edge to
  * a file the code may never include.
  *
+ * Both patterns are anchored, because the text handed to them is one
+ * include/require expression node rather than a whole statement — see
+ * PHP_REQUIRE_KINDS.
  */
 const PHP_REQUIRE_DIR_JOINED =
-  /(?:require|include)(?:_once)?\s*\(?\s*(?:__DIR__|dirname\s*\(\s*__FILE__\s*\))\s*\.\s*['"]([^'"]+)['"]/;
+  /^(?:require|include)(?:_once)?\s*\(?\s*(?:__DIR__|dirname\s*\(\s*__FILE__\s*\))\s*\.\s*['"]([^'"]+)['"]/;
 const PHP_REQUIRE_QUOTED =
-  /(?:require|include)(?:_once)?\s*[(]?\s*['"]([^'"]+)['"]/;
+  /^(?:require|include)(?:_once)?\s*[(]?\s*['"]([^'"]+)['"]/;
 
+/**
+ * The AST node kinds PHP's four include constructs produce.
+ *
+ * Matching these rather than scanning statement text is what keeps the pattern
+ * off everything that merely reads like an include. The parser has already
+ * decided what is code: a comment saying "does NOT include 'event'", a string
+ * holding a Blade directive (`"@include('partials/card')"`), and a method
+ * named after the construct (`$loader->require('x.php')`) produce no node here,
+ * while `@include('x.php')` — the error-suppressed form, which is real — still
+ * does. Scanning `expression_statement` text matched the first three and was
+ * the source of every junk specifier this extractor produced.
+ *
+ * It also removes the need to enumerate the statements an include can sit in.
+ * `return require __DIR__ . '/config.php';` is a return_statement and
+ * `$c = include 'c.php';` an expression_statement; as expressions they are the
+ * same node kind, so both are found without either being named.
+ */
+const PHP_REQUIRE_KINDS = [
+  "require_expression",
+  "require_once_expression",
+  "include_expression",
+  "include_once_expression",
+];
 
 function phpRequireSpecifier(text: string): string | null {
   const dirRelative = text.match(PHP_REQUIRE_DIR_JOINED);
@@ -436,8 +462,14 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
             imports.push({ moduleSpecifier: spec, isDynamic: false });
           }
         }
-        // require/require_once/include/include_once, quoted or __DIR__-joined
-        for (const node of sgNode.findAll({ rule: { kind: "expression_statement" } })) {
+        // require/require_once/include/include_once, quoted or __DIR__-joined,
+        // taken from the include expressions themselves. Collected across the
+        // four kinds and re-sorted by position, so the specifiers stay in
+        // document order rather than being grouped by construct.
+        const requireNodes = PHP_REQUIRE_KINDS
+          .flatMap((kind) => sgNode.findAll({ rule: { kind } }))
+          .sort((a, b) => a.range().start.index - b.range().start.index);
+        for (const node of requireNodes) {
           const spec = phpRequireSpecifier(node.text());
           if (spec) imports.push({ moduleSpecifier: spec, isDynamic: false });
         }
