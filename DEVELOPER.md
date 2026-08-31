@@ -373,7 +373,7 @@ When `codebase_index` is called:
 
 5. BATCHED EMBEDDING + UPSERT (50 files per batch)
    For each batch of files:
-   ├── Prepare text: "search_document: {relativePath}\n{content}" (default prefix; see EMBEDDING_DOCUMENT_PREFIX)
+   ├── Prepare text: "{documentPrefix}{relativePath}\n{content}" (prefix defaults to "search_document: ", see EMBEDDING_DOCUMENT_PREFIX; the path is dropped when EMBEDDING_DOCUMENT_INCLUDE_PATH=false)
    ├── Generate embeddings via configured provider (further batched internally)
    ├── Upsert to Qdrant with dense vector + BM25 text + payload
    ├── Update in-memory file hashes
@@ -782,7 +782,7 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 |----------|-----------|-------------|
 | `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings for the texts as given — batching and retries only, no prefixing (callers pass text from `prepareDocumentText`) |
 | `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding, prefixed with `search_query: ` (default; env-configurable via `EMBEDDING_QUERY_PREFIX`) |
-| `prepareDocumentText` | `(content, filePath) → string` | Build the text to embed: `search_document: ` prefix, then the relative path, then the content (prefix env-configurable via `EMBEDDING_DOCUMENT_PREFIX`) |
+| `prepareDocumentText` | `(content, filePath) → string` | Build the text to embed: `search_document: ` prefix, then the relative path, then the content (prefix env-configurable via `EMBEDDING_DOCUMENT_PREFIX`; the path is dropped when `EMBEDDING_DOCUMENT_INCLUDE_PATH=false`) |
 
 ### indexer.ts
 
