@@ -975,9 +975,11 @@ npx tsx scripts/benchmark-graph.ts /absolute/path/to/repo
 |--------|-----------|-------------|
 | `SocratiCodeConfig` | *(interface)* | Parsed `.socraticodecontextartifacts.json` shape: `{ artifacts?: ContextArtifact[] }` |
 | `loadConfig` | `(projectPath) → Promise<SocratiCodeConfig \| null>` | Load and validate config file (null if missing, throws on parse/validation errors) |
-| `readArtifactContent` | `(artifactPath, projectPath) → Promise<{ content, contentHash }>` | Read file or directory content with SHA-256 hash for staleness detection |
+| `ArtifactContent` | *(interface)* | One artifact's read result: `{ content, contentHash, exclusions }`. Accepted by `indexArtifact` so a caller that already read the artifact does not pay for a second read. |
+| `ArtifactExclusions` | *(interface)* | What a directory walk left out, by reason: `{ ignored, binary, unreadable }`. All zero for a single-file artifact. |
+| `readArtifactContent` | `(artifactPath, projectPath) → Promise<{ content, contentHash, exclusions }>` | Read file or directory content with SHA-256 hash for staleness detection. A directory walk skips dot-files, anything the ignore chain rejects (rooted at the artifact directory), and binary files (NUL byte in the first 8 KiB); `exclusions` counts what it left out, for the caller to log. A single-file path is read verbatim. |
 | `chunkArtifactContent` | `(content, artifactName, artifactPath) → ArtifactChunk[]` | Line-based chunking with overlap (same `CHUNK_SIZE`/`CHUNK_OVERLAP` as code) |
-| `indexArtifact` | `(projectPath, artifact, collection) → Promise<ArtifactIndexState>` | Index a single artifact: read → chunk → embed → upsert to Qdrant |
+| `indexArtifact` | `(projectPath, artifact, collection, preread?) → Promise<ArtifactIndexState>` | Index a single artifact: read → chunk → embed → upsert to Qdrant. Pass `preread` (an `ArtifactContent`) to skip the read; `ensureArtifactsIndexed` threads the content it hashed, so a re-index does not walk and re-read the directory a second time. |
 | `indexAllArtifacts` | `(projectPath) → Promise<{ indexed, errors }>` | Index all artifacts from config, saving metadata. Errors per-artifact, never throws. |
 | `ensureArtifactsIndexed` | `(projectPath) → Promise<{ reindexed, upToDate, errors }>` | Staleness check: compare content hashes, re-index only changed artifacts, remove deleted ones |
 | `searchArtifacts` | `(projectPath, query, artifactName?, limit?) → Promise<SearchResult[]>` | Hybrid semantic + BM25 search across context artifacts with optional name filter |

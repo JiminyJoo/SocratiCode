@@ -360,6 +360,223 @@ describe("readArtifactContent", () => {
   });
 });
 
+// ── readArtifactContent: directory exclusions ───────────────────────────
+//
+// A directory artifact used to embed whatever the walk found, including
+// compiled bytecode: `readFile(path, "utf-8")` never throws on binary input,
+// so the `catch` that was meant to skip it could not fire. These cover both
+// halves of the fix — the ignore chain and the binary guard — and pin the
+// boundaries each must not cross.
+
+describe("readArtifactContent — directory exclusions", () => {
+  /**
+   * A .pyc-shaped buffer: CPython magic, the NUL bytes of its header, a marshal
+   * byte that is not valid UTF-8, then a readable docstring. The docstring is
+   * the point — marshal keeps string constants legible, which is what BM25
+   * matched when bytecode reached the index.
+   */
+  const PYC_BYTES = Buffer.concat([
+    Buffer.from([0x6f, 0x0d, 0x0d, 0x0a, 0x00, 0x00, 0x00, 0x00, 0xe3, 0x00, 0x80]),
+    Buffer.from("upgrade the users table", "latin1"),
+  ]);
+
+  async function writeBytes(dir: string, relPath: string, buf: Buffer): Promise<void> {
+    const fullPath = path.join(dir, relPath);
+    await fsp.mkdir(path.dirname(fullPath), { recursive: true });
+    await fsp.writeFile(fullPath, buf);
+  }
+
+  it("applies all three ignore layers, with no binary involved", async () => {
+    const projectDir = await createTempProject({
+      "versions/001_init.py": "def upgrade(): pass",
+      // One fixture per layer, each matched by a pattern the other two layers
+      // do not carry, so a regression in any single layer fails this test.
+      "versions/coverage/report.txt": "COVERAGE_MARKER", // layer 1: defaults
+      "versions/__pycache__/001_init.txt": "PYCACHE_MARKER", // layer 1: defaults
+      "versions/.gitignore": "notes-draft.txt\n", // layer 2
+      "versions/notes-draft.txt": "GITIGNORE_MARKER",
+      "versions/.socraticodeignore": "scratch.txt\n", // layer 3
+      "versions/scratch.txt": "SCRATCH_MARKER",
+    });
+
+    // Layer 2 is env-gated; pin it on explicitly so neither a host shell
+    // setting nor the default in ignore.ts decides whether this test is
+    // exercising the .gitignore layer at all.
+    const originalEnv = process.env.RESPECT_GITIGNORE;
+    process.env.RESPECT_GITIGNORE = "true";
+    let content: string;
+    try {
+      ({ content } = await readArtifactContent("./versions", projectDir));
+    } finally {
+      if (originalEnv === undefined) {
+        delete process.env.RESPECT_GITIGNORE;
+      } else {
+        process.env.RESPECT_GITIGNORE = originalEnv;
+      }
+    }
+
+    expect(content).toContain("def upgrade()");
+    // Every excluded file here is plain text — the binary guard cannot be
+    // what removed them, so the chain is demonstrably live on its own.
+    expect(content).not.toContain("COVERAGE_MARKER");
+    expect(content).not.toContain("PYCACHE_MARKER");
+    expect(content).not.toContain("GITIGNORE_MARKER");
+    expect(content).not.toContain("SCRATCH_MARKER");
+    // dot: false — the ignore files themselves are never walked, so they
+    // cannot be embedded as artifact content.
+    expect(content).not.toContain(".socraticodeignore");
+    expect(content).not.toContain(".gitignore");
+  });
+
+  it("skips a top-level binary with no ignore pattern involved", async () => {
+    const projectDir = await createTempProject({
+      "specs/openapi.yaml": "openapi: 3.0.0",
+    });
+    // .bin matches nothing in the ignore chain — only the guard can drop it.
+    await writeBytes(projectDir, "specs/payload.bin", PYC_BYTES);
+
+    const { content } = await readArtifactContent("./specs", projectDir);
+    expect(content).toContain("openapi: 3.0.0");
+    expect(content).not.toContain("upgrade the users table");
+    expect(content).not.toContain("payload.bin");
+  });
+
+  it("keeps a latin1 text file rather than dropping it whole", async () => {
+    const projectDir = await createTempProject({});
+    // 0xE9 is "é" in latin1 and invalid UTF-8. A fatal decoder would reject the
+    // file entirely; the NUL sniff keeps it, losing only the undecodable byte.
+    await writeBytes(
+      projectDir,
+      "docs/notes.md",
+      Buffer.from("café architecture notes", "latin1"),
+    );
+
+    const { content } = await readArtifactContent("./docs", projectDir);
+    expect(content).toContain("architecture notes");
+    expect(content).toContain("caf");
+  });
+
+  it("skips UTF-16 with a BOM, matching the indexer's Stage-0 guard", async () => {
+    const projectDir = await createTempProject({
+      "specs/readable.yaml": "kind: Service",
+    });
+    await writeBytes(
+      projectDir,
+      "specs/utf16.yaml",
+      Buffer.from("\uFEFFkind: Deployment", "utf16le"),
+    );
+
+    const { content } = await readArtifactContent("./specs", projectDir);
+    expect(content).toContain("kind: Service");
+    // Assert on the per-file header, not on the UTF-16 text: decoded as UTF-8
+    // those bytes are NUL-interleaved, so a "kind: Deployment" substring check
+    // would pass whether the file was embedded or not.
+    expect(content).not.toContain("utf16.yaml");
+  });
+
+  it("still throws loudly for a directory of only binaries", async () => {
+    const projectDir = await createTempProject({});
+    await writeBytes(projectDir, "versions/a.bin", PYC_BYTES);
+    await writeBytes(projectDir, "versions/b.bin", PYC_BYTES);
+
+    await expect(readArtifactContent("./versions", projectDir)).rejects.toThrow(
+      "empty or contains no readable files",
+    );
+    // The throw names what went missing, so the failure is actionable.
+    await expect(readArtifactContent("./versions", projectDir)).rejects.toThrow("2 binary");
+  });
+
+  it("leaves a declared single-file binary artifact untouched", async () => {
+    const projectDir = await createTempProject({});
+    await writeBytes(projectDir, "blob.pyc", PYC_BYTES);
+
+    // A declared path is an explicit instruction: it must not gain a silent
+    // skip, even though the same bytes are excluded from a directory walk.
+    const { content, contentHash } = await readArtifactContent("./blob.pyc", projectDir);
+    expect(content).toContain("upgrade the users table");
+    expect(contentHash).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  it("lets a .socraticodeignore negation re-include a default-excluded directory", async () => {
+    const projectDir = await createTempProject({
+      // "env" is a built-in default pattern, but an artifact directory may
+      // legitimately hold per-environment manifests under that name.
+      "deploy/service.yaml": "kind: Service",
+      "deploy/env/prod.yaml": "PROD_MANIFEST_MARKER",
+      "deploy/.socraticodeignore": "!env\n",
+    });
+    const { content } = await readArtifactContent("./deploy", projectDir);
+    expect(content).toContain("PROD_MANIFEST_MARKER");
+  });
+
+  it("reports what it excluded, by reason", async () => {
+    const projectDir = await createTempProject({
+      "versions/001_init.py": "def upgrade(): pass",
+      "versions/coverage/report.txt": "COVERAGE_MARKER",
+    });
+    await writeBytes(projectDir, "versions/payload.bin", PYC_BYTES);
+
+    const { exclusions } = await readArtifactContent("./versions", projectDir);
+    expect(exclusions).toEqual({ ignored: 1, binary: 1, unreadable: 0 });
+  });
+
+  // Creating a symlink on Windows needs developer mode or elevation; CI is
+  // ubuntu-only, so guard rather than reach for chmod, which root ignores.
+  it.skipIf(process.platform === "win32")("counts a file it cannot read at all, and keeps its siblings", async () => {
+    const projectDir = await createTempProject({
+      "specs/real.yaml": "kind: Service",
+    });
+    // A dangling symlink is the portable way to reach the third counter: glob
+    // yields it (nodir: true does not resolve the target) and the read throws
+    // ENOENT — no chmod, which root would ignore anyway.
+    await fsp.symlink("./nonexistent-target", path.join(projectDir, "specs", "dangling.yaml"));
+
+    const { content, exclusions } = await readArtifactContent("./specs", projectDir);
+    expect(exclusions).toEqual({ ignored: 0, binary: 0, unreadable: 1 });
+    expect(content).toContain("kind: Service");
+    expect(content).not.toContain("dangling.yaml");
+  });
+
+  it("reports no exclusions for a single-file artifact", async () => {
+    const projectDir = await createTempProject({ "schema.sql": "SELECT 1;" });
+    const { exclusions } = await readArtifactContent("./schema.sql", projectDir);
+    expect(exclusions).toEqual({ ignored: 0, binary: 0, unreadable: 0 });
+  });
+
+  it("hashes exactly the content it returns", async () => {
+    const mixed = await createTempProject({
+      "versions/001_init.py": "def upgrade(): pass",
+      "versions/__pycache__/001_init.txt": "PYCACHE_MARKER",
+    });
+    await writeBytes(mixed, "versions/001_init.pyc", PYC_BYTES);
+
+    // A directory holding only the files that survive exclusion, byte for byte.
+    const clean = await createTempProject({
+      "versions/001_init.py": "def upgrade(): pass",
+    });
+
+    const mixedResult = await readArtifactContent("./versions", mixed);
+    const cleanResult = await readArtifactContent("./versions", clean);
+
+    // Same content and same hash: the staleness hash covers the indexed content
+    // and nothing else, so the two cannot drift apart.
+    expect(mixedResult.content).toBe(cleanResult.content);
+    expect(mixedResult.contentHash).toBe(cleanResult.contentHash);
+  });
+
+  it("does not report staleness when only excluded build output changes", async () => {
+    const projectDir = await createTempProject({
+      "versions/001_init.py": "def upgrade(): pass",
+    });
+    const before = await readArtifactContent("./versions", projectDir);
+
+    await writeBytes(projectDir, "versions/__pycache__/001_init.pyc", PYC_BYTES);
+    const after = await readArtifactContent("./versions", projectDir);
+
+    expect(after.contentHash).toBe(before.contentHash);
+  });
+});
+
 // ── chunkArtifactContent ────────────────────────────────────────────────
 
 describe("chunkArtifactContent", () => {

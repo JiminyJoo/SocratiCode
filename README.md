@@ -996,6 +996,10 @@ The indexer combines three layers of ignore rules:
 2. **`.gitignore`** — All `.gitignore` files in the project (root and nested subdirectories). Set `RESPECT_GITIGNORE=false` to skip `.gitignore` processing entirely.
 3. **`.socraticodeignore`** — Optional file for indexer-specific exclusions. Same syntax as `.gitignore`.
 
+All three layers also apply to a [context artifact](#context-artifacts) that points at a **directory**, but they are resolved **relative to the artifact directory**, not the project root. A project-root `.gitignore` or `.socraticodeignore` governs the code index and does **not** reach a directory artifact. What applies to a directory artifact is the built-in defaults, the `.gitignore` at the artifact root and any nested `.gitignore` files, and a `.socraticodeignore` only at the artifact root. Nested `.socraticodeignore` files are not read. To exclude something from a directory artifact, put the pattern in one of those applicable files.
+
+Note that a directory artifact inherits the built-in defaults **in full**, not just the build-output ones. Beyond `__pycache__`, `*.pyc`, `dist` and `build`, that list also covers names an artifact directory might legitimately use: `env`, `vendor`, `target`, `out`, `coverage`, `*.map`, `*.log`. If a directory artifact needs one of those, re-include it with a `!` pattern in the `.socraticodeignore` at the artifact root, negating the **name itself** (`!env`). Gitignore semantics cannot re-include a file whose parent directory is excluded, so `!env/**` on its own does nothing. `target` has one additional constraint: its contents can be re-included, but `target/` is skipped while discovering nested `.gitignore` files, so rules from `target/.gitignore` are not loaded. Put those rules in the `.gitignore` or `.socraticodeignore` at the artifact root instead. Files dropped by the ignore rules, by the binary check, or because they could not be read are counted in that artifact's log line when it is indexed. `node_modules`, `.git` and dot-files are pruned before the walk sees them, so they appear in no count.
+
 ## Context Artifacts
 
 Give the AI awareness of project knowledge beyond source code — database schemas, API specs, infrastructure configs, architecture docs, and more.
@@ -1028,12 +1032,14 @@ Create a `.socraticodecontextartifacts.json` file in your project root (see [`.s
 
 Each artifact has:
 - **`name`** — Unique identifier (used to filter searches)
-- **`path`** — Path to a file or directory (relative to project root, or absolute). Directories are read recursively.
+- **`path`** — Path to a file or directory (relative to project root, or absolute). Directories are read recursively, excluding: dot-files and dot-directories (`.pytest_cache/`, `.tox/`); anything matched by the [ignore rules](#ignore-rules) resolved against the artifact directory; and binary files, detected by a NUL byte in the first 8 KiB. Excluded files are logged with a per-directory summary count. A path pointing at a **single file** is read verbatim — no exclusions apply, so a declared binary file is still indexed.
 - **`description`** — Tells the AI what this artifact is and how to use it
 
 ### How it works
 
 Artifacts are chunked and embedded into Qdrant using the same hybrid dense + BM25 search as code. On first search, artifacts are auto-indexed. On subsequent searches, staleness is auto-detected via content hashing — changed files are re-indexed transparently.
+
+Because exclusions are applied before the content hash is computed, build output under an artifact directory no longer marks that artifact stale. A directory artifact indexed by an earlier version re-indexes on its next hash check **if the walk previously embedded files that are now excluded** — expect its chunk count to **drop** when it does. An artifact with nothing to exclude hashes identically and is left alone.
 
 ### Usage
 

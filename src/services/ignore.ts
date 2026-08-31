@@ -65,6 +65,10 @@ const DEFAULT_IGNORE_PATTERNS = [
  *   3. .socraticodeignore — optional project-specific exclusions
  *
  * Set env RESPECT_GITIGNORE=false to skip .gitignore processing entirely.
+ *
+ * The two status lines below log at debug, not info: context-artifact reads
+ * build a filter per artifact on every staleness check, so an info line here
+ * would fire once per artifact per context search.
  */
 export function createIgnoreFilter(projectPath: string): Ignore {
   const ig = ignore();
@@ -86,7 +90,7 @@ export function createIgnoreFilter(projectPath: string): Ignore {
     // Find and process nested .gitignore files
     findNestedGitignores(projectPath, projectPath, ig);
   } else {
-    logger.info("Skipping .gitignore processing (RESPECT_GITIGNORE=false)");
+    logger.debug("Skipping .gitignore processing (RESPECT_GITIGNORE=false)");
   }
 
   // .socraticodeignore
@@ -95,7 +99,7 @@ export function createIgnoreFilter(projectPath: string): Ignore {
   if (fs.existsSync(socraticodeignorePath)) {
     const content = fs.readFileSync(socraticodeignorePath, "utf-8");
     ig.add(content);
-    logger.info("Loaded .socraticodeignore rules");
+    logger.debug("Loaded .socraticodeignore rules");
   }
 
   return ig;
