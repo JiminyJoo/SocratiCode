@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
-import { getEmbeddingConfig } from "./embedding-config.js";
+import {
+  documentPrefix,
+  getEmbeddingConfig,
+  queryPrefix,
+} from "./embedding-config.js";
 import { getEmbeddingProvider } from "./embedding-provider.js";
 import { logger } from "./logger.js";
 
@@ -65,6 +69,9 @@ async function withRetry<T>(
 /**
  * Generate embeddings for a batch of texts, handling batching automatically.
  * Texts are pre-truncated to the model's context window inside the provider.
+ *
+ * Takes the texts as given: task prefixes are the caller's business, added by
+ * {@link prepareDocumentText} before the texts get here.
  */
 export async function generateEmbeddings(
   texts: string[],
@@ -98,20 +105,27 @@ export async function generateEmbeddings(
 }
 
 /**
- * Generate a single query embedding.
+ * Generate a single query embedding, prefixed with the configured query task
+ * prefix (`EMBEDDING_QUERY_PREFIX`; see `queryPrefix` in embedding-config.ts).
  */
 export async function generateQueryEmbedding(query: string): Promise<number[]> {
   const provider = await getEmbeddingProvider();
   return withRetry(
-    () => provider.embedSingle(`search_query: ${query}`),
+    () => provider.embedSingle(`${queryPrefix()}${query}`),
     "Query embedding",
   );
 }
 
 /**
- * Prepare text for embedding by adding a document prefix.
- * nomic-embed-text uses task prefixes for better retrieval.
+ * Prepare text for embedding: the document task prefix, then the file path, then
+ * the content. The prefix is configurable through `EMBEDDING_DOCUMENT_PREFIX`;
+ * see `documentPrefix` in embedding-config.ts for what each model expects.
+ *
+ * Callers hand the result to the vector store as the text to embed, so it drives
+ * the dense vector and the BM25 sparse vector derived from that same string.
+ * It is not what gets stored for display: the payload keeps the raw chunk
+ * content, unprefixed.
  */
 export function prepareDocumentText(content: string, filePath: string): string {
-  return `search_document: ${filePath}\n${content}`;
+  return `${documentPrefix()}${filePath}\n${content}`;
 }

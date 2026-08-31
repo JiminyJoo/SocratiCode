@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ensureQdrantReady } from "../../src/services/docker.js";
 import { getEmbeddingConfig } from "../../src/services/embedding-config.js";
 import {
@@ -13,6 +13,19 @@ import { isDockerAvailable } from "../helpers/fixtures.js";
 import { waitForOllama } from "../helpers/setup.js";
 
 const dockerAvailable = isDockerAvailable();
+
+// The prepareDocumentText assertions below expect the default task prefixes, so
+// clear the two variables that change them — a developer running a model such
+// as bge-m3 has them exported in the shell.
+// tests/unit/embedding-prefix.test.ts is the place that varies them on purpose.
+beforeEach(() => {
+  vi.stubEnv("EMBEDDING_QUERY_PREFIX", undefined);
+  vi.stubEnv("EMBEDDING_DOCUMENT_PREFIX", undefined);
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe.skipIf(!dockerAvailable)("embeddings service", () => {
   const config = getEmbeddingConfig();

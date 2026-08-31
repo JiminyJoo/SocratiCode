@@ -28,6 +28,8 @@ describe("embedding-config", () => {
     delete process.env.LITELLM_URL;
     delete process.env.LITELLM_API_KEY;
     delete process.env.LITELLM_SEND_DIMENSIONS;
+    delete process.env.EMBEDDING_QUERY_PREFIX;
+    delete process.env.EMBEDDING_DOCUMENT_PREFIX;
   });
 
   afterEach(() => {
