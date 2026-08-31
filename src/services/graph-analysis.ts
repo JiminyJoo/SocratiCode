@@ -67,6 +67,148 @@ export function isImportResolutionLow(edgeCount: number, importCount?: number): 
   return edgeCount / importCount < LOW_IMPORT_RESOLUTION_RATIO;
 }
 
+/** A version split into its release numbers and its prerelease identifiers. */
+interface ParsedVersion {
+  release: number[];
+  /** Dot-separated prerelease identifiers, or null for a final release. */
+  prerelease: string[] | null;
+}
+
+/**
+ * A version string as release numbers plus prerelease identifiers, or null when
+ * it does not read as a version at all.
+ *
+ * Build metadata is dropped: SemVer excludes it from precedence, so `1.13.0+a`
+ * and `1.13.0+b` are the same release and neither is behind the other. The
+ * prerelease is kept, because it does carry precedence — see
+ * {@link comparePrerelease}.
+ *
+ * The release is deliberately lenient about arity (`1.12` and `1.12.0.1` both
+ * parse, missing segments comparing as zero) since this reads a version off a
+ * stored artifact rather than validating one on the way in. Prerelease
+ * identifiers must be the alphanumerics-and-hyphen SemVer allows; anything else
+ * makes the whole string unparseable, which reports the graph as unknown rather
+ * than risking a wrong verdict on a string this does not understand.
+ */
+function parseVersion(version: string): ParsedVersion | null {
+  const withoutBuild = version.trim().replace(/^v/, "").split("+")[0];
+  const dash = withoutBuild.indexOf("-");
+  const core = dash === -1 ? withoutBuild : withoutBuild.slice(0, dash);
+  const pre = dash === -1 ? null : withoutBuild.slice(dash + 1);
+
+  const parts = core.split(".");
+  // No floor check: split always yields at least one element, and the digit
+  // test below is what rejects the empty string it yields for empty input.
+  if (parts.length > 4) return null;
+  if (!parts.every((part) => /^\d+$/.test(part))) return null;
+
+  if (pre === null) return { release: parts.map(Number), prerelease: null };
+  const identifiers = pre.split(".");
+  if (!identifiers.every((id) => /^[0-9A-Za-z-]+$/.test(id))) return null;
+  return { release: parts.map(Number), prerelease: identifiers };
+}
+
+/**
+ * Compare two prerelease identifier lists by SemVer precedence (spec item 11.4):
+ * numeric identifiers compare numerically, alphanumeric ones compare in ASCII
+ * order, a numeric identifier is always lower than an alphanumeric one, and when
+ * one list is a prefix of the other the longer list is higher.
+ */
+function comparePrerelease(a: string[], b: string[]): number {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] === b[i]) continue;
+    // A numeric identifier with a leading zero (`1.0.0-01`) is invalid SemVer,
+    // and is compared here as the number anyway rather than rejected. This
+    // reads a version off a stored artifact, where refusing to rank it reports
+    // the graph as unknown — a worse answer than the obvious one — and only a
+    // release that never shipped could have stamped it.
+    const aNumeric = /^\d+$/.test(a[i]);
+    const bNumeric = /^\d+$/.test(b[i]);
+    if (aNumeric && bNumeric) return Number(a[i]) - Number(b[i]);
+    if (aNumeric !== bNumeric) return aNumeric ? -1 : 1;
+    return a[i] < b[i] ? -1 : 1;
+  }
+  return a.length - b.length;
+}
+
+/** Compare two parsed versions by SemVer precedence. */
+function compareVersions(a: ParsedVersion, b: ParsedVersion): number {
+  const length = Math.max(a.release.length, b.release.length);
+  for (let i = 0; i < length; i++) {
+    const left = a.release[i] ?? 0;
+    const right = b.release[i] ?? 0;
+    if (left !== right) return left < right ? -1 : 1;
+  }
+  // Same release: a prerelease is behind the final release it leads to, so a
+  // graph cut by 1.13.0-beta.1 is missing whatever landed before 1.13.0 shipped.
+  if (a.prerelease === null && b.prerelease === null) return 0;
+  if (a.prerelease === null) return 1;
+  if (b.prerelease === null) return -1;
+  return comparePrerelease(a.prerelease, b.prerelease);
+}
+
+/**
+ * Whether a persisted graph was built by an older release than the one now
+ * serving it.
+ *
+ * A graph is stored once and served unchanged until something rebuilds it, so
+ * an upgrade leaves the old artifact in place: the new binary answers queries
+ * from a graph whose edges were resolved by the old one. Every signal a user
+ * can read says healthy — `codebase_about` reports the new version because that
+ * is the running binary, status reports READY because a graph exists — so a
+ * graph cut before a language's resolver shipped is indistinguishable from that
+ * resolver being broken. That cost a real bug report (issue #120), where a
+ * 27-day-old graph built four days before PSR-4 resolution existed was measured
+ * as a live defect in the current release.
+ *
+ * Ordered by SemVer precedence, prereleases included: a graph built by
+ * `1.13.0-beta.1` is stale against a `1.13.0` server, because the beta predates
+ * anything that landed in the run-up to the release. Build metadata carries no
+ * precedence and is ignored.
+ *
+ * Returns false when either version is absent or unparseable: a graph persisted
+ * before the stamp existed is unknown rather than stale, which the caller says
+ * in its own words instead of guessing.
+ */
+export function isGraphBuilderStale(
+  builtByVersion: string | undefined,
+  runningVersion: string,
+): boolean {
+  if (!builtByVersion) return false;
+  const built = parseVersion(builtByVersion);
+  const running = parseVersion(runningVersion);
+  if (!built || !running) return false;
+  return compareVersions(built, running) < 0;
+}
+
+/**
+ * The `Built by:` lines for `codebase_graph_status`: which build produced the
+ * graph being served, and whether that is the build now answering.
+ *
+ * Warns rather than rebuilding. A rebuild is minutes of work on a large repo
+ * and is the user's call, not a status call's side effect — and the reason to
+ * surface this at all is that the user had no way to tell a stale artifact from
+ * a broken resolver, which a sentence fixes.
+ */
+export function describeGraphBuilder(
+  builtByVersion: string | undefined,
+  runningVersion: string,
+): string[] {
+  if (!builtByVersion) {
+    return [
+      "Built by: unknown (persisted before the builder version was recorded)",
+      `  Run codebase_graph_build to rebuild with v${runningVersion} and confirm this graph reflects the current resolvers.`,
+    ];
+  }
+  if (isGraphBuilderStale(builtByVersion, runningVersion)) {
+    return [
+      `Built by: v${builtByVersion} — STALE, this server is v${runningVersion}`,
+      `  This graph's edges were resolved by the older build, so any resolver fix or language support added since v${builtByVersion} is absent from it. Run codebase_graph_build.`,
+    ];
+  }
+  return [`Built by: v${builtByVersion}`];
+}
+
 /**
  * Get dependencies for a specific file.
  * The input path is normalized to forward slashes so lookups succeed

@@ -998,11 +998,12 @@ Supports 18+ languages including TypeScript, JavaScript, Python, Java, Kotlin, G
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `resolveImport` | `(specifier, sourceFile, projectPath, fileSet, language, aliases?, jvmSuffixMap?, csNamespaceMap?, goModuleInfo?, phpPsr4Map?, dartPackageMap?, pythonImportRoots?, elixirModuleMap?) → string \| null` | Resolve a module specifier to a project-relative file path; null for external/stdlib modules or a resolution miss |
+| `resolveImport` | `(specifier, sourceFile, projectPath, fileSet, language, aliases?, jvmSuffixMap?, csNamespaceMap?, goModuleInfo?, phpPsr4Map?, dartPackageMap?, pythonImportRoots?, elixirModuleMap?, phpFqcnMap?) → string \| null` | Resolve a module specifier to a project-relative file path; null for external/stdlib modules or a resolution miss |
 | `buildJvmSuffixMap` | `(fileSet) → Map<string, string>` | Java/Kotlin/Scala: class-name suffix → file, for multi-module source layouts |
 | `buildCsNamespaceMap` | `(fileSet, projectPath) → Map<string, string[]>` | C#: `namespace X.Y` declarations → contributing files, resolving `using` directives |
 | `buildGoModuleInfo` | `(fileSet, projectPath) → GoModuleInfo[]` | Go: one entry per `go.mod` (root and nested), package dir → representative file |
 | `buildPhpPsr4Map` | `(projectPath) → Map<string, string[]>` | PHP: PSR-4 prefix → base dirs from every in-repo `composer.json` (`autoload` + `autoload-dev`) |
+| `buildPhpFqcnMap` | `(fileSet, projectPath) → Map<string, string[]>` | PHP: declared FQCN (`namespace` + class/interface/trait/enum) → declaring files, consulted after a PSR-4 miss so packages with a runtime autoloader still resolve |
 | `buildDartPackageMap` | `(projectPath) → Map<string, string>` | Dart: package name → package root from every `pubspec.yaml`; `package:<name>/<rest>` resolves to `<root>/lib/<rest>` |
 | `buildPythonManifests` | `(projectPath) → PythonManifest[]` | Python: one entry per `pyproject.toml` with its import roots and declared uv workspace members |
 | `pythonRootsForFile` | `(manifests, relSourceDir) → string[]` | Python: the import roots that apply to one file, ancestry- and membership-scoped, nearest first |
@@ -1025,6 +1026,12 @@ unconditionally where a generated or vendored manifest would poison the map:
 trailing optional parameters, keeping every existing caller
 source-compatible, and duplicate names resolve first-wins in sorted path
 order so edges are deterministic across machines.
+
+PHP is the one language with two of them, consulted in order: `buildPhpPsr4Map`
+reads the manifests and answers first, and `buildPhpFqcnMap` — a `fileSet` scan,
+not a manifest walk — answers for everything the manifests do not describe. That
+covers a package with no autoload map at all as well as one whose map is
+incomplete, without either regime needing to know where the other applies.
 
 ### lock.ts
 

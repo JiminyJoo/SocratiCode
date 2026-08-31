@@ -46,6 +46,141 @@ function extractCssImports(source: string): ImportInfo[] {
   return imports;
 }
 
+/**
+ * Split a PHP `use` statement body on the commas that separate its clauses,
+ * leaving the ones inside a `{…}` group alone.
+ *
+ * `use App\{User, Post}, Other\Thing;` is one declaration holding two clauses,
+ * and the group's internal commas separate members of the first clause rather
+ * than clauses of the statement. A plain `split(",")` cannot tell the two
+ * apart, and matching only the first clause is what dropped every name after
+ * the first comma.
+ */
+function splitPhpUseClauses(body: string): string[] {
+  const clauses: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of body) {
+    if (ch === "{") depth++;
+    else if (ch === "}") depth = Math.max(0, depth - 1);
+    else if (ch === "," && depth === 0) {
+      clauses.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  clauses.push(current);
+  return clauses.map((clause) => clause.trim()).filter(Boolean);
+}
+
+/**
+ * Every namespace path a PHP `use` declaration names.
+ *
+ * Handles the single (`use A\B;`), aliased (`use A\B as C;`), grouped
+ * (`use A\{B, C};`) and comma-list (`use A\B, A\C;`) forms, with the
+ * statement-level `function`/`const` modifiers stripped. A leading `\` on a
+ * fully-qualified name is left on the specifier — the resolver strips it, so
+ * `node.imports` keeps reporting what the source actually says.
+ */
+function phpUseSpecifiers(text: string): string[] {
+  const specs: string[] = [];
+  const body = text.replace(/^use\s+(?:function\s+|const\s+)?/, "").replace(/;\s*$/, "");
+
+  for (const clause of splitPhpUseClauses(body)) {
+    // Grouped: A\B\{C, D as E, function f, const K}
+    const group = clause.match(/^([\w\\]+)\\\{([^}]*)\}$/);
+    if (group) {
+      for (const member of group[2].split(",")) {
+        // A group may carry `function`/`const` per member as well as at the
+        // statement level — `use App\{function first, const MAX, User};` is one
+        // declaration importing a function, a constant and a class. Left on,
+        // the modifier became part of the name (`App\function first`), which
+        // names nothing and loses the real one.
+        const name = member
+          .trim()
+          .replace(/^(?:function|const)\s+/, "")
+          .split(/\s+as\s+/)[0]
+          .trim();
+        if (name) specs.push(`${group[1]}\\${name}`);
+      }
+      continue;
+    }
+    // Single: A\B, \A\B, A\B as C
+    const single = clause.match(/^([\w\\]+)/);
+    if (single) specs.push(single[1].trim());
+  }
+
+  return specs;
+}
+
+/**
+ * The path a PHP `require`/`include` names, or null when it names nothing
+ * statically knowable.
+ *
+ * Two shapes are literal. A quoted path (`require './x.php'`) is taken as
+ * written. `__DIR__ . '/x.php'` and its `dirname(__FILE__)` spelling are
+ * compile-time constants naming the including file's own directory, so they
+ * are equivalent to a source-relative path and are emitted as one — which is
+ * what the resolver's relative branch already knows how to handle. This is
+ * the dominant include idiom in WordPress and in any plugin-style tree that
+ * predates Composer, and the previous regex could not match it: it required a
+ * quote immediately after `require`/`(`, so the `__DIR__ .` prefix killed the
+ * match and the statement produced no specifier at all.
+ *
+ * Anything else stays null rather than being guessed. `require ABSPATH .
+ * '/x.php'` and `require $base . '/x.php'` depend on a value this pass cannot
+ * know, and inventing a path from the literal tail alone would draw an edge to
+ * a file the code may never include.
+ *
+ * Both patterns are anchored, because the text handed to them is one
+ * include/require expression node rather than a whole statement — see
+ * PHP_REQUIRE_KINDS.
+ */
+const PHP_REQUIRE_DIR_JOINED =
+  /^(?:require|include)(?:_once)?\s*\(?\s*(?:__DIR__|dirname\s*\(\s*__FILE__\s*\))\s*\.\s*['"]([^'"]+)['"]/;
+const PHP_REQUIRE_QUOTED =
+  /^(?:require|include)(?:_once)?\s*[(]?\s*['"]([^'"]+)['"]/;
+
+/**
+ * The AST node kinds PHP's four include constructs produce.
+ *
+ * Matching these rather than scanning statement text is what keeps the pattern
+ * off everything that merely reads like an include. The parser has already
+ * decided what is code: a comment saying "does NOT include 'event'", a string
+ * holding a Blade directive (`"@include('partials/card')"`), and a method
+ * named after the construct (`$loader->require('x.php')`) produce no node here,
+ * while `@include('x.php')` — the error-suppressed form, which is real — still
+ * does. Scanning `expression_statement` text matched the first three and was
+ * the source of every junk specifier this extractor produced.
+ *
+ * It also removes the need to enumerate the statements an include can sit in.
+ * `return require __DIR__ . '/config.php';` is a return_statement and
+ * `$c = include 'c.php';` an expression_statement; as expressions they are the
+ * same node kind, so both are found without either being named.
+ */
+const PHP_REQUIRE_KINDS = [
+  "require_expression",
+  "require_once_expression",
+  "include_expression",
+  "include_once_expression",
+];
+
+function phpRequireSpecifier(text: string): string | null {
+  const dirRelative = text.match(PHP_REQUIRE_DIR_JOINED);
+  if (dirRelative) {
+    // `__DIR__` is the directory itself, so the literal's leading separator is
+    // a joiner rather than an absolute-path anchor. `./` makes the result
+    // explicitly source-relative for the resolver; `__DIR__ . '/../lib/x.php'`
+    // becomes `./../lib/x.php`, which normalizes to the parent directory.
+    const rest = dirRelative[1].replace(/^\/+/, "");
+    return rest ? `./${rest}` : null;
+  }
+
+  const quoted = text.match(PHP_REQUIRE_QUOTED);
+  return quoted ? quoted[1] : null;
+}
+
 /** Extract JS/TS imports from an ast-grep root node. Shared by JS/TS and Svelte/Vue handlers. */
 function extractJsTsImportsFromNode(sgNode: ReturnType<ReturnType<typeof parse>["root"]>): ImportInfo[] {
   const imports: ImportInfo[] = [];
@@ -330,36 +465,22 @@ export function extractImports(source: string, lang: Lang | string, ext: string)
         // use function App\Helpers\format;
         // use const App\Config\MAX;
         // use App\Models\{User, Post, Comment};
+        // use App\Models\User, App\Models\Post;
         for (const node of sgNode.findAll({ rule: { kind: "namespace_use_declaration" } })) {
-          const text = node.text();
-
-          // Grouped use: use App\Models\{User, Post};
-          const groupMatch = text.match(/^use\s+(?:function\s+|const\s+)?([\w\\]+)\\\{([^}]+)\}/);
-          if (groupMatch) {
-            const prefix = groupMatch[1];
-            const members = groupMatch[2].split(",");
-            for (const member of members) {
-              const name = member.trim().split(/\s+as\s+/)[0].trim();
-              if (name) {
-                imports.push({ moduleSpecifier: `${prefix}\\${name}`, isDynamic: false });
-              }
-            }
-            continue;
-          }
-
-          // Single use: use App\Models\User; or use App\Models\User as Alias;
-          const singleMatch = text.match(/^use\s+(?:function\s+|const\s+)?([\w\\]+)/);
-          if (singleMatch) {
-            imports.push({ moduleSpecifier: singleMatch[1].trim(), isDynamic: false });
+          for (const spec of phpUseSpecifiers(node.text())) {
+            imports.push({ moduleSpecifier: spec, isDynamic: false });
           }
         }
-        // require/require_once/include/include_once
-        for (const node of sgNode.findAll({ rule: { kind: "expression_statement" } })) {
-          const text = node.text();
-          const match = text.match(/(?:require|include)(?:_once)?\s*[(]?\s*['"]([^'"]+)['"]/);
-          if (match) {
-            imports.push({ moduleSpecifier: match[1], isDynamic: false });
-          }
+        // require/require_once/include/include_once, quoted or __DIR__-joined,
+        // taken from the include expressions themselves. Collected across the
+        // four kinds and re-sorted by position, so the specifiers stay in
+        // document order rather than being grouped by construct.
+        const requireNodes = PHP_REQUIRE_KINDS
+          .flatMap((kind) => sgNode.findAll({ rule: { kind } }))
+          .sort((a, b) => a.range().start.index - b.range().start.index);
+        for (const node of requireNodes) {
+          const spec = phpRequireSpecifier(node.text());
+          if (spec) imports.push({ moduleSpecifier: spec, isDynamic: false });
         }
         break;
       }

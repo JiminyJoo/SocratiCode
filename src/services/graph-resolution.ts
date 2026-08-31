@@ -254,6 +254,132 @@ export function buildPhpPsr4Map(projectPath: string): Map<string, string[]> {
 }
 
 /**
+ * The shape of a PHP namespace path: identifier segments joined by
+ * backslashes, and nothing else.
+ *
+ * PHP `use` statements and `require`/`include` paths arrive in one specifier
+ * space, and only their shape tells them apart. A namespace path cannot hold a
+ * `/`, a `.` or a separator of any other kind, so anything that does is a file
+ * path. Segments admit the high-byte range because PHP identifiers do.
+ */
+const PHP_NAMESPACE_SHAPE =
+  /^[A-Za-z_\x80-\uFFFF][\w\x80-\uFFFF]*(?:\\[A-Za-z_\x80-\uFFFF][\w\x80-\uFFFF]*)*$/;
+
+/**
+ * One regex hit in a PHP source file: the name it captured and the offset it
+ * was found at. Used for both passes below — the `namespace` declarations and
+ * the `class`/`interface`/`trait`/`enum` ones — because attributing the second
+ * to the first is purely a matter of comparing their offsets.
+ */
+interface PhpSourceMatch {
+  index: number;
+  name: string;
+}
+
+/**
+ * Build a fully-qualified-class-name lookup map for PHP files, derived from
+ * the declarations themselves rather than from any manifest.
+ *
+ * PSR-4 stays the authority wherever it exists, and this map is consulted only
+ * after it misses. It exists for the code PSR-4 cannot describe: a package that
+ * ships no autoload map at all and registers its namespaces at run time —
+ *
+ *   $loader->addNamespace('Acme', PLUGIN_DIR . '/src/acme');
+ *
+ * — which is how WordPress plugins overwhelmingly do it, and which a
+ * composer.json reader cannot see. Such a package declares `"autoload": {}` or
+ * no manifest at all, so every `use` it makes and every `use` of it resolved to
+ * nothing, leaving whole trees orphaned in the graph while their symbols
+ * extracted perfectly (issue #120). Interpreting `spl_autoload_register` is not
+ * needed to fix that: the file that declares `Acme\Schema\Role` is a fact the
+ * source states outright.
+ *
+ *   key:   "Acme\\Schema\\Role"
+ *   value: ["src/acme/schema/RoleSchema.php"]
+ *
+ * Scans every PHP file unconditionally rather than only those under roots no
+ * PSR-4 prefix covers, following `buildCsNamespaceMap`. One map means one
+ * resolution regime everywhere, and it keeps working where a composer.json
+ * exists but is incomplete — a partial map is the common case, not an edge one.
+ *
+ * The key is the exact FQCN, declared namespace and declared name together,
+ * with no tail matching, so a collision means two files literally declaring the
+ * same class — in practice a vendored duplicate. Files are read in
+ * lexicographic order and `resolveImport` takes `candidates[0]`, so the pick is
+ * deterministic across machines; an edge to either copy is a true "depends on
+ * this FQCN" edge, which is why this guesses rather than refusing, matching the
+ * C# resolver.
+ *
+ * Reads `fileSet`, which is already ignore-filtered, so a `vendor/` tree the
+ * project excluded contributes nothing and one it deliberately re-included is a
+ * legitimate target — no unconditional skip is needed here, unlike the
+ * manifest walk in `findComposerManifests`.
+ *
+ * Declarations are matched by regex at line start, as in `buildCsNamespaceMap`,
+ * which costs one read per file instead of a parse. Positional association
+ * carries the braced multi-namespace form (`namespace A { … } namespace B { … }`)
+ * as well as the file-scoped one. A `class` line inside a heredoc would be
+ * matched as a declaration; a false FQCN nobody imports resolves nothing.
+ */
+export function buildPhpFqcnMap(
+  fileSet: Set<string>,
+  projectPath: string,
+): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+  // `namespace Foo\Bar;` (file-scoped) and `namespace Foo\Bar {` (braced).
+  const namespaceRegex =
+    /^[ \t]*namespace\s+([A-Za-z_\x80-\uFFFF][\w\x80-\uFFFF]*(?:\\[A-Za-z_\x80-\uFFFF][\w\x80-\uFFFF]*)*)\s*[;{]/gm;
+  // Enums are autoloadable and `use`-imported exactly as classes are, so they
+  // belong in a map whose job is answering "which file declares this name".
+  //
+  // A declaration starts its line, or follows an opening brace on one — the
+  // braced namespace form puts the two together as `namespace A { class B`.
+  // Requiring one or the other is what rejects the near-misses: ` * class Foo`
+  // in a doc block, `// class Foo`, `"class Foo"` in a string, and the
+  // anonymous `new class {}`, none of which declare a name to import.
+  const declarationRegex =
+    /(?:^|\{)[ \t]*(?:(?:final|abstract|readonly)\s+)*(?:class|interface|trait|enum)\s+([A-Za-z_\x80-\uFFFF][\w\x80-\uFFFF]*)/gm;
+
+  const phpFiles = [...fileSet]
+    .filter((f) => path.extname(f).toLowerCase() === ".php")
+    .sort();
+
+  for (const file of phpFiles) {
+    let source: string;
+    try {
+      source = readFileSync(path.join(projectPath, file), "utf8");
+    } catch {
+      continue;
+    }
+
+    // Namespaces in declaration order, so each type can be attributed to the
+    // one in effect where it appears.
+    const namespaces: PhpSourceMatch[] = [];
+    for (const match of source.matchAll(namespaceRegex)) {
+      namespaces.push({ index: match.index ?? 0, name: match[1] });
+    }
+
+    for (const match of source.matchAll(declarationRegex)) {
+      const at = match.index ?? 0;
+      let namespace = "";
+      for (const ns of namespaces) {
+        if (ns.index < at) namespace = ns.name;
+        else break;
+      }
+      const fqcn = namespace ? `${namespace}\\${match[1]}` : match[1];
+      const files = map.get(fqcn);
+      if (files) {
+        if (!files.includes(file)) files.push(file);
+      } else {
+        map.set(fqcn, [file]);
+      }
+    }
+  }
+
+  return map;
+}
+
+/**
  * Information needed to resolve Go imports to local files for ONE module.
  *
  * A project may contain several Go modules (a monorepo with nested
@@ -1013,6 +1139,7 @@ export function resolveImport(
   dartPackageMap?: Map<string, string>,
   pythonImportRoots?: string[],
   elixirModuleMap?: Map<string, string[]>,
+  phpFqcnMap?: Map<string, string[]>,
 ): string | null {
   // Skip obvious external/stdlib modules. Go is excluded from this
   // pre-check because its external classifier in `isExternalModule`
@@ -1215,22 +1342,42 @@ export function resolveImport(
     }
 
     case "php": {
-      // PSR-4: App\Models\User → app/Models/User.php
-      if (moduleSpecifier.includes("\\")) {
+      // A `use` names a namespace, a require/include names a file, and both
+      // arrive here as one specifier. Shape decides which: a namespace path is
+      // identifier segments joined by backslashes and can hold nothing else.
+      //
+      // The leading `\` of a fully-qualified name (`use \App\Models\User;`) is
+      // stripped once, for every branch below rather than only inside the
+      // PSR-4 lookup where it used to be handled. Left on, it made the
+      // heuristics build `/App/Models/User` — an absolute path resolving
+      // outside the project — so a project with no composer.json missed every
+      // fully-qualified import it made.
+      const namespaced = moduleSpecifier.replace(/^\\+/, "");
+
+      if (PHP_NAMESPACE_SHAPE.test(namespaced)) {
         // Declared PSR-4 first — composer.json is the authority on where a
-        // namespace lives, and the heuristics below can only guess. Longest
+        // namespace lives, and everything below it can only infer. Longest
         // matching prefix wins so `Acme\Auth\Database\Seeders\` beats the
         // shorter `Acme\Auth\` that also prefixes it.
         if (phpPsr4Map && phpPsr4Map.size > 0) {
-          const namespaced = moduleSpecifier.replace(/^\\+/, "");
           let bestPrefix = "";
           for (const prefix of phpPsr4Map.keys()) {
             if (namespaced.startsWith(prefix) && prefix.length > bestPrefix.length) {
               bestPrefix = prefix;
             }
           }
-          if (bestPrefix) {
-            const relative = namespaced.slice(bestPrefix.length).replace(/\\/g, "/");
+          // An exact prefix match leaves nothing to look up: the specifier
+          // names the prefix's own base directory, not a file in it. Composer
+          // rejects a PSR-4 prefix that does not end in a separator, so this
+          // needs a hand-edited manifest — but left unguarded, `use Foo;`
+          // against a `"Foo": "src/"` entry probes the bare directory, and
+          // resolveRelativePath's extension and index fallbacks land it on
+          // `src.php` or `src/index.php`: a wrong edge rather than a missing
+          // one.
+          const relative = bestPrefix
+            ? namespaced.slice(bestPrefix.length).replace(/\\/g, "/")
+            : "";
+          if (bestPrefix && relative) {
             for (const dir of phpPsr4Map.get(bestPrefix) ?? []) {
               const candidate = dir ? `${dir}/${relative}` : relative;
               const hit = resolveRelativePath(candidate, projectPath, projectPath, fileSet, [".php"]);
@@ -1239,7 +1386,20 @@ export function resolveImport(
           }
         }
 
-        const filePath = moduleSpecifier.replace(/\\/g, "/");
+        // Then what the declarations themselves say. This is the only branch
+        // that can reach a package whose namespaces are registered at run time
+        // rather than declared in a manifest, and it is exact where the
+        // heuristics below are a guess, so it outranks them.
+        const declared = phpFqcnMap?.get(namespaced);
+        if (declared && declared.length > 0) return declared[0];
+
+        // Layout heuristics, for a namespace no manifest declares and no
+        // in-project file claims. Single-segment names are excluded, as they
+        // were before: `use Foo;` names the global namespace, and probing it
+        // as a path would attach any same-named file in the tree to it.
+        if (!namespaced.includes("\\")) return null;
+
+        const filePath = namespaced.replace(/\\/g, "/");
         // Try exact case first
         const exact = resolveRelativePath(filePath, projectPath, projectPath, fileSet, [".php"]);
         if (exact) return exact;
@@ -1268,10 +1428,20 @@ export function resolveImport(
 
         return null;
       }
+
+      // require/include. An explicit `./` or `../` is source-relative, which
+      // is also the form `__DIR__ . '<literal>'` is emitted as.
       if (moduleSpecifier.startsWith("./") || moduleSpecifier.startsWith("../")) {
         return resolveRelativePath(moduleSpecifier, sourceDir, projectPath, fileSet, [".php"]);
       }
-      return null;
+      // A bare `require 'inc/util.php'` is resolved against the include_path
+      // at run time, which always starts with the including file's own
+      // directory and typically also carries the project root. Try both, in
+      // that order — the ruby resolver's shape, for the same reason. Before
+      // this, only `./`-prefixed paths resolved and every bare require was
+      // dropped, which in an include-driven tree is most of them.
+      return resolveRelativePath(moduleSpecifier, sourceDir, projectPath, fileSet, [".php"])
+        ?? resolveRelativePath(moduleSpecifier, projectPath, projectPath, fileSet, [".php"]);
     }
 
     case "rust": {

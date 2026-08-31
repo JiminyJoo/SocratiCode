@@ -4,7 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { graphCollectionName, projectIdFromPath } from "../../src/config.js";
+import { QDRANT_COLLECTION_PREFIX, SOCRATICODE_VERSION } from "../../src/constants.js";
 import { invalidateGraphCache, rebuildGraph } from "../../src/services/code-graph.js";
+import { getClient } from "../../src/services/qdrant.js";
 import { stopAllWatchers } from "../../src/services/watcher.js";
 import { handleContextTool } from "../../src/tools/context-tools.js";
 import { handleGraphTool } from "../../src/tools/graph-tools.js";
@@ -201,6 +204,23 @@ describe("graph tool handlers", () => {
         invalidateGraphCache(proj.root);
         proj.cleanup();
       }
+    });
+  });
+
+  describe("codebase_graph_status builder version (#120)", () => {
+    it("reports the version that built the graph now being served", async () => {
+      // A persisted graph outlives the binary that wrote it, and every other
+      // signal in this output describes the server: READY because a graph
+      // exists, and codebase_about's version because that is what is running.
+      // The three rendered forms are unit-tested; what this pins is that the
+      // stamp survives the round trip through storage and reaches the output.
+      const result = await handleGraphTool("codebase_graph_status", {
+        projectPath: fixture.root,
+      });
+
+      expect(result).toContain(`Built by: v${SOCRATICODE_VERSION}`);
+      expect(result).not.toContain("STALE");
+      expect(result).not.toContain("Built by: unknown");
     });
   });
 
@@ -483,6 +503,67 @@ describe.skipIf(!dockerAvailable)(
 
         expect(result).toBeDefined();
       }, 30_000);
+    });
+
+    describe("codebase_status builder version (#120)", () => {
+      // Mirrors the private constant in qdrant.ts. Reconstructed rather than
+      // exported, so the module keeps its surface; a rename fails this test
+      // loudly, since the doctored field would then still be present.
+      const metadataCollection = `${QDRANT_COLLECTION_PREFIX}socraticode_metadata`;
+
+      it("reports an unrecorded builder version and points at a rebuild", async () => {
+        // Reproduce a graph persisted before the stamp existed — the state
+        // that made a stale artifact indistinguishable from a resolver bug,
+        // and the one no rebuild on this machine can produce any more.
+        await rebuildGraph(fixture.root);
+        invalidateGraphCache(fixture.root);
+        const client = getClient();
+        // Keyed on the graph's own collection name, not on projectPath: the
+        // index metadata point lives in this same collection and carries the
+        // same projectPath, so a path filter would restore `builtByVersion`
+        // onto that point too, where it means nothing.
+        const filter = {
+          must: [
+            {
+              key: "collectionName",
+              match: { value: graphCollectionName(projectIdFromPath(path.resolve(fixture.root))) },
+            },
+          ],
+        };
+        await client.deletePayload(metadataCollection, {
+          keys: ["builtByVersion"],
+          filter,
+          wait: true,
+        });
+
+        try {
+          const result = await handleQueryTool("codebase_status", {
+            projectPath: fixture.root,
+          });
+
+          expect(result).toContain("Built by an unrecorded version");
+          expect(result).toContain("codebase_graph_build");
+          expect(result).not.toContain(`Built by v${SOCRATICODE_VERSION}`);
+        } finally {
+          // Leave the stored graph as it was found, so the tests after this
+          // one see a normally-stamped graph.
+          await client.setPayload(metadataCollection, {
+            payload: { builtByVersion: SOCRATICODE_VERSION },
+            filter,
+            wait: true,
+          });
+        }
+      }, 120_000);
+
+      it("says nothing about the builder when the graph is current", async () => {
+        const result = await handleQueryTool("codebase_status", {
+          projectPath: fixture.root,
+        });
+
+        expect(result).toContain("Code graph:");
+        expect(result).not.toContain("Built by an unrecorded version");
+        expect(result).not.toContain("run codebase_graph_build to pick up newer resolvers");
+      }, 60_000);
     });
 
     describe("codebase_update", () => {

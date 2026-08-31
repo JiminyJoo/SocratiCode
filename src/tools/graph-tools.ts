@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import path from "node:path";
 import { projectIdFromPath } from "../config.js";
-import { mergeExtraExtensions } from "../constants.js";
-import { awaitGraphBuild, ensureDynamicLanguages, findCircularDependencies, generateMermaidDiagram, getDynamicLanguageStatus, getFileDependencies, getGraphBuildProgress, getGraphStats, getGraphStatus, getLastGraphBuildCompleted, getOrBuildGraph, isGraphBuildInProgress, isImportResolutionLow, rebuildGraph, removeGraph } from "../services/code-graph.js";
+import { mergeExtraExtensions, SOCRATICODE_VERSION } from "../constants.js";
+import { awaitGraphBuild, describeGraphBuilder, ensureDynamicLanguages, findCircularDependencies, generateMermaidDiagram, getDynamicLanguageStatus, getFileDependencies, getGraphBuildProgress, getGraphStats, getGraphStatus, getLastGraphBuildCompleted, getOrBuildGraph, isGraphBuildInProgress, isImportResolutionLow, rebuildGraph, removeGraph } from "../services/code-graph.js";
 import { detectEntryPoints } from "../services/graph-entrypoints.js";
 import {
   type FlowNode,
@@ -362,6 +362,13 @@ async function dispatchGraphTool(
         `Dependencies (edges): ${graphInfo.edgeCount}`,
         ...renderImportResolutionBlock(),
         `Last built: ${graphInfo.lastBuiltAt} (${ago}s ago)`,
+        // Which build produced the graph being served, next to when it was
+        // produced. A persisted graph outlives the binary that wrote it, so
+        // after an upgrade every other signal here — READY, and the current
+        // version from codebase_about — describes the server rather than the
+        // artifact, and a graph cut before a resolver shipped reads as that
+        // resolver being broken (issue #120).
+        ...describeGraphBuilder(graphInfo.builtByVersion, SOCRATICODE_VERSION),
         `In-memory cache: ${graphInfo.cached ? "yes" : "no (will load from storage on next query)"}`,
       ];
 
