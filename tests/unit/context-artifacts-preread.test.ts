@@ -8,8 +8,9 @@
  * the caller already held — the largest cost on the search path, since reading
  * and hashing file contents dominates a directory read.
  *
- * These tests pin the contract rather than the timing: content handed in is the
- * content indexed, and a caller that hands nothing in still reads for itself.
+ * These tests pin the contract rather than timing it: content handed in is the
+ * content indexed, the ensure call site performs one artifact read, and ignore
+ * rules are rebuilt before every staleness check.
  */
 
 import fsp from "node:fs/promises";
@@ -122,6 +123,53 @@ describe("indexArtifact preread content", () => {
 });
 
 describe("ensureArtifactsIndexed threading", () => {
+  it("rebuilds nested ignore rules before every staleness check", async () => {
+    const projectDir = await createProject({
+      ".socraticodecontextartifacts.json": JSON.stringify({
+        artifacts: [{ name: "deploy", path: "./deploy", description: "Manifests" }],
+      }),
+      "deploy/sub/keep.yaml": "KEEP_MARKER",
+      "deploy/sub/drop.yaml": "DROP_MARKER",
+    });
+
+    expect((await ensureArtifactsIndexed(projectDir)).reindexed).toEqual(["deploy"]);
+    expect(upsertedContent.join("\n")).toContain("DROP_MARKER");
+
+    await fsp.writeFile(path.join(projectDir, "deploy/sub/.gitignore"), "drop.yaml\n");
+    upsertedContent.length = 0;
+
+    const second = await ensureArtifactsIndexed(projectDir);
+    expect(second.errors).toHaveLength(0);
+    expect(second.reindexed).toEqual(["deploy"]);
+    expect(second.upToDate).toEqual([]);
+
+    const indexed = upsertedContent.join("\n");
+    expect(indexed).toContain("KEEP_MARKER");
+    expect(indexed).not.toContain("DROP_MARKER");
+  });
+
+  it("reads the config and stale artifact exactly once each", async () => {
+    const projectDir = await createProject({
+      ".socraticodecontextartifacts.json": JSON.stringify({
+        artifacts: [{ name: "deploy", path: "./deploy", description: "Manifests" }],
+      }),
+      "deploy/service.yaml": "kind: Service",
+    });
+    const readFile = vi.spyOn(fsp, "readFile");
+
+    try {
+      const result = await ensureArtifactsIndexed(projectDir);
+
+      expect(result.errors).toHaveLength(0);
+      expect(result.reindexed).toEqual(["deploy"]);
+      // One config read plus one artifact-file read. Omitting the preread at
+      // the indexArtifact call site adds a third read of service.yaml.
+      expect(readFile).toHaveBeenCalledTimes(2);
+    } finally {
+      readFile.mockRestore();
+    }
+  });
+
   it("indexes exactly the content it hashed for the staleness check", async () => {
     const projectDir = await createProject({
       ".socraticodecontextartifacts.json": JSON.stringify({
