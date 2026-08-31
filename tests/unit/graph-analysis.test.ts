@@ -451,11 +451,39 @@ describe("graph-analysis", () => {
       expect(isGraphBuilderStale("1.2.3.4.5", "1.12.0")).toBe(false);
     });
 
-    it("ignores prerelease and build suffixes", () => {
-      // A prerelease of a release carries that release's resolvers, so it is
-      // not behind it.
-      expect(isGraphBuilderStale("1.13.0-beta.1", "1.13.0")).toBe(false);
+    it("orders a prerelease before the release it leads to", () => {
+      // SemVer precedence, spec item 11: the beta predates whatever landed in
+      // the run-up to the release, so a graph it built is behind that release.
+      expect(isGraphBuilderStale("1.13.0-beta.1", "1.13.0")).toBe(true);
+      // And the converse: a released graph is not behind a prerelease server.
+      expect(isGraphBuilderStale("1.13.0", "1.13.0-beta.1")).toBe(false);
+      expect(isGraphBuilderStale("1.13.0-beta.1", "1.13.0-beta.1")).toBe(false);
+    });
+
+    it("orders prerelease identifiers by SemVer precedence", () => {
+      // Alphanumeric identifiers compare in ASCII order...
+      expect(isGraphBuilderStale("1.13.0-alpha", "1.13.0-beta")).toBe(true);
+      expect(isGraphBuilderStale("1.13.0-beta", "1.13.0-alpha")).toBe(false);
+      // ...numeric ones numerically, so 2 is behind 10 rather than ahead of it
+      // as a string comparison would have it...
+      expect(isGraphBuilderStale("1.13.0-alpha.2", "1.13.0-alpha.10")).toBe(true);
+      // ...a numeric identifier is always lower than an alphanumeric one...
+      expect(isGraphBuilderStale("1.13.0-1", "1.13.0-alpha")).toBe(true);
+      // ...and a longer identifier list outranks the prefix it extends.
+      expect(isGraphBuilderStale("1.13.0-alpha", "1.13.0-alpha.1")).toBe(true);
+    });
+
+    it("ignores build metadata, which carries no precedence", () => {
       expect(isGraphBuilderStale("v1.11.0", "1.12.0+build.7")).toBe(true);
+      expect(isGraphBuilderStale("1.13.0+a", "1.13.0+b")).toBe(false);
+      expect(isGraphBuilderStale("1.13.0-beta.1+a", "1.13.0")).toBe(true);
+    });
+
+    it("says nothing when a prerelease identifier is not one SemVer allows", () => {
+      // Refusing to rank a string this does not understand keeps a wrong
+      // verdict off the screen; unknown is reported instead.
+      expect(isGraphBuilderStale("1.13.0-beta_1", "1.13.0")).toBe(false);
+      expect(isGraphBuilderStale("1.13.0-", "1.13.0")).toBe(false);
     });
   });
 

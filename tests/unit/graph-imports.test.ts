@@ -646,6 +646,22 @@ use App\\Services\\Payments, App\\Services\\Refunds;
       ]);
     });
 
+    it("strips function and const modifiers carried by group members", () => {
+      // A group can carry the modifier per member rather than on the statement,
+      // mixing a function, a constant and a class in one declaration. Left on,
+      // the modifier became part of the name and the real one was lost.
+      const source = `<?php
+use App\\Helpers\\{function first, const MAX, User};
+`;
+      const specs = extractImports(source, "php", ".php").map((i) => i.moduleSpecifier);
+
+      expect(specs).toEqual([
+        "App\\Helpers\\first",
+        "App\\Helpers\\MAX",
+        "App\\Helpers\\User",
+      ]);
+    });
+
     it("handles a group split across lines", () => {
       const source = `<?php
 use App\\Models\\{
@@ -668,7 +684,7 @@ use \\App\\Models\\User;
       expect(specs).toContain("\\App\\Models\\User");
     });
 
-    it("extracts __DIR__-joined requires as source-relative paths", () => {
+    it("extracts __DIR__ and dirname(__FILE__) joined requires as source-relative paths", () => {
       // The dominant include idiom outside Composer projects. The old regex
       // demanded a quote right after require/(, so the __DIR__ prefix killed
       // the match and these statements yielded nothing at all.

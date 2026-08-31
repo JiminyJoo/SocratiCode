@@ -273,8 +273,16 @@ export async function handleQueryTool(
           statusLines.push(`  Last built: ${graphAgo}s ago${graphInfo.cached ? " (cached in memory)" : ""}`);
           // The stored graph is served unchanged across upgrades, so this
           // reports the build that produced it, not the one answering (issue
-          // #120). codebase_graph_status carries the full explanation.
-          if (isGraphBuilderStale(graphInfo.builtByVersion, SOCRATICODE_VERSION)) {
+          // #120). One line per case, matching the density of the rest of this
+          // status; codebase_graph_status carries the full explanation.
+          if (!graphInfo.builtByVersion) {
+            // A graph persisted before the stamp existed. Unknown is not the
+            // same as current: this is exactly the state that made a stale
+            // artifact read as a resolver bug, so it gets said out loud.
+            statusLines.push(
+              `  Built by an unrecorded version — run codebase_graph_build to confirm this graph reflects v${SOCRATICODE_VERSION}'s resolvers.`,
+            );
+          } else if (isGraphBuilderStale(graphInfo.builtByVersion, SOCRATICODE_VERSION)) {
             statusLines.push(
               `  Built by v${graphInfo.builtByVersion}, this server is v${SOCRATICODE_VERSION} — run codebase_graph_build to pick up newer resolvers.`,
             );

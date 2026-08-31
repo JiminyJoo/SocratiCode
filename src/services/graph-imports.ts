@@ -88,11 +88,20 @@ function phpUseSpecifiers(text: string): string[] {
   const body = text.replace(/^use\s+(?:function\s+|const\s+)?/, "").replace(/;\s*$/, "");
 
   for (const clause of splitPhpUseClauses(body)) {
-    // Grouped: A\B\{C, D as E}
+    // Grouped: A\B\{C, D as E, function f, const K}
     const group = clause.match(/^([\w\\]+)\\\{([^}]*)\}$/);
     if (group) {
       for (const member of group[2].split(",")) {
-        const name = member.trim().split(/\s+as\s+/)[0].trim();
+        // A group may carry `function`/`const` per member as well as at the
+        // statement level — `use App\{function first, const MAX, User};` is one
+        // declaration importing a function, a constant and a class. Left on,
+        // the modifier became part of the name (`App\function first`), which
+        // names nothing and loses the real one.
+        const name = member
+          .trim()
+          .replace(/^(?:function|const)\s+/, "")
+          .split(/\s+as\s+/)[0]
+          .trim();
         if (name) specs.push(`${group[1]}\\${name}`);
       }
       continue;
