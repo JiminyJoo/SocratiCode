@@ -158,16 +158,45 @@ export async function ensureCollection(name: string): Promise<void> {
   }
 }
 
-/** Create a payload index on a collection (idempotent — ignores "already exists" errors) */
-export async function ensurePayloadIndex(collName: string, fieldName: string): Promise<void> {
+/** True when an error means "someone else already created it" — safe to ignore. */
+function isAlreadyExistsError(err: unknown): boolean {
+  const status =
+    (err as { status?: number })?.status ?? (err as { statusCode?: number })?.statusCode;
+  const message = err instanceof Error ? err.message : String(err);
+  return status === 409 || /already exists/i.test(message);
+}
+
+/**
+ * Create a payload index, ignoring only the "it is already there" conflict.
+ *
+ * Every other failure propagates: a 503 leaves the collection without the index,
+ * and a caller that swallows it can never tell that it still has work to do.
+ */
+async function createPayloadIndexIfMissing(collName: string, fieldName: string): Promise<void> {
   const qdrant = getClient();
   try {
     await qdrant.createPayloadIndex(collName, {
       field_name: fieldName,
       field_schema: "keyword",
     });
-  } catch {
-    // Index already exists — ignore
+  } catch (err) {
+    if (!isAlreadyExistsError(err)) throw err;
+    // Index already exists — that is the end state we wanted.
+  }
+}
+
+/** Create a payload index on a collection (best effort — never throws) */
+export async function ensurePayloadIndex(collName: string, fieldName: string): Promise<void> {
+  try {
+    await createPayloadIndexIfMissing(collName, fieldName);
+  } catch (err) {
+    // Callers of this helper index their payload opportunistically: a missing
+    // index costs filter performance but does not make their write incorrect.
+    logger.debug("ensurePayloadIndex failed (ignored)", {
+      collection: collName,
+      field: fieldName,
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
@@ -716,32 +745,74 @@ const METADATA_COLLECTION = `${QDRANT_COLLECTION_PREFIX}socraticode_metadata`;
 /** Cached flag: once the metadata collection is confirmed to exist, skip re-checking */
 let metadataCollectionReady = false;
 
+/**
+ * In-flight creation shared by concurrent callers.
+ *
+ * `ensureMetadataCollection` is awaited from more than ten call sites, several of
+ * which run concurrently at startup (readiness checks, hash loading, graph
+ * loading). The readiness flag is only set *after* creation finishes, so without
+ * this every concurrent caller sees "does not exist" and races to create the
+ * collection — all but the first then fail with a 409 Conflict, which surfaces as
+ * `loadProjectHashes(...) failed [status 409]: Conflict` and aborts indexing.
+ */
+let metadataCollectionInFlight: Promise<void> | null = null;
+
 /** Reset the metadata collection readiness cache (for testing only) */
 export function resetMetadataCollectionCache(): void {
   metadataCollectionReady = false;
+  metadataCollectionInFlight = null;
 }
 
-/** Ensure the metadata collection exists (idempotent, cached after first success) */
+/** Ensure the metadata collection exists (idempotent, cached, concurrency-safe) */
 async function ensureMetadataCollection(): Promise<void> {
   if (metadataCollectionReady) return;
+  // Join the in-flight creation instead of starting a second one.
+  if (metadataCollectionInFlight) return metadataCollectionInFlight;
 
-  const qdrant = getClient();
-  const collections = await qdrant.getCollections();
-  const exists = collections.collections.some((c) => c.name === METADATA_COLLECTION);
-  if (!exists) {
-    // Metadata collection uses a dummy 1-dim vector since Qdrant requires vectors
-    await qdrant.createCollection(METADATA_COLLECTION, {
-      vectors: { size: 1, distance: "Cosine" },
-      on_disk_payload: true,
-    });
-    await qdrant.createPayloadIndex(METADATA_COLLECTION, {
-      field_name: "collectionName",
-      field_schema: "keyword",
-    });
-    logger.info("Created metadata collection");
+  const attempt = (async () => {
+    const qdrant = getClient();
+    const collections = await qdrant.getCollections();
+    const exists = collections.collections.some((c) => c.name === METADATA_COLLECTION);
+    if (!exists) {
+      try {
+        // Metadata collection uses a dummy 1-dim vector since Qdrant requires vectors
+        await qdrant.createCollection(METADATA_COLLECTION, {
+          vectors: { size: 1, distance: "Cosine" },
+          on_disk_payload: true,
+        });
+        logger.info("Created metadata collection");
+      } catch (err) {
+        // Another process (a second MCP instance on the same Qdrant) may have won
+        // the race. That is the desired end state, so treat it as success.
+        if (!isAlreadyExistsError(err)) throw err;
+        logger.info("Metadata collection already created by another process");
+      }
+    }
+
+    // Outside the `!exists` branch on purpose: if an earlier attempt created the
+    // collection but failed before indexing, every later attempt sees the
+    // collection and would otherwise skip indexing forever. Creating the index
+    // is idempotent, so calling it unconditionally is safe.
+    //
+    // A failure here has to propagate. The metadata collection is queried by
+    // `collectionName`, so without the index it is not usable, and swallowing
+    // the failure would mark the collection ready and never retry the index in
+    // this process.
+    await createPayloadIndexIfMissing(METADATA_COLLECTION, "collectionName");
+  })();
+  metadataCollectionInFlight = attempt;
+
+  try {
+    await attempt;
+    // Only the attempt that is still the current one may publish readiness, so a
+    // cache reset that lands mid-attempt is not undone by it.
+    if (metadataCollectionInFlight === attempt) metadataCollectionReady = true;
+  } finally {
+    // Clear on failure too, so a transient Qdrant blip can be retried. Guarded by
+    // identity so a later caller's in-flight promise is never dropped — the cache
+    // may have been reset while this attempt was running.
+    if (metadataCollectionInFlight === attempt) metadataCollectionInFlight = null;
   }
-
-  metadataCollectionReady = true;
 }
 
 /** Generate a stable UUID from a collection name (for Qdrant point ID).
