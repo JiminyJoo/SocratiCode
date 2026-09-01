@@ -798,7 +798,7 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings for the texts as given; batching and retries only, no prefixing (callers pass text from `prepareDocumentText`) |
-| `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding, prefixed with `search_query: ` (default; env-configurable via `EMBEDDING_QUERY_PREFIX`) |
+| `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding, prefixed with `search_query:` followed by a space (default; env-configurable via `EMBEDDING_QUERY_PREFIX`) |
 | `prepareDocumentText` | `(content, filePath, profile?) → string` | Build the text to embed. `profile.documentPrefix` controls the prefix and `profile.documentIncludesPath` controls whether the file path precedes the content; omitting the profile uses the requested runtime settings. |
 
 ### indexer.ts

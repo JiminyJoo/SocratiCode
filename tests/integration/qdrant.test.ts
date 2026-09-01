@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { QDRANT_COLLECTION_PREFIX } from "../../src/constants.js";
 import { ensureQdrantReady } from "../../src/services/docker.js";
 import {
-  legacyIndexProfile,
   requestedIndexProfile,
 } from "../../src/services/index-profile.js";
 import { ensureOllamaReady } from "../../src/services/ollama.js";
 import {
-  adoptEffectiveIndexProfile,
   deleteCollection,
   deleteFileChunks,
   deleteProjectMetadata,
@@ -25,7 +22,6 @@ import {
 import type { FileChunk } from "../../src/types.js";
 import { isDockerAvailable } from "../helpers/fixtures.js";
 import {
-  createTestQdrantClient,
   deleteTestCollection,
   waitForOllama,
   waitForQdrant,
@@ -266,53 +262,6 @@ describe.skipIf(!dockerAvailable)("qdrant service", () => {
       // Initially might be empty or contain entries based on implementation
       expect(hashes).toBeDefined();
       expect(typeof hashes).toBe("object");
-    });
-
-    it("persists a legacy profile only when effective profile metadata is absent", async () => {
-      const client = createTestQdrantClient();
-      await client.deletePayload(`${QDRANT_COLLECTION_PREFIX}socraticode_metadata`, {
-        keys: ["effectiveIndexProfile"],
-        filter: {
-          must: [{ key: "collectionName", match: { value: metadataCollection } }],
-        },
-        wait: true,
-      });
-      const denseVectorSize = (await getCollectionInfo(metadataCollection))
-        ?.denseVectorSize;
-      expect(denseVectorSize).toBeDefined();
-      const candidate = legacyIndexProfile("code", denseVectorSize);
-
-      const adopted = await adoptEffectiveIndexProfile(metadataCollection, candidate);
-
-      expect(adopted).toEqual(candidate);
-      expect((await getProjectMetadata(metadataCollection))?.effectiveProfile).toEqual(
-        candidate,
-      );
-    });
-
-    it("keeps existing metadata when legacy profile adoption is retried", async () => {
-      const stored = requestedIndexProfile("code");
-      const fileHashes = new Map<string, string>([
-        ["src/existing.ts", "hash-existing"],
-      ]);
-      await saveProjectMetadata(
-        metadataCollection,
-        projectPath,
-        1,
-        1,
-        fileHashes,
-        "completed",
-        stored,
-      );
-      const candidate = legacyIndexProfile("code", 7);
-
-      const adopted = await adoptEffectiveIndexProfile(metadataCollection, candidate);
-
-      expect(adopted).toEqual(stored);
-      expect((await getProjectMetadata(metadataCollection))?.effectiveProfile).toEqual(
-        stored,
-      );
-      expect(await loadProjectHashes(metadataCollection)).toEqual(fileHashes);
     });
 
     it("can delete project metadata", async () => {

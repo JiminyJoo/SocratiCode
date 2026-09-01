@@ -12,6 +12,7 @@ let collectionInfo: { pointsCount: number; status: string } | null = null;
 let existingStates: ArtifactIndexState[] = [];
 let storedProfile: EffectiveIndexProfile | null = null;
 let metadataReadError: Error | null = null;
+let metadataWriteError: Error | null = null;
 let tempRoot = "";
 
 const savedMetadata: Array<{
@@ -61,10 +62,6 @@ vi.mock("../../src/services/embeddings.js", () => ({
 }));
 
 vi.mock("../../src/services/qdrant.js", () => ({
-  adoptEffectiveIndexProfile: vi.fn(async (
-    _collection: string,
-    profile: EffectiveIndexProfile,
-  ) => profile),
   deleteArtifactChunks: vi.fn(async (_collection: string, artifactName: string) => {
     deletedArtifacts.push(artifactName);
   }),
@@ -85,6 +82,7 @@ vi.mock("../../src/services/qdrant.js", () => ({
     states: ArtifactIndexState[],
     profile: EffectiveIndexProfile,
   ) => {
+    if (metadataWriteError) throw metadataWriteError;
     existingStates = states.map((state) => ({ ...state }));
     storedProfile = profile;
     savedMetadata.push({
@@ -145,6 +143,7 @@ beforeEach(async () => {
   existingStates = [];
   storedProfile = null;
   metadataReadError = null;
+  metadataWriteError = null;
   savedMetadata.length = 0;
   deletedArtifacts.length = 0;
   upsertedBatches.length = 0;
@@ -214,6 +213,28 @@ describe("context effective profile compatibility", () => {
       `search_document: context:reference:reference.md\n${content}`,
     );
     expect(String(points[0].payload.content).length).toBeGreaterThan(20);
+  });
+
+  it("does not mutate context vectors when the mandatory profile checkpoint fails", async () => {
+    const service = await loadContextService();
+    const project = await createProject("reference.md", "changed context content");
+    collectionInfo = { pointsCount: 1, status: "green" };
+    existingStates = [{
+      name: "reference",
+      description: "Reference documentation",
+      resolvedPath: path.join(project, "reference.md"),
+      contentHash: "old-hash",
+      lastIndexedAt: "2026-01-01T00:00:00.000Z",
+      chunksIndexed: 1,
+    }];
+    metadataWriteError = new Error("metadata write forbidden");
+
+    await expect(service.ensureArtifactsIndexed(project)).rejects.toThrow(
+      "metadata write forbidden",
+    );
+
+    expect(deletedArtifacts).toEqual([]);
+    expect(upsertedBatches).toEqual([]);
   });
 
   it("continues using the stored context provider after requested values change", async () => {

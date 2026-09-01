@@ -43,10 +43,6 @@ vi.mock("../../src/services/embedding-provider.js", () => ({
 }));
 
 vi.mock("../../src/services/qdrant.js", () => ({
-  adoptEffectiveIndexProfile: vi.fn(async (
-    _collection: string,
-    profile: EffectiveIndexProfile,
-  ) => profile),
   deleteArtifactChunks: vi.fn(async () => undefined),
   deleteCollection: vi.fn(async () => undefined),
   deleteContextMetadata: vi.fn(async () => undefined),

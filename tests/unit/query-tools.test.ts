@@ -36,10 +36,6 @@ const mockGetProjectMetadata = vi.fn(async () => null);
 const mockLoadProjectEffectiveProfile = vi.fn(async (): Promise<EffectiveIndexProfile | null> => null);
 
 vi.mock("../../src/services/qdrant.js", () => ({
-  adoptEffectiveIndexProfile: vi.fn(async (
-    _collection: string,
-    profile: EffectiveIndexProfile,
-  ) => profile),
   searchChunks: (...args: unknown[]) => mockSearchChunks(...(args as [string, string, number])),
   searchMultipleCollections: (...args: unknown[]) => mockSearchMultipleCollections(...(args as [])),
   getCollectionInfo: (...args: unknown[]) => mockGetCollectionInfo(...(args as [string])),
@@ -231,9 +227,8 @@ describe("codebase_status: effective profile", () => {
     mockGetProjectMetadata.mockResolvedValue(null);
   });
 
-  it("reports pending requested settings and legacy-unverified fields without rejecting status", async () => {
-    const { legacyIndexProfile } = await import("../../src/services/index-profile.js");
-    mockLoadProjectEffectiveProfile.mockResolvedValue(legacyIndexProfile("code"));
+  it("resolves an unprofiled legacy index without writing during status", async () => {
+    mockLoadProjectEffectiveProfile.mockResolvedValue(null);
 
     const output = await handleQueryTool("codebase_status", {
       projectPath: TEST_PATH,

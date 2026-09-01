@@ -36,7 +36,6 @@ import {
 } from "./index-profile.js";
 import { logger } from "./logger.js";
 import {
-  adoptEffectiveIndexProfile,
   deleteArtifactChunks,
   deleteCollection,
   deleteContextMetadata,
@@ -944,18 +943,12 @@ export async function getArtifactStatusSummary(projectPath: string): Promise<{
   }
 
 
-  let effectiveProfile = resolveEffectiveIndexProfile(
+  const effectiveProfile = resolveEffectiveIndexProfile(
     "context",
     existingMetadata?.effectiveProfile ?? null,
     (collectionInfo?.pointsCount ?? 0) > 0,
     collectionInfo?.denseVectorSize,
   );
-  if (
-    existingMetadata?.effectiveProfile == null &&
-    (collectionInfo?.pointsCount ?? 0) > 0
-  ) {
-    effectiveProfile = await adoptEffectiveIndexProfile(collection, effectiveProfile);
-  }
   const requestedProfile = requestedIndexProfile("context");
   const profileDifferences = indexProfileDifferences(effectiveProfile, requestedProfile);
   if (profileDifferences.length > 0) {

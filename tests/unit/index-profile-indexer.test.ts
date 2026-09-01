@@ -10,6 +10,7 @@ import type { EffectiveIndexProfile } from "../../src/services/index-profile.js"
 let collectionInfo: { pointsCount: number; status: string } | null = null;
 let storedHashes: Map<string, string> | null = null;
 let storedProfile: EffectiveIndexProfile | null = null;
+let metadataWriteError: Error | null = null;
 let tempRoot = "";
 
 const savedMetadata: Array<{
@@ -88,6 +89,7 @@ vi.mock("../../src/services/qdrant.js", () => ({
     status: string,
     profile: EffectiveIndexProfile,
   ) => {
+    if (metadataWriteError) throw metadataWriteError;
     storedHashes = new Map(hashes);
     storedProfile = profile;
     savedMetadata.push({ hashes: new Map(hashes), status, profile });
@@ -159,6 +161,7 @@ beforeEach(async () => {
   collectionInfo = null;
   storedHashes = null;
   storedProfile = null;
+  metadataWriteError = null;
   savedMetadata.length = 0;
   deletedFiles.length = 0;
   upsertedBatches.length = 0;
@@ -212,6 +215,21 @@ describe("code-index effective profile compatibility", () => {
     expect(points[0].bm25Text).toBe(`search_document: notes.txt\n${content}`);
     expect((points[0].payload as { content: string }).content.length).toBeGreaterThan(20);
     expect(savedMetadata.at(-1)?.profile.source).toBe("legacy-adopted");
+  });
+
+  it("does not mutate vectors when the mandatory profile checkpoint fails", async () => {
+    const indexer = await loadIndexer();
+    const project = await createProject("notes.txt", "changed source content");
+    collectionInfo = { pointsCount: 1, status: "green" };
+    storedHashes = new Map([["notes.txt", indexer.hashContent("old source")]]);
+    metadataWriteError = new Error("metadata write forbidden");
+
+    await expect(indexer.updateProjectIndex(project)).rejects.toThrow(
+      "metadata write forbidden",
+    );
+
+    expect(deletedFiles).toEqual([]);
+    expect(upsertedBatches).toEqual([]);
   });
 
   it("continues using an adopted provider and model after requested values change", async () => {

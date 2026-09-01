@@ -256,7 +256,7 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
     expect(mockGenerateQueryEmbedding).toHaveBeenCalledWith("q", "search_query: ");
   });
 
-  it("persists the first legacy adoption and uses Qdrant's stored vector width", async () => {
+  it("uses Qdrant's stored vector width without persisting from the search path", async () => {
     vi.stubEnv("EMBEDDING_PROVIDER", "openai");
     vi.stubEnv("EMBEDDING_MODEL", "requested-model-a");
     vi.stubEnv("EMBEDDING_DIMENSIONS", "11");
@@ -266,15 +266,8 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
       points_count: 1,
       config: { params: { vectors: { dense: { size: 7, distance: "Cosine" } } } },
     });
-    let metadataPayload: Record<string, unknown> = { projectPath: "/project" };
+    const metadataPayload: Record<string, unknown> = { projectPath: "/project" };
     mockRetrieve.mockImplementation(async () => [{ payload: metadataPayload }]);
-    mockSetPayload.mockImplementation(async (
-      _collection: string,
-      args: { payload: Record<string, unknown> },
-    ) => {
-      metadataPayload = { ...metadataPayload, ...args.payload };
-      return { status: "completed" };
-    });
     mockQuery.mockResolvedValue({ points: [] });
     const observedDimensions: number[] = [];
     mockGenerateQueryEmbedding.mockImplementation(async () => {
@@ -288,16 +281,8 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
 
     await searchMultipleCollections([COLLECTIONS[0]], "first", 10);
 
-    const persisted = JSON.parse(
-      metadataPayload.effectiveIndexProfile as string,
-    ) as ReturnType<typeof effectiveProfile>;
-    expect(persisted.embedding).toMatchObject({
-      provider: "openai",
-      model: "requested-model-a",
-      dimensions: 7,
-    });
-    expect(persisted.legacyUnverifiedFields).not.toContain("embedding.dimensions");
-    expect(mockSetPayload).toHaveBeenCalledOnce();
+    expect(metadataPayload).not.toHaveProperty("effectiveIndexProfile");
+    expect(mockSetPayload).not.toHaveBeenCalled();
 
     vi.stubEnv("EMBEDDING_PROVIDER", "google");
     vi.stubEnv("EMBEDDING_MODEL", "requested-model-b");
@@ -305,8 +290,7 @@ describe("dense-vector handling for cross-project ranking (#94)", () => {
     resetEmbeddingConfig();
     await searchMultipleCollections([COLLECTIONS[0]], "second", 10);
 
-    expect(mockSetPayload).toHaveBeenCalledOnce();
-    expect(JSON.parse(metadataPayload.effectiveIndexProfile as string)).toEqual(persisted);
+    expect(mockSetPayload).not.toHaveBeenCalled();
     expect(observedDimensions).toEqual([7, 7]);
   });
 

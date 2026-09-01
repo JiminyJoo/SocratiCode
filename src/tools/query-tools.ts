@@ -15,7 +15,6 @@ import type { IndexingProgress } from "../services/indexer.js";
 import { getIndexingProgress, getLastCompleted, isIndexingInProgress } from "../services/indexer.js";
 import { getLockHolderPid } from "../services/lock.js";
 import {
-  adoptEffectiveIndexProfile,
   getCollectionInfo,
   getProjectMetadata,
   loadProjectEffectiveProfile,
@@ -196,15 +195,12 @@ export async function handleQueryTool(
         `Indexed chunks: ${info.pointsCount}`,
       ];
 
-      let effectiveProfile = resolveEffectiveIndexProfile(
+      const effectiveProfile = resolveEffectiveIndexProfile(
         "code",
         storedProfile,
         info.pointsCount > 0,
         info.denseVectorSize,
       );
-      if (storedProfile === null && info.pointsCount > 0) {
-        effectiveProfile = await adoptEffectiveIndexProfile(collection, effectiveProfile);
-      }
       const requestedProfile = requestedIndexProfile("code");
       const profileDifferences = indexProfileDifferences(effectiveProfile, requestedProfile);
       if (profileDifferences.length > 0) {
