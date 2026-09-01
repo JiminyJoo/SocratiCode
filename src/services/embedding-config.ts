@@ -40,6 +40,11 @@
  *                          Default: http://localhost:1234/v1
  *   LMSTUDIO_API_KEY:      Optional API key. LM Studio's Local Server has no auth by default;
  *                          set this only if you've enabled an API key in LM Studio.
+ *   LMSTUDIO_ALLOW_MISSING_MODEL_LISTING: Opt-in ("true" / "1" / "yes"). Accepts an
+ *                          OpenAI-compatible server whose /v1/models endpoint is absent
+ *                          (404/405) — e.g. HuggingFace Text Embeddings Inference — by
+ *                          falling back to an /v1/embeddings probe. Default off.
+ *                          Any other non-empty value is rejected with an error.
  *
  * LiteLLM-specific:
  *   LITELLM_URL:               OpenAI-compatible base URL of the LiteLLM proxy.
@@ -88,6 +93,11 @@ export interface EmbeddingConfig {
   lmstudioUrl: string;
   /** LiteLLM proxy OpenAI-compatible base URL (only relevant when embeddingProvider is "litellm"). */
   litellmUrl: string;
+  /**
+   * Accept an OpenAI-compatible server with no /v1/models endpoint (only relevant when
+   * embeddingProvider is "lmstudio"). See LMSTUDIO_ALLOW_MISSING_MODEL_LISTING above.
+   */
+  allowMissingModelListing: boolean;
   embeddingModel: string;
   embeddingDimensions: number;
   /** Max context window in tokens. Used for client-side pre-truncation. */
@@ -183,6 +193,31 @@ export function queryPrefix(): string {
  */
 export function documentPrefix(): string {
   return process.env.EMBEDDING_DOCUMENT_PREFIX ?? DEFAULT_DOCUMENT_PREFIX;
+}
+
+// ── Boolean env vars ──────────────────────────────────────────────────────
+
+/**
+ * Parse a boolean env var: case-insensitive and whitespace-tolerant, with
+ * "true" / "1" / "yes" enabling and "false" / "0" / "no" disabling. Unset,
+ * empty, and whitespace-only all mean "not configured", so the caller's
+ * default applies.
+ *
+ * Anything else throws, naming the variable and the value. A typo such as
+ * "ture" is a request for the flag to be on, and silently treating it as off
+ * would leave the operator debugging the behaviour they thought they had
+ * disabled the flag out of.
+ */
+function parseBooleanEnv(name: string, raw: string | undefined, defaultValue: boolean): boolean {
+  if (!raw) return defaultValue;
+  const v = raw.trim().toLowerCase();
+  if (v === "") return defaultValue;
+  if (v === "true" || v === "1" || v === "yes") return true;
+  if (v === "false" || v === "0" || v === "no") return false;
+  throw new Error(
+    `Invalid ${name}: "${raw}". Must be "true", "1", "yes", "false", "0", or "no" ` +
+    `(case-insensitive), or left unset.`,
+  );
 }
 
 // ── Singleton ─────────────────────────────────────────────────────────────
@@ -311,6 +346,11 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
     ollamaUrl: process.env.OLLAMA_URL || modeDefaults.url,
     lmstudioUrl: process.env.LMSTUDIO_URL || "http://localhost:1234/v1",
     litellmUrl: process.env.LITELLM_URL || "http://localhost:4000/v1",
+    allowMissingModelListing: parseBooleanEnv(
+      "LMSTUDIO_ALLOW_MISSING_MODEL_LISTING",
+      process.env.LMSTUDIO_ALLOW_MISSING_MODEL_LISTING,
+      false,
+    ),
     embeddingModel,
     embeddingDimensions,
     embeddingContextLength: contextLengthEnv
@@ -337,6 +377,7 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
     } : {}),
     ...(embeddingProvider === "lmstudio" ? {
       lmstudioUrl: _config.lmstudioUrl,
+      allowMissingModelListing: _config.allowMissingModelListing,
     } : {}),
     ...(embeddingProvider === "litellm" ? {
       litellmUrl: _config.litellmUrl,

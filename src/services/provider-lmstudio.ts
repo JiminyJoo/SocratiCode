@@ -19,6 +19,8 @@
  *   LMSTUDIO_URL=http://localhost:1234/v1   (default)
  *   LMSTUDIO_API_KEY=<key>                  (only if you've enabled API key auth in LM Studio)
  *   EMBEDDING_CONTEXT_LENGTH=<tokens>       (defaults to 2048 if model unknown)
+ *   LMSTUDIO_ALLOW_MISSING_MODEL_LISTING=true  (accept servers without /v1/models, e.g. TEI;
+ *                                           resolved in embedding-config.ts)
  */
 
 import OpenAI from "openai";
@@ -84,6 +86,26 @@ function pretruncateTexts(texts: string[], contextLength: number): string[] {
   return texts.map((t) => (t.length > maxChars ? t.substring(0, maxChars) : t));
 }
 
+// ── Missing-endpoint detection ──────────────────────────────────────────
+
+/**
+ * Whether a `models.list()` failure means the endpoint itself is absent.
+ *
+ * Only 404 (no such route) and 405 (route exists for other verbs) say "this
+ * server has no model listing". A refused connection, a 401, or a 5xx say
+ * something else is wrong, and the LM Studio-specific guidance is then the more
+ * useful answer — so those must not be mistaken for a single-model server.
+ *
+ * The OpenAI SDK surfaces HTTP failures as APIError subclasses carrying a
+ * `.status` field. We duck-type on it rather than importing those classes, the
+ * same way `provider-litellm.ts` detects auth errors.
+ */
+function isMissingEndpointError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const status = (err as { status?: unknown }).status;
+  return status === 404 || status === 405;
+}
+
 // ── Provider class ──────────────────────────────────────────────────────
 
 export class LMStudioEmbeddingProvider implements EmbeddingProvider {
@@ -96,18 +118,70 @@ export class LMStudioEmbeddingProvider implements EmbeddingProvider {
     // Step 1 — connectivity. The Local Server might be off, the port might be wrong,
     // or LM Studio itself might not be running. Surface those as a single actionable
     // message before checking model load state.
+    //
+    // Not every OpenAI-compatible server implements /v1/models. Single-model servers
+    // such as HuggingFace Text Embeddings Inference (TEI) fix the model at startup
+    // via --model-id and return 404 for the listing endpoint, even though
+    // /v1/embeddings works normally. Only that case — an absent endpoint, opted into
+    // via LMSTUDIO_ALLOW_MISSING_MODEL_LISTING — falls back to probing
+    // /v1/embeddings with one throwaway input. Every other failure keeps the LM
+    // Studio guidance below, which is what an operator who forgot to start the
+    // Local Server needs to read.
     let modelList: Awaited<ReturnType<typeof client.models.list>>;
     try {
       modelList = await client.models.list();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `LM Studio is not reachable at ${config.lmstudioUrl}. ` +
-        "Make sure LM Studio is running and the Local Server is started " +
-        "(Local Server tab > Start Server). " +
-        "If you've changed the port, set LMSTUDIO_URL accordingly (e.g. http://localhost:5678/v1). " +
-        `Underlying error: ${message}`,
-      );
+      const listingMessage = err instanceof Error ? err.message : String(err);
+
+      if (!(config.allowMissingModelListing && isMissingEndpointError(err))) {
+        throw new Error(
+          `LM Studio is not reachable at ${config.lmstudioUrl}. ` +
+          "Make sure LM Studio is running and the Local Server is started " +
+          "(Local Server tab > Start Server). " +
+          "If you've changed the port, set LMSTUDIO_URL accordingly (e.g. http://localhost:5678/v1). " +
+          (config.allowMissingModelListing
+            ? ""
+            : "If your server is OpenAI-compatible but has no /v1/models endpoint (e.g. TEI), " +
+              "set LMSTUDIO_ALLOW_MISSING_MODEL_LISTING=true to probe /v1/embeddings instead. ") +
+          `Underlying error: ${listingMessage}`,
+        );
+      }
+
+      // Fall back to an embedding probe. A single short input is enough: if it
+      // succeeds, both the server and the configured model are usable.
+      let probe: number[];
+      try {
+        probe = await this.embedSingle("probe");
+      } catch (probeErr) {
+        const probeMessage =
+          probeErr instanceof Error ? probeErr.message : String(probeErr);
+        throw new Error(
+          `The embedding server at ${config.lmstudioUrl} has no /v1/models endpoint and its ` +
+          "/v1/embeddings endpoint did not answer either. Check that the server is running and " +
+          "that LMSTUDIO_URL points at its OpenAI-compatible base URL (it must include the /v1 " +
+          `suffix). Model listing error: ${listingMessage}. Embedding probe error: ${probeMessage}`,
+        );
+      }
+
+      // Without /v1/models this probe is the only chance to catch a wrong
+      // EMBEDDING_DIMENSIONS. The value sizes the Qdrant collection, so a mismatch
+      // resurfaces later as an opaque vector-dimension error from the database.
+      if (probe.length !== config.embeddingDimensions) {
+        throw new Error(
+          `The embedding server at ${config.lmstudioUrl} returns ${probe.length}-dimensional ` +
+          `vectors for model "${config.embeddingModel}", but EMBEDDING_DIMENSIONS is set to ` +
+          `${config.embeddingDimensions}. Set EMBEDDING_DIMENSIONS=${probe.length} to match the ` +
+          "model, or point EMBEDDING_MODEL at a model of the expected width.",
+        );
+      }
+
+      logger.info("Embedding provider ready via embedding probe", {
+        baseUrl: config.lmstudioUrl,
+        model: config.embeddingModel,
+        dimensions: probe.length,
+        note: "/v1/models unavailable — model load state not verified",
+      });
+      return { modelPulled: false, containerStarted: false, imagePulled: false };
     }
 
     // Step 2 — model loaded. LM Studio's /v1/models lists the currently-loaded
@@ -168,8 +242,12 @@ export class LMStudioEmbeddingProvider implements EmbeddingProvider {
     const lines: string[] = [];
     const icon = (ok: boolean) => (ok ? "[OK]" : "[MISSING]");
 
+    // Outside the try: a client that cannot even be constructed is a configuration
+    // fault, not a reachability one, and must not be reported as an unreachable
+    // server (nor retried through the probe, which would fail identically).
+    const client = getClient();
+
     try {
-      const client = getClient();
       const models = await client.models.list();
       lines.push(`${icon(true)} LM Studio: Reachable at ${config.lmstudioUrl}`);
 
@@ -186,6 +264,43 @@ export class LMStudioEmbeddingProvider implements EmbeddingProvider {
       return { available: true, modelReady: modelLoaded, statusLines: lines };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+
+      // A server whose /v1/models endpoint is absent is not necessarily down — see
+      // LMSTUDIO_ALLOW_MISSING_MODEL_LISTING. Probe /v1/embeddings before reporting a
+      // failure, otherwise codebase_health misreports a working TEI server as
+      // unreachable. Same failure-kind test as ensureReady: anything other than a
+      // missing endpoint is reported as-is.
+      if (config.allowMissingModelListing && isMissingEndpointError(err)) {
+        try {
+          // Keep the probe's width: without /v1/models this is the only check on
+          // EMBEDDING_DIMENSIONS, and ensureReady() refuses a mismatch. Reporting
+          // the model ready here would contradict it for the same configuration.
+          const probe = await this.embedSingle("probe");
+          const dimensionsMatch = probe.length === config.embeddingDimensions;
+          lines.push(
+            `${icon(true)} Embedding server: Reachable at ${config.lmstudioUrl} ` +
+            "(/v1/models unavailable — verified via /v1/embeddings)",
+          );
+          lines.push(
+            `${icon(dimensionsMatch)} Embedding model (${config.embeddingModel}): ` +
+            (dimensionsMatch
+              ? "Responding (load state not verifiable without /v1/models)"
+              : `Returns ${probe.length}-dimensional vectors, but EMBEDDING_DIMENSIONS ` +
+                `is set to ${config.embeddingDimensions}. Set EMBEDDING_DIMENSIONS=` +
+                `${probe.length} to match the model`),
+          );
+          return { available: true, modelReady: dimensionsMatch, statusLines: lines };
+        } catch (probeErr) {
+          const probeMessage =
+            probeErr instanceof Error ? probeErr.message : String(probeErr);
+          lines.push(
+            `${icon(false)} Embedding server: Not reachable at ${config.lmstudioUrl} ` +
+            `(model listing: ${message}; embedding probe: ${probeMessage})`,
+          );
+          return { available: false, modelReady: false, statusLines: lines };
+        }
+      }
+
       lines.push(`${icon(false)} LM Studio: Not reachable at ${config.lmstudioUrl} (${message})`);
       return { available: false, modelReady: false, statusLines: lines };
     }
