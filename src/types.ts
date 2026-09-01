@@ -87,6 +87,8 @@ export interface ArtifactIndexState {
   description: string;
   /** Resolved absolute path */
   resolvedPath: string;
+  /** Hash of the artifact path and description settings used for this index. */
+  configurationSignature?: string;
   /** Content hash at the time of last indexing */
   contentHash: string;
   /** ISO timestamp of last indexing */

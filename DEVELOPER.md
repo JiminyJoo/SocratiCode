@@ -218,9 +218,9 @@ tests/
 ├── helpers/
 │   ├── fixtures.ts          # Test fixture utilities (temp projects, Docker checks)
 │   └── setup.ts             # Integration test infrastructure (Qdrant client, cleanup)
-├── unit/                    # 608 tests — no Docker required
-├── integration/             # 137 tests — requires Docker
-└── e2e/                     # 20 tests — full lifecycle
+├── unit/                    # No Docker required
+├── integration/             # Requires Docker
+└── e2e/                     # Full lifecycle
 
 docker-compose.yml           # Alternative way to run infrastructure
 vitest.config.ts             # Test framework configuration
@@ -342,20 +342,26 @@ When `codebase_index` is called:
    ├── Check for nomic-embed-text model
    └── Pull model if missing
 
-2. FILE DISCOVERY
+2. EFFECTIVE PROFILE RESOLUTION
+   ├── Load the collection's versioned effective index profile
+   ├── Infer released legacy defaults when existing metadata has no profile
+   ├── Keep requested changes pending for a collection that already has vectors
+   └── Use requested settings only when no collection profile remains; an empty profiled collection still keeps its profile
+
+3. FILE DISCOVERY
    getIndexableFiles(projectPath, extraExts?)
    ├── glob("**/*") to enumerate all files
    ├── Build ignore filter: defaults + .gitignore + .socraticodeignore
    ├── Filter by supported extension, special filename, or extra extensions
    └── Filter out ignored paths
 
-3. COLLECTION SETUP
+4. COLLECTION SETUP
    ensureCollection(collectionName)
    ├── Check if collection exists
    ├── Create with: provider-dependent dimensions (768/1536/3072), cosine distance, on-disk payload
    └── Create payload indexes: filePath, relativePath, language, contentHash
 
-4. FILE SCANNING & CHUNKING (parallel batches of 50 files)
+5. FILE SCANNING & CHUNKING (parallel batches of 50 files)
    ├── Read file content (skip if > 5 MB or unreadable)
    ├── Hash content: SHA-256 → 16-char prefix
    ├── Skip if hash matches existing (re-index mode)
@@ -371,7 +377,7 @@ When `codebase_index` is called:
    ├── Generate chunk ID: SHA-256 of "filePath:startLine" formatted as UUID
    └── Detect language from file extension
 
-5. BATCHED EMBEDDING + UPSERT (50 files per batch)
+6. BATCHED EMBEDDING + UPSERT (50 files per batch)
    For each batch of files:
    ├── Prepare text: "{documentPrefix}{relativePath}\n{content}" (prefix defaults to "search_document: ", see EMBEDDING_DOCUMENT_PREFIX; the path is dropped when EMBEDDING_DOCUMENT_INCLUDE_PATH=false)
    ├── Generate embeddings via configured provider (further batched internally)
@@ -380,7 +386,7 @@ When `codebase_index` is called:
    ├── Checkpoint: persist hashes to Qdrant (progress survives crashes)
    └── Check for cancellation request before next batch
 
-6. POST-INDEX
+7. POST-INDEX
    ├── Save final metadata (status: "completed")
    ├── Auto-build code dependency graph (non-fatal on failure)
    └── Auto-index context artifacts if config exists (non-fatal on failure)
@@ -394,8 +400,9 @@ When `codebase_search` is called:
 
 ```
 1. Generate query embedding
-   ├── Prepare text: "search_query: {query}" (default; see EMBEDDING_QUERY_PREFIX)
-   └── Send to configured embedding provider → provider-dependent vector (768 / 1536 / 3072 dims)
+   ├── Load the collection's effective query and embedding profile
+   ├── Prepare text with that profile's query prefix
+   └── Send to that profile's provider and model
 
 2. HYBRID SEARCH (dense + BM25, RRF-fused)
    ├── Build two parallel prefetch sub-queries:
@@ -418,6 +425,16 @@ The `nomic-embed-text` model uses task-specific prefixes for asymmetric retrieva
 This asymmetric encoding significantly improves retrieval quality.
 
 These are the defaults, kept for backward compatibility. Override them with `EMBEDDING_QUERY_PREFIX` / `EMBEDDING_DOCUMENT_PREFIX` to match a different model's expected prefixes (e.g. `query: ` / `passage: ` for `multilingual-e5-*`, none for `bge-m3`). See the README's environment variable table for the full details.
+
+### Effective Index Profiles
+
+Each code collection and context collection stores a versioned effective profile. It records the query and document prefixes, document-path inclusion, chunk cap, embedding provider, model, dimensions, effective context length, LiteLLM dimensions flag, and format version. Code profiles also record the extension-language map and maximum file size.
+
+An existing collection always uses its effective profile for incremental updates, watcher events, and search. Requested differences are status-only pending changes. Removing and freshly indexing the collection records the requested profile. A legacy collection without profile metadata adopts the released prefix, path, and chunk defaults without rewriting vectors; unavailable historical embedding and code-scanning values are marked `legacy-unverified`.
+
+Linked search computes one query vector per compatible verified effective query profile. Legacy-unverified embedding identities are never grouped across collections.
+
+Context artifact states also store a configuration signature covering the configured path, resolved path, and description. A signature change replaces that artifact's vectors and payloads even when its content hash is unchanged.
 
 ---
 
@@ -559,7 +576,7 @@ Uses depth-first search (DFS) with a recursion stack to find cycles in the direc
 
 ## Testing
 
-SocratiCode uses **vitest** as its test framework with **765 tests** across three layers.
+SocratiCode uses **vitest** as its test framework across three layers.
 
 ### Running Tests
 
@@ -585,11 +602,11 @@ npm run test:coverage
 
 ### Test Architecture
 
-| Layer | Directory | Tests | Docker | Description |
-|-------|-----------|-------|--------|-------------|
-| Unit | `tests/unit/` | 608 | No | Pure logic: config, constants, ignore rules, cross-process locking, logging, graph analysis, import extraction, path resolution, startup lifecycle |
-| Integration | `tests/integration/` | 137 | Yes | Real Docker containers: Qdrant CRUD, real Ollama embeddings, indexer, watcher, code graph, all 21 MCP tools |
-| E2E | `tests/e2e/` | 20 | Yes | Full lifecycle: health check → index → search → graph build/query/stats → watch → remove |
+| Layer | Directory | Docker | Description |
+|-------|-----------|--------|-------------|
+| Unit | `tests/unit/` | No | Pure logic: config, constants, ignore rules, cross-process locking, logging, graph analysis, import extraction, path resolution, startup lifecycle |
+| Integration | `tests/integration/` | Yes | Real Docker containers: Qdrant CRUD, real Ollama embeddings, indexer, watcher, code graph, all MCP tools |
+| E2E | `tests/e2e/` | Yes | Full lifecycle: health check → index → search → graph build/query/stats → watch → remove |
 
 ### Test Infrastructure
 
@@ -780,9 +797,9 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings for the texts as given — batching and retries only, no prefixing (callers pass text from `prepareDocumentText`) |
-| `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding, prefixed with `search_query: ` (default; env-configurable via `EMBEDDING_QUERY_PREFIX`) |
-| `prepareDocumentText` | `(content, filePath) → string` | Build the text to embed: `search_document: ` prefix, then the relative path, then the content (prefix env-configurable via `EMBEDDING_DOCUMENT_PREFIX`; the path is dropped when `EMBEDDING_DOCUMENT_INCLUDE_PATH=false`) |
+| `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings for the texts as given; batching and retries only, no prefixing (callers pass text from `prepareDocumentText`) |
+| `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding, prefixed with `search_query:` followed by a space (default; env-configurable via `EMBEDDING_QUERY_PREFIX`) |
+| `prepareDocumentText` | `(content, filePath, profile?) → string` | Build the text to embed. `profile.documentPrefix` controls the prefix and `profile.documentIncludesPath` controls whether the file path precedes the content; omitting the profile uses the requested runtime settings. |
 
 ### indexer.ts
 
@@ -1467,7 +1484,8 @@ Edit `CHUNK_SIZE` and `CHUNK_OVERLAP` in `src/constants.ts`. Smaller chunks give
 
 1. Set `EMBEDDING_PROVIDER` in your MCP config env block (`ollama`, `openai`, or `google`).
 2. Optionally override `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` for the chosen provider (auto-detected defaults exist for all built-in models).
-3. Re-index all projects (`codebase_remove` then `codebase_index`) since existing vectors have different dimensions.
+3. Existing collections continue using their stored effective profile. Confirm pending differences with `codebase_status`.
+4. Activate the requested settings for each intended collection with `codebase_remove`, then `codebase_index`.
 
 See `src/services/embedding-config.ts` for all supported environment variables and per-provider defaults.
 

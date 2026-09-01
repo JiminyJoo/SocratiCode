@@ -1203,6 +1203,10 @@ QDRANT_URL = "https://xyz.qdrant.io"
 
 The rest of this section documents the variables themselves. Pass them using whichever syntax matches your host.
 
+### Effective Index Profiles
+
+Code and context collections persist the settings that define their stored representation. Existing collections continue using that effective profile for indexing, watcher updates, and search. Search and status resolve an unprofiled legacy collection without writing metadata; the next indexing or update operation persists the resolved profile before changing vectors. A changed embedding provider, model, dimension, context length, query or document prefix, path-inclusion setting, chunk cap, extension-language map, file-size cap, or LiteLLM dimensions flag is reported by `codebase_status` as pending and does not partially change the collection. Remove the collection with `codebase_remove`, then run `codebase_index` to activate the requested profile in a fresh index. Legacy collections remain usable with the released defaults for newly introduced settings; historically unavailable values are marked `legacy-unverified`.
+
 ### Embedding Provider
 
 | Variable | Default | Description |
@@ -1212,8 +1216,8 @@ The rest of this section documents the variables themselves. Pass them using whi
 | `EMBEDDING_DIMENSIONS` | *(per provider)* | Vector dimensions. Defaults: `768` (ollama), `1536` (openai), `3072` (google). **Required** for `lmstudio` and `litellm` (no default; varies per loaded model / proxy alias). |
 | `EMBEDDING_CONTEXT_LENGTH` | *(auto-detected)* | Model context window in tokens. Auto-detected for known model names (works for LiteLLM aliases that match the underlying model name). Set manually for custom LM Studio models or arbitrary LiteLLM aliases. |
 | `EMBEDDING_QUERY_PREFIX` | `"search_query: "` | Task prefix prepended to queries before embedding. Match it to your model: `"query: "` for `multilingual-e5-*`, `"検索クエリ: "` for `cl-nagoya/ruri-v3-*`, and an empty string for `bge-m3` (which expects no prefix). Set to `""` to disable. Leaving the variable out and setting it to an empty value are not the same: unset keeps the default, while nothing after the `=` means no prefix at all. |
-| `EMBEDDING_DOCUMENT_PREFIX` | `"search_document: "` | Task prefix prepended to documents before embedding. Counterparts: `"passage: "` for `multilingual-e5-*`, `"検索文書: "` for `cl-nagoya/ruri-v3-*`, empty for `bge-m3`. Set to `""` to disable, with the same unset-versus-empty distinction as above. Must be changed together with `EMBEDDING_QUERY_PREFIX`. Requires a full re-index: run `codebase_remove` for the project, then `codebase_index` — a plain re-run skips unchanged files by content hash and would leave old vectors behind. |
-| `EMBEDDING_DOCUMENT_INCLUDE_PATH` | `true` | Whether the file path is embedded with the chunk, between `EMBEDDING_DOCUMENT_PREFIX` and the content. Accepts `true` / `1` / `yes` and `false` / `0` / `no`, case-insensitively and ignoring surrounding whitespace; leaving it empty is the same as leaving it unset, and any other value is rejected with an error naming it. Path tokens help path-shaped queries but add noise on prose-heavy corpora. Set to `false` to embed the document prefix and the chunk content only, with no separator between them other than whatever the prefix itself ends in. The same text feeds the dense embedding **and** the BM25 lexical index, so path-derived tokens stop matching in keyword search too, and for context artifacts the `context:<name>:<path>` identifier is dropped along with the path. Requires a full re-index: run `codebase_remove` for the project, then `codebase_index` — a plain re-run skips unchanged files by content hash and would leave old vectors behind. |
+| `EMBEDDING_DOCUMENT_PREFIX` | `"search_document: "` | Task prefix prepended to documents before embedding. Counterparts: `"passage: "` for `multilingual-e5-*`, `"検索文書: "` for `cl-nagoya/ruri-v3-*`, empty for `bge-m3`. Set to `""` to disable, with the same unset-versus-empty distinction as above. Must be changed together with `EMBEDDING_QUERY_PREFIX`. Existing collections keep their effective prefix; remove and freshly index the collection to activate a changed value. |
+| `EMBEDDING_DOCUMENT_INCLUDE_PATH` | `true` | Whether the file path is embedded with the chunk, between `EMBEDDING_DOCUMENT_PREFIX` and the content. Accepts `true` / `1` / `yes` and `false` / `0` / `no`, case-insensitively and ignoring surrounding whitespace; leaving it empty is the same as leaving it unset, and any other value is rejected with an error naming it. Path tokens help path-shaped queries but add noise on prose-heavy corpora. Set to `false` to embed the document prefix and the chunk content only, with no separator between them other than whatever the prefix itself ends in. The same text feeds the dense embedding **and** the BM25 lexical index, so path-derived tokens stop matching in keyword search too, and for context artifacts the `context:<name>:<path>` identifier is dropped along with the path. Existing collections keep their effective path setting; remove and freshly index the collection to activate a changed value. |
 
 ### Ollama Configuration (when `EMBEDDING_PROVIDER=ollama`)
 
@@ -1267,10 +1271,10 @@ The rest of this section documents the variables themselves. Pass them using whi
 | `RESPECT_GITIGNORE` | `true` | Set to `false` to skip `.gitignore` processing. Built-in defaults and `.socraticodeignore` still apply. |
 | `INCLUDE_DOT_FILES` | `false` | Set to `true` to include dot-directories (e.g. `.agent`, `.config`) in indexing. By default, directories and files starting with `.` are excluded. Useful for projects where important code lives in dot-directories. |
 | `EXTRA_EXTENSIONS` | *(none)* | Comma-separated list of additional file extensions to scan (e.g. `.tpl,.blade,.hbs`). Applies to both indexing and code graph. Files with extra extensions are indexed as plaintext and appear as leaf nodes in the code graph. Can also be passed per-operation via the `extraExtensions` tool parameter. |
-| `EXTENSION_LANGUAGE_MAP` | *(none)* | Comma-separated `extension:language` overrides that make a non-standard extension be treated as a real language end to end (semantic/AST chunking, symbols, call graph), e.g. `EXTENSION_LANGUAGE_MAP=.inc:php,.module:php` for Drupal/PHP. Unlike `EXTRA_EXTENSIONS` (which indexes as plaintext), the mapped extension gets the full language treatment and is auto-discovered without also listing it in `EXTRA_EXTENSIONS`. The target must be a language SocratiCode has an AST grammar for (the Full Support list above plus the AST-graph languages); unknown targets are ignored with a startup warning. Overrides built-in mappings too (e.g. `.h:cpp`). |
+| `EXTENSION_LANGUAGE_MAP` | *(none)* | Comma-separated `extension:language` overrides that make a non-standard extension be treated as a real language end to end (semantic/AST chunking, symbols, call graph), e.g. `EXTENSION_LANGUAGE_MAP=.inc:php,.module:php` for Drupal/PHP. Unlike `EXTRA_EXTENSIONS` (which indexes as plaintext), the mapped extension gets the full language treatment and is auto-discovered without also listing it in `EXTRA_EXTENSIONS`. The target must be a language SocratiCode has an AST grammar for (the Full Support list above plus the AST-graph languages); unknown targets are ignored with a startup warning. Overrides built-in mappings too (e.g. `.h:cpp`). Existing code collections keep their effective map until freshly indexed. |
 | `INDEX_EXTENSIONLESS` | `true` | When enabled (default), files with **no extension** are indexed when their content identifies them as code — a shebang (`#!/bin/bash`, `#!/usr/bin/env python3`, …) or a conservative content sniff (no-shebang Python/shell). A shebang with an unmapped interpreter (perl, awk, make, …) is indexed as searchable plaintext. Binaries (NUL byte in the head) and undetectable text (configs, licenses, data) are never indexed. The real on-disk path is always preserved — only the detected language/grammar is inferred, so `.txt`-detected files stay out of the code graph. Set `false` or `0` to restore the previous behavior (extensionless files indexed only when their exact name is a special file such as `Dockerfile`/`Makefile`). **Writer-consistency:** every process writing to one collection must agree on this flag — a mixed fleet would flap extensionless chunks on alternating runs. |
-| `MAX_FILE_SIZE_MB` | `5` | Maximum file size in MB. Files larger than this are skipped during indexing. Increase for repos with large generated or data files you want indexed. |
-| `MAX_CHUNK_CHARS` | `2000` | Hard character cap per chunk. What the cap does depends on which path `chunkFileContent` takes. On the small-file single-chunk path, the AST path and the line-based path it **truncates**: content past the cap is dropped before the chunk is stored, so it reaches neither the vector, nor the payload, nor the keyword (BM25) text, and no search can retrieve it. On the minified/bundled path (average line length above `MAX_AVG_LINE_LENGTH`) the cap is instead the **split boundary**, so a lower cap yields more chunks rather than dropping content. Where it truncates on the AST path, the dropped tail is not recovered from the next chunk: adjacent AST chunks are cut at top-level declaration boundaries and do not overlap. Lower this cap to match an embedding model whose context is smaller than the default assumes. Raising it above the model's context length × the provider's chars-per-token estimate does not put more content into the embedding: the provider pre-truncates, so the extra characters reach the stored payload and the keyword (BM25) text but are not represented in the vector. Changing the cap changes the stored chunks, and re-running indexing alone does not apply it (unchanged files are skipped by content hash) — rebuild the index (`codebase_remove` then `codebase_index`). |
+| `MAX_FILE_SIZE_MB` | `5` | Maximum file size in MB. Files larger than this are skipped during indexing. Increase for repos with large generated or data files you want indexed. Existing code collections keep their effective limit until freshly indexed. A file that grows beyond the effective limit has its old chunks removed. |
+| `MAX_CHUNK_CHARS` | `2000` | Hard character cap per chunk. What the cap does depends on which path `chunkFileContent` takes. On the small-file single-chunk path, the AST path and the line-based path it **truncates**: content past the cap is dropped before the chunk is stored, so it reaches neither the vector, nor the payload, nor the keyword (BM25) text, and no search can retrieve it. On the minified/bundled path (average line length above `MAX_AVG_LINE_LENGTH`) the cap is instead the **split boundary**, so a lower cap yields more chunks rather than dropping content. Where it truncates on the AST path, the dropped tail is not recovered from the next chunk: adjacent AST chunks are cut at top-level declaration boundaries and do not overlap. Lower this cap to match an embedding model whose context is smaller than the default assumes. Raising it above the model's context length × the provider's chars-per-token estimate does not put more content into the embedding: the provider pre-truncates, so the extra characters reach the stored payload and the keyword (BM25) text but are not represented in the vector. Existing code and context collections keep their effective cap until freshly indexed. |
 | `SEARCH_DEFAULT_LIMIT` | `10` | Default number of results returned by `codebase_search` (1-50). Each result is a ranked code chunk with file path, line range, and content. Higher values give broader coverage but produce more output. Can still be overridden per-query via the `limit` tool parameter. |
 | `SEARCH_MIN_SCORE` | `0.10` | Minimum score threshold (0-1). Results below this score are filtered out. Helps remove low-relevance noise from search results. Set to `0` to disable filtering (returns all results up to `limit`). Can be overridden per-query via the `minScore` tool parameter. Works together with `limit`: results are first filtered by score, then capped at `limit`. The score is an RRF (Reciprocal Rank Fusion) value for a single-project search, and a cosine similarity for a cross-project one (`includeLinked: true`), which falls back to RRF when a cosine is unavailable for any hit — see Cross-Project Search below for why the scales differ and what that means for this threshold. |
 | `SOCRATICODE_PROJECT_ID` | *(none)* | Override the auto-generated project ID. When set, all paths resolve to the same Qdrant collections, allowing multiple directories (e.g. git worktrees of the same repo) to share a single index. Must match `[a-zA-Z0-9_-]+`. Takes precedence over the `projectId` field in `.socraticode.json`. |
@@ -1281,7 +1285,7 @@ The rest of this section documents the variables themselves. Pass them using whi
 | `SOCRATICODE_LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error` |
 | `SOCRATICODE_LOG_FILE` | *(none)* | Absolute path to a log file. When set, all log entries are appended to this file (a session separator is written on each server start). Useful for debugging when the MCP host doesn't surface log notifications. |
 
-> **Important**: If you change `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, or `EMBEDDING_DIMENSIONS` after indexing, you must re-index your projects (`codebase_remove` then `codebase_index`) since existing vectors have different dimensions.
+> **Important**: Existing collections keep their stored effective provider, model, and dimensions when runtime settings change. `codebase_status` reports requested differences as pending. To activate them, remove the collection with `codebase_remove`, then create a fresh index with `codebase_index`. This explicit rebuild is required for activation, not for continued use of the existing index.
 
 ## Docker Resources
 
@@ -1302,7 +1306,7 @@ All containers use `--restart unless-stopped` for automatic recovery.
 
 ## Testing
 
-SocratiCode has a comprehensive test suite with **634 tests** across unit, integration, and end-to-end layers.
+SocratiCode has a comprehensive test suite across unit, integration, and end-to-end layers.
 
 ### Prerequisites
 
@@ -1333,11 +1337,11 @@ npm run test:coverage
 
 ### Test Architecture
 
-| Layer | Tests | Docker? | Description |
-|-------|-------|---------|-------------|
-| **Unit** (`tests/unit/`) | 477 | No | Config, constants, ignore rules, cross-process locking, logging, graph analysis, import extraction, path resolution, embedding config, indexer utilities, embeddings, startup lifecycle, watcher cross-process awareness |
-| **Integration** (`tests/integration/`) | 137 | Yes | Docker/Ollama setup, Qdrant CRUD, real embeddings, indexer, watcher, code graph, all MCP tools |
-| **E2E** (`tests/e2e/`) | 20 | Yes | Complete lifecycle: health → index → search → graph → watch → remove  |
+| Layer | Docker? | Description |
+|-------|---------|-------------|
+| **Unit** (`tests/unit/`) | No | Config, constants, ignore rules, cross-process locking, logging, graph analysis, import extraction, path resolution, embedding config, indexer utilities, embeddings, startup lifecycle, watcher cross-process awareness |
+| **Integration** (`tests/integration/`) | Yes | Docker/Ollama setup, Qdrant CRUD, real embeddings, indexer, watcher, code graph, all MCP tools |
+| **E2E** (`tests/e2e/`) | Yes | Complete lifecycle: health → index → search → graph → watch → remove  |
 
 Integration and E2E tests that require Docker are automatically skipped when Docker is not available.
 
@@ -1467,11 +1471,11 @@ AI to *"list all indexed projects"* to see everything currently indexed.
 
 ### What happens if I change my embedding provider or model?
 
-Each collection is created with a fixed vector size matching the model used at index time.
-If you change `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, or `EMBEDDING_DIMENSIONS` in your
-MCP config, any projects indexed with the old model will return a dimension mismatch error.
-Ask your AI to *"remove the index for this project"* and then to index again with the new
-model. Projects you haven't touched are unaffected.
+Each collection keeps the effective provider, model, dimensions, and query behavior recorded
+when its index was created. Changing those settings in the MCP config does not alter an existing
+collection. Indexing and search continue with its stored profile, while `codebase_status` reports
+the requested settings as pending. To activate the new settings, ask your AI to *"remove the index
+for this project"* and then index it again. Other collections continue using their own profiles.
 
 ### How do I remove a project's index (e.g. to switch embedding model or reindex from scratch)?
 

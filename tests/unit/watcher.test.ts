@@ -57,9 +57,12 @@ vi.mock("../../src/config.js", () => ({
 
 const mockGetCollectionInfo = vi.fn(async (_c: string): Promise<{ pointsCount: number } | null> => null);
 const mockGetProjectMetadata = vi.fn(async (_c: string): Promise<Record<string, unknown> | null> => null);
+const mockLoadProjectEffectiveProfile = vi.fn(async (_c: string) => null);
 vi.mock("../../src/services/qdrant.js", () => ({
   getCollectionInfo: (...args: unknown[]) => mockGetCollectionInfo(...(args as [string])),
   getProjectMetadata: (...args: unknown[]) => mockGetProjectMetadata(...(args as [string])),
+  loadProjectEffectiveProfile: (...args: unknown[]) =>
+    mockLoadProjectEffectiveProfile(...(args as [string])),
 }));
 
 const mockAcquireProjectLock = vi.fn(async (_path: string, _type: string) => true);
@@ -103,6 +106,7 @@ describe("watcher (unit)", () => {
     mockIsIndexingInProgress.mockReturnValue(false);
     mockGetCollectionInfo.mockResolvedValue(null);
     mockGetProjectMetadata.mockResolvedValue(null);
+    mockLoadProjectEffectiveProfile.mockResolvedValue(null);
   });
 
   afterEach(async () => {
@@ -162,6 +166,113 @@ describe("watcher (unit)", () => {
       expect(isWatching(TEST_PROJECT)).toBe(false);
       expect(mockReleaseProjectLock).toHaveBeenCalledWith(RESOLVED_PROJECT, "watch");
       expect(progress.some((m) => m.includes("Failed to start watching"))).toBe(true);
+    });
+
+    it("subscribes without Qdrant and retries the effective profile on a later event", async () => {
+      vi.useFakeTimers();
+      mockGetCollectionInfo.mockRejectedValueOnce(new Error("Qdrant unavailable"));
+
+      const result = await startWatching(TEST_PROJECT);
+
+      expect(result).toBe(true);
+      expect(isWatching(TEST_PROJECT)).toBe(true);
+      expect(mockGetCollectionInfo).not.toHaveBeenCalled();
+
+      await mockSubscribeCallback?.(null, [
+        { path: path.join(RESOLVED_PROJECT, "file.ts"), type: "update" },
+      ]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Watch profile load failed; scheduling profile-aware update",
+        expect.objectContaining({ error: "Qdrant unavailable" }),
+      );
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(mockUpdateProjectIndex).toHaveBeenCalledWith(RESOLVED_PROJECT, undefined);
+      mockUpdateProjectIndex.mockClear();
+
+      mockGetCollectionInfo.mockResolvedValue({ pointsCount: 1 });
+      await mockSubscribeCallback?.(null, [
+        { path: path.join(RESOLVED_PROJECT, "file.ts"), type: "update" },
+      ]);
+      await vi.advanceTimersByTimeAsync(2100);
+
+      expect(mockGetCollectionInfo).toHaveBeenCalledTimes(2);
+      expect(mockUpdateProjectIndex).toHaveBeenCalledWith(RESOLVED_PROJECT, undefined);
+      vi.useRealTimers();
+    });
+
+    it("uses the stored profile extension map when filtering watcher events", async () => {
+      vi.useFakeTimers();
+      mockGetCollectionInfo.mockResolvedValue({ pointsCount: 1 });
+      mockLoadProjectEffectiveProfile.mockResolvedValue({
+        schemaVersion: 1,
+        indexFormatVersion: 1,
+        kind: "code",
+        source: "fresh",
+        queryPrefix: "query: ",
+        documentPrefix: "document: ",
+        documentIncludesPath: true,
+        maxChunkChars: 2000,
+        embedding: {
+          provider: "openai",
+          model: "test-model",
+          dimensions: 3,
+          contextLength: 512,
+          litellmSendDimensions: false,
+        },
+        extensionLanguageMap: { ".profilefixture": ".ts" },
+        maxFileBytes: 5_000_000,
+        legacyUnverifiedFields: [],
+      });
+      await startWatching(TEST_PROJECT);
+
+      await mockSubscribeCallback?.(null, [
+        {
+          path: path.join(RESOLVED_PROJECT, "file.profilefixture"),
+          type: "update",
+        },
+      ]);
+      await vi.advanceTimersByTimeAsync(2100);
+
+      expect(mockUpdateProjectIndex).toHaveBeenCalledWith(RESOLVED_PROJECT, undefined);
+      vi.useRealTimers();
+    });
+
+    it("ignores stale profile metadata after the collection was removed", async () => {
+      vi.useFakeTimers();
+      mockGetCollectionInfo.mockResolvedValue(null);
+      mockLoadProjectEffectiveProfile.mockResolvedValue({
+        schemaVersion: 1,
+        indexFormatVersion: 0,
+        kind: "code",
+        source: "legacy-adopted",
+        queryPrefix: "search_query: ",
+        documentPrefix: "search_document: ",
+        documentIncludesPath: true,
+        maxChunkChars: 2000,
+        embedding: {
+          provider: "ollama",
+          model: "nomic-embed-text",
+          dimensions: 768,
+          contextLength: 2048,
+          litellmSendDimensions: false,
+        },
+        extensionLanguageMap: { ".staleprofile": ".ts" },
+        maxFileBytes: 5_000_000,
+        legacyUnverifiedFields: ["extensionLanguageMap"],
+      });
+      await startWatching(TEST_PROJECT);
+
+      await mockSubscribeCallback?.(null, [
+        {
+          path: path.join(RESOLVED_PROJECT, "file.staleprofile"),
+          type: "update",
+        },
+      ]);
+      await vi.advanceTimersByTimeAsync(2100);
+
+      expect(mockLoadProjectEffectiveProfile).not.toHaveBeenCalled();
+      expect(mockUpdateProjectIndex).not.toHaveBeenCalled();
+      vi.useRealTimers();
     });
   });
 

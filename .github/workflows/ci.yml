@@ -37,3 +37,27 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run test:unit
+
+  node-floor-consumer-install:
+    name: Node 18.17 Consumer Install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18.17.0
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Verify package installation at the declared Node floor
+        shell: bash
+        run: |
+          set -euo pipefail
+          consumer_dir="$(mktemp -d)"
+          npm pack --pack-destination "$consumer_dir"
+          package_file="$(find "$consumer_dir" -maxdepth 1 -type f -name 'socraticode-*.tgz' -print -quit)"
+          test -n "$package_file"
+          cd "$consumer_dir"
+          npm init --yes
+          npm install --engine-strict "$package_file"
+          test -f node_modules/socraticode/dist/index.js
