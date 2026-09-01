@@ -130,18 +130,72 @@ export const QDRANT_UPSERT_BUDGET_BYTES = 25_165_824;
  */
 export const MAX_AVG_LINE_LENGTH = 500;
 
+/** Default hard character limit per chunk payload. */
+const DEFAULT_MAX_CHUNK_CHARS = 2000;
+
 /**
  * Hard character limit per chunk payload — the universal safety net applied
  * to every chunk regardless of chunking strategy (AST, line-based, or
  * character-based).
  *
  * Must be kept below CHARS_PER_TOKEN_ESTIMATE × model_context_length so that
- * the provider-level pretruncation always fires as a second line of defence.
- * At CHARS_PER_TOKEN_ESTIMATE=1.0 and a 2048-token context this means chunks
- * must be < 2048 chars. We use 2000 to leave headroom for the
- * `prepareDocumentText` path prefix (~50 chars) prepended at embed time.
+ * the provider-level pretruncation is not needed, leaving it as the last-resort
+ * defence rather than a routine one.
+ * CHARS_PER_TOKEN_ESTIMATE is per provider: 1.0 for ollama, 3.0 for the rest.
+ * Ollama is therefore the tightest case — a 2048-token context gives a
+ * 2048-char budget, which is what the 2000 default is sized against.
+ *
+ * The cap bounds the chunk body only. `prepareDocumentText` prepends
+ * `documentPrefix()`, the path and a newline, so the text that reaches the
+ * provider is longer than the cap by an amount that is not a constant: the
+ * prefix is configurable and the path length varies per chunk. A 2000-char
+ * chunk under the 17-char default prefix already crosses a 2048-char budget
+ * once the path exceeds 30 characters, so lower MAX_CHUNK_CHARS when the whole
+ * embedded text has to stay inside the budget.
+ *
+ * Provider pre-truncation still stands behind this, and it always runs: each
+ * provider substitutes a conservative default when the resolved context length
+ * is 0, which is what `guessContextLength()` returns for a model outside
+ * MODEL_CONTEXT_LENGTHS. That default (2048 tokens everywhere except openai's
+ * 8191) need not match the real model, so set EMBEDDING_CONTEXT_LENGTH to size
+ * it against the model actually in use.
+ *
+ * Override with MAX_CHUNK_CHARS when the embedding model's context is smaller
+ * than the default assumes. `applyCharCap` drops the content past the cap
+ * before the chunk is stored, so it reaches neither the vector, nor the
+ * payload, nor the BM25 text.
+ *
+ * What the cap does depends on which path `chunkFileContent` takes. On the
+ * small-file single-chunk path, `chunkByAstRegions` and `chunkByLines` it only
+ * truncates, leaving the chunk count unchanged. On `chunkByCharacters` — the
+ * minified/bundled path gated by {@link MAX_AVG_LINE_LENGTH} — the cap is the
+ * split boundary instead, so a lower cap produces more chunks.
+ *
+ * Where it truncates on the AST path, the dropped tail is not recovered from
+ * the next chunk: `chunkByAstRegions` cuts chunks at top-level declaration
+ * boundaries and leaves **no overlap** between adjacent chunks.
+ *
+ * Raising it beyond CHARS_PER_TOKEN_ESTIMATE × model_context_length gains
+ * nothing at embed time: the provider pre-truncates, so the extra characters
+ * reach the stored payload and the BM25 text but are not represented in the
+ * vector.
+ *
+ * Changing this changes the stored chunks, and re-running indexing alone does
+ * not apply it — unchanged files are skipped by content hash, so the index has
+ * to be rebuilt (`codebase_remove`, then `codebase_index`).
  */
-export const MAX_CHUNK_CHARS = 2000;
+export const MAX_CHUNK_CHARS = (() => {
+  const raw = process.env.MAX_CHUNK_CHARS;
+  if (raw === undefined || raw === "") return DEFAULT_MAX_CHUNK_CHARS;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(
+      `Invalid MAX_CHUNK_CHARS: "${raw}". Must be a positive integer ` +
+      `(default ${DEFAULT_MAX_CHUNK_CHARS}).`,
+    );
+  }
+  return parsed;
+})();
 
 // ── Symbol-level call graph (Impact Analysis) ────────────────────────────
 
