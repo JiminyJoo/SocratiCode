@@ -6,13 +6,22 @@ import { SEARCH_DEFAULT_LIMIT, SEARCH_MIN_SCORE, SOCRATICODE_VERSION } from "../
 import { getGraphStatus, isGraphBuilderStale } from "../services/code-graph.js";
 import { getArtifactStatusSummary } from "../services/context-artifacts.js";
 import { ensureQdrantReady } from "../services/docker.js";
-import { getEmbeddingConfig } from "../services/embedding-config.js";
-import { getEmbeddingProvider } from "../services/embedding-provider.js";
+import {
+  indexProfileDifferences,
+  requestedIndexProfile,
+  resolveEffectiveIndexProfile,
+} from "../services/index-profile.js";
 import type { IndexingProgress } from "../services/indexer.js";
 import { getIndexingProgress, getLastCompleted, isIndexingInProgress } from "../services/indexer.js";
-import { getLockHolderPid, } from "../services/lock.js";
-import { ensureOllamaReady } from "../services/ollama.js";
-import { getCollectionInfo, getProjectMetadata, searchChunks, searchMultipleCollections } from "../services/qdrant.js";
+import { getLockHolderPid } from "../services/lock.js";
+import {
+  adoptEffectiveIndexProfile,
+  getCollectionInfo,
+  getProjectMetadata,
+  loadProjectEffectiveProfile,
+  searchChunks,
+  searchMultipleCollections,
+} from "../services/qdrant.js";
 import { ensureWatcherStarted, isWatchedByAnyProcess, isWatching } from "../services/watcher.js";
 import type { SearchResult } from "../types.js";
 
@@ -60,13 +69,6 @@ export async function handleQueryTool(
   switch (name) {
     case "codebase_search": {
       await ensureQdrantReady();
-      // Only ensure Ollama infrastructure when using the Ollama embedding provider.
-      // For OpenAI/Google providers, just ensure the provider is initialized.
-      if (getEmbeddingConfig().embeddingProvider === "ollama") {
-        await ensureOllamaReady();
-      } else {
-        await getEmbeddingProvider();
-      }
 
       const query = args.query as string;
       const limit = (args.limit as number) || SEARCH_DEFAULT_LIMIT;
@@ -185,6 +187,7 @@ export async function handleQueryTool(
       }
 
       const metadata = await getProjectMetadata(collection);
+      const storedProfile = await loadProjectEffectiveProfile(collection);
 
       const statusLines = [
         `Project: ${resolvedPath}`,
@@ -192,6 +195,28 @@ export async function handleQueryTool(
         `Status: ${info.status}`,
         `Indexed chunks: ${info.pointsCount}`,
       ];
+
+      let effectiveProfile = resolveEffectiveIndexProfile(
+        "code",
+        storedProfile,
+        info.pointsCount > 0,
+        info.denseVectorSize,
+      );
+      if (storedProfile === null && info.pointsCount > 0) {
+        effectiveProfile = await adoptEffectiveIndexProfile(collection, effectiveProfile);
+      }
+      const requestedProfile = requestedIndexProfile("code");
+      const profileDifferences = indexProfileDifferences(effectiveProfile, requestedProfile);
+      if (profileDifferences.length > 0) {
+        statusLines.push(
+          `Index profile: ${profileDifferences.length} requested change${profileDifferences.length === 1 ? "" : "s"} inactive for this existing index: ${profileDifferences.join(", ")}`,
+        );
+      }
+      if (effectiveProfile.legacyUnverifiedFields.length > 0) {
+        statusLines.push(
+          `Index profile: legacy-unverified fields: ${effectiveProfile.legacyUnverifiedFields.join(", ")}`,
+        );
+      }
 
       // Detect persisted incomplete index (previous run was interrupted)
       if (metadata?.indexingStatus === "in-progress" && !isIndexingInProgress(resolvedPath)) {

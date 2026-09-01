@@ -6,6 +6,15 @@ import { QDRANT_API_KEY, QDRANT_COLLECTION_PREFIX, QDRANT_HOST, QDRANT_PORT, QDR
 import type { ArtifactIndexState, CodeGraph, FileChunk, SearchResult } from "../types.js";
 import { getEmbeddingConfig } from "./embedding-config.js";
 import { generateEmbeddings, generateQueryEmbedding, prepareDocumentText } from "./embeddings.js";
+import {
+  documentTextProfile,
+  type EffectiveIndexProfile,
+  ensureEffectiveEmbeddingReady,
+  parseEffectiveIndexProfile,
+  queryProfileKey,
+  resolveEffectiveIndexProfile,
+  withEffectiveEmbedding,
+} from "./index-profile.js";
 import { logger } from "./logger.js";
 
 const MAX_RETRIES = 3;
@@ -266,12 +275,15 @@ export async function upsertChunks(
   collectionName: string,
   chunks: FileChunk[],
   contentHash: string,
+  profile: EffectiveIndexProfile,
 ): Promise<void> {
   if (chunks.length === 0) return;
 
   const qdrant = getClient();
-  const texts = chunks.map((c) => prepareDocumentText(c.content, c.relativePath));
-  const embeddings = await generateEmbeddings(texts);
+  const texts = chunks.map((c) =>
+    prepareDocumentText(c.content, c.relativePath, documentTextProfile(profile)),
+  );
+  const embeddings = await withEffectiveEmbedding(profile, () => generateEmbeddings(texts));
 
   const points = chunks.map((chunk, i) => ({
     id: chunk.id,
@@ -402,8 +414,49 @@ export async function searchChunks(
   fileFilter?: string,
   languageFilter?: string,
 ): Promise<SearchResult[]> {
-  const queryVector = await generateQueryEmbedding(query);
+  const profile = await loadEffectiveIndexProfileForCollection(collectionName);
+  const queryVector = await queryVectorForProfile(query, profile);
   return searchChunksWithVector(collectionName, query, queryVector, limit, fileFilter, languageFilter);
+}
+
+function collectionProfileKind(collectionName: string): "code" | "context" {
+  return collectionName.startsWith(`${QDRANT_COLLECTION_PREFIX}context_`)
+    ? "context"
+    : "code";
+}
+
+export async function loadEffectiveIndexProfileForCollection(
+  collectionName: string,
+): Promise<EffectiveIndexProfile> {
+  const info = await getCollectionInfo(collectionName);
+  const kind = collectionProfileKind(collectionName);
+  const stored = info === null
+    ? null
+    : kind === "context"
+      ? await loadContextEffectiveProfile(collectionName)
+      : await loadProjectEffectiveProfile(collectionName);
+  const profile = resolveEffectiveIndexProfile(
+    kind,
+    stored,
+    (info?.pointsCount ?? 0) > 0,
+    info?.denseVectorSize,
+  );
+  if (stored === null && (info?.pointsCount ?? 0) > 0) {
+    return adoptEffectiveIndexProfile(collectionName, profile);
+  }
+  return profile;
+}
+
+function queryVectorForProfile(
+  query: string,
+  profile: EffectiveIndexProfile,
+): Promise<number[]> {
+  return withEffectiveEmbedding(profile, async () => {
+    if (profile.embedding.provider === "ollama") {
+      await ensureEffectiveEmbeddingReady(profile);
+    }
+    return generateQueryEmbedding(query, profile.queryPrefix);
+  });
 }
 
 /** Internal: hybrid search using a pre-computed dense embedding vector.
@@ -626,8 +679,11 @@ export async function searchMultipleCollections(
     return results.map((r) => ({ ...r, project: collections[0].label }));
   }
 
-  // Compute the dense embedding once for all collections
-  const queryVector = await generateQueryEmbedding(query);
+  // Reuse a query vector only where the persisted query-side identity is
+  // compatible. Unverified legacy profiles receive collection-specific keys.
+  // Promises are cached before they are awaited so concurrent collections with
+  // the same verified profile share exactly one embedding request.
+  const queryVectors = new Map<string, Promise<number[]>>();
 
   // Query all collections in parallel, requesting extra candidates for RRF re-ranking
   const perCollectionLimit = Math.max(limit * 2, 20);
@@ -636,6 +692,15 @@ export async function searchMultipleCollections(
   const allResults = await Promise.all(
     collections.map(async ({ name, label }) => {
       try {
+        const profile = await loadEffectiveIndexProfileForCollection(name);
+        const key = queryProfileKey(profile, name);
+        let queryVectorPromise = queryVectors.get(key);
+        if (!queryVectorPromise) {
+          queryVectorPromise = queryVectorForProfile(query, profile);
+          queryVectors.set(key, queryVectorPromise);
+        }
+        const queryVector = await queryVectorPromise;
+
         // includeDenseScore: results from different collections are about to be
         // ordered against each other, which their per-collection RRF scores
         // cannot support.
@@ -665,7 +730,8 @@ export async function searchChunksWithFilter(
   filters: Array<{ key: string; value: string }>,
 ): Promise<SearchResult[]> {
   const qdrant = getClient();
-  const queryVector = await generateQueryEmbedding(query);
+  const profile = await loadEffectiveIndexProfileForCollection(collectionName);
+  const queryVector = await queryVectorForProfile(query, profile);
 
   const filter = filters.length > 0
     ? { must: filters.map((f) => ({ key: f.key, match: { value: f.value } })) }
@@ -707,16 +773,40 @@ export async function searchChunksWithFilter(
  * Returns the collection info if it exists, null if the collection does not exist,
  * or throws an error if the request fails for any other reason (network, timeout, etc.).
  * This distinction is critical: callers must NOT treat transient errors as "collection missing". */
-export async function getCollectionInfo(name: string): Promise<{
+export interface CollectionInfo {
   pointsCount: number;
   status: string;
-} | null> {
+  /** Stored dense-vector width, when Qdrant exposes a supported vector config. */
+  denseVectorSize?: number;
+}
+
+function denseVectorSizeFromInfo(info: unknown): number | undefined {
+  const vectors = (info as {
+    config?: { params?: { vectors?: unknown } };
+  }).config?.params?.vectors;
+  if (typeof vectors !== "object" || vectors === null || Array.isArray(vectors)) {
+    return undefined;
+  }
+  const vectorConfig = vectors as Record<string, unknown>;
+  const dense = vectorConfig.dense;
+  const size =
+    typeof dense === "object" && dense !== null && !Array.isArray(dense)
+      ? (dense as Record<string, unknown>).size
+      : vectorConfig.size;
+  return Number.isInteger(size) && (size as number) > 0
+    ? size as number
+    : undefined;
+}
+
+export async function getCollectionInfo(name: string): Promise<CollectionInfo | null> {
   const qdrant = getClient();
   try {
     const info = await qdrant.getCollection(name);
+    const denseVectorSize = denseVectorSizeFromInfo(info);
     return {
       pointsCount: info.points_count ?? 0,
       status: info.status,
+      ...(denseVectorSize !== undefined ? { denseVectorSize } : {}),
     };
   } catch (err: unknown) {
     // Only return null for "not found" — propagate all other errors
@@ -826,6 +916,86 @@ function metadataPointId(collName: string): string {
 /** Indexing status persisted in Qdrant metadata */
 export type IndexingStatus = "in-progress" | "completed";
 
+export interface ProjectMetadata {
+  projectPath: string;
+  lastIndexedAt: string;
+  filesTotal: number;
+  filesIndexed: number;
+  indexingStatus: IndexingStatus;
+  effectiveProfile: EffectiveIndexProfile | null;
+}
+
+function profileFromPayload(
+  payload: Record<string, unknown> | null | undefined,
+  kind: "code" | "context",
+): EffectiveIndexProfile | null {
+  const serialized = payload?.effectiveIndexProfile;
+  if (serialized === undefined || serialized === null) return null;
+  const parsed = typeof serialized === "string" ? JSON.parse(serialized) : serialized;
+  return parseEffectiveIndexProfile(parsed, kind);
+}
+
+/**
+ * Persist a legacy profile exactly once without replacing any existing metadata
+ * fields. The server-side `is_empty` filter prevents two processes from
+ * overwriting a profile after one of them has already adopted it.
+ */
+export async function adoptEffectiveIndexProfile(
+  collName: string,
+  candidate: EffectiveIndexProfile,
+): Promise<EffectiveIndexProfile> {
+  try {
+    await ensureMetadataCollection();
+    const qdrant = getClient();
+    const id = metadataPointId(collName);
+    let points = await qdrant.retrieve(METADATA_COLLECTION, {
+      ids: [id],
+      with_payload: true,
+    });
+
+    if (points.length === 0) {
+      logger.warn("Cannot persist adopted effective profile because collection metadata is missing", {
+        collName,
+      });
+      return candidate;
+    }
+
+    const existing = profileFromPayload(
+      points[0].payload as Record<string, unknown>,
+      candidate.kind,
+    );
+    if (existing) return existing;
+
+    await qdrant.setPayload(METADATA_COLLECTION, {
+      payload: { effectiveIndexProfile: JSON.stringify(candidate) },
+      filter: {
+        must: [
+          { has_id: [id] },
+          { is_empty: { key: "effectiveIndexProfile" } },
+        ],
+      },
+      wait: true,
+    });
+
+    points = await qdrant.retrieve(METADATA_COLLECTION, {
+      ids: [id],
+      with_payload: true,
+    });
+    const adopted = points.length > 0
+      ? profileFromPayload(
+          points[0].payload as Record<string, unknown>,
+          candidate.kind,
+        )
+      : null;
+    if (!adopted) {
+      throw new Error(`Failed to persist the effective index profile for ${collName}.`);
+    }
+    return adopted;
+  } catch (err) {
+    throw wrapQdrantError("adoptEffectiveIndexProfile", { collName }, err);
+  }
+}
+
 /** Save project metadata and file hashes to Qdrant */
 export async function saveProjectMetadata(
   collName: string,
@@ -834,6 +1004,7 @@ export async function saveProjectMetadata(
   filesIndexed: number,
   fileHashes: Map<string, string>,
   indexingStatus: IndexingStatus,
+  effectiveProfile: EffectiveIndexProfile,
 ): Promise<void> {
   await ensureMetadataCollection();
   const qdrant = getClient();
@@ -857,12 +1028,30 @@ export async function saveProjectMetadata(
           filesIndexed,
           fileHashes: JSON.stringify(hashObj),
           indexingStatus,
+          effectiveIndexProfile: JSON.stringify(effectiveProfile),
         },
       },
     ],
   });
 
   logger.info("Saved project metadata", { collName, projectPath, filesTotal, filesIndexed, indexingStatus });
+}
+
+/** Load only the stored code-index profile. Missing profile means legacy metadata. */
+export async function loadProjectEffectiveProfile(
+  collName: string,
+): Promise<EffectiveIndexProfile | null> {
+  try {
+    await ensureMetadataCollection();
+    const points = await getClient().retrieve(METADATA_COLLECTION, {
+      ids: [metadataPointId(collName)],
+      with_payload: true,
+    });
+    if (points.length === 0) return null;
+    return profileFromPayload(points[0].payload as Record<string, unknown>, "code");
+  } catch (err) {
+    throw wrapQdrantError("loadProjectEffectiveProfile", { collName }, err);
+  }
 }
 
 /** Load file hashes for a project from Qdrant.
@@ -898,13 +1087,7 @@ export async function loadProjectHashes(collName: string): Promise<Map<string, s
 
 /** Get project metadata (for list display).
  * Returns null if metadata doesn't exist or on any error (logged as warning). */
-export async function getProjectMetadata(collName: string): Promise<{
-  projectPath: string;
-  lastIndexedAt: string;
-  filesTotal: number;
-  filesIndexed: number;
-  indexingStatus: IndexingStatus;
-} | null> {
+export async function getProjectMetadata(collName: string): Promise<ProjectMetadata | null> {
   try {
     await ensureMetadataCollection();
     const qdrant = getClient();
@@ -924,6 +1107,10 @@ export async function getProjectMetadata(collName: string): Promise<{
       filesTotal: (payload?.filesTotal as number) ?? (payload?.filesIndexed as number) ?? 0,
       filesIndexed: (payload?.filesIndexed as number) ?? 0,
       indexingStatus: (payload?.indexingStatus as IndexingStatus) ?? "completed",
+      effectiveProfile: profileFromPayload(
+        payload as Record<string, unknown> | undefined,
+        "code",
+      ),
     };
   } catch (err) {
     logger.warn("getProjectMetadata failed (returning null)", {
@@ -1095,6 +1282,7 @@ export async function saveContextMetadata(
   contextCollName: string,
   projectPath: string,
   artifacts: ArtifactIndexState[],
+  effectiveProfile: EffectiveIndexProfile,
 ): Promise<void> {
   await ensureMetadataCollection();
   const qdrant = getClient();
@@ -1111,6 +1299,7 @@ export async function saveContextMetadata(
           lastIndexedAt: new Date().toISOString(),
           artifactCount: artifacts.length,
           artifacts: JSON.stringify(artifacts),
+          effectiveIndexProfile: JSON.stringify(effectiveProfile),
         },
       },
     ],
@@ -1119,25 +1308,50 @@ export async function saveContextMetadata(
   logger.info("Saved context artifact metadata", { contextCollName, projectPath, artifactCount: artifacts.length });
 }
 
+export interface ContextIndexMetadata {
+  artifacts: ArtifactIndexState[];
+  effectiveProfile: EffectiveIndexProfile | null;
+}
+
+/**
+ * Load context states and profile for mutation paths. Missing metadata returns
+ * null; transport, JSON, and profile validation failures propagate.
+ */
+export async function loadContextIndexMetadata(
+  contextCollName: string,
+): Promise<ContextIndexMetadata | null> {
+  try {
+    await ensureMetadataCollection();
+    const points = await getClient().retrieve(METADATA_COLLECTION, {
+      ids: [metadataPointId(contextCollName)],
+      with_payload: true,
+    });
+    if (points.length === 0) return null;
+    const payload = points[0].payload as Record<string, unknown> | undefined;
+    const artifacts = payload?.artifacts
+      ? JSON.parse(payload.artifacts as string) as ArtifactIndexState[]
+      : [];
+    return {
+      artifacts,
+      effectiveProfile: profileFromPayload(payload, "context"),
+    };
+  } catch (err) {
+    throw wrapQdrantError("loadContextIndexMetadata", { contextCollName }, err);
+  }
+}
+
+/** Load only the stored context-index profile. Missing profile means legacy metadata. */
+export async function loadContextEffectiveProfile(
+  contextCollName: string,
+): Promise<EffectiveIndexProfile | null> {
+  return (await loadContextIndexMetadata(contextCollName))?.effectiveProfile ?? null;
+}
+
 /** Load context artifact metadata from Qdrant.
  * Returns null if no metadata exists or on any error (logged as warning). */
 export async function loadContextMetadata(contextCollName: string): Promise<ArtifactIndexState[] | null> {
   try {
-    await ensureMetadataCollection();
-    const qdrant = getClient();
-    const id = metadataPointId(contextCollName);
-
-    const points = await qdrant.retrieve(METADATA_COLLECTION, {
-      ids: [id],
-      with_payload: true,
-    });
-
-    if (points.length === 0) return null;
-
-    const payload = points[0].payload;
-    if (!payload?.artifacts) return null;
-
-    return JSON.parse(payload.artifacts as string) as ArtifactIndexState[];
+    return (await loadContextIndexMetadata(contextCollName))?.artifacts ?? null;
   } catch (err) {
     logger.warn("loadContextMetadata failed (returning null)", {
       contextCollName,
@@ -1153,6 +1367,7 @@ export async function getContextMetadata(contextCollName: string): Promise<{
   projectPath: string;
   lastIndexedAt: string;
   artifactCount: number;
+  effectiveProfile: EffectiveIndexProfile | null;
 } | null> {
   try {
     await ensureMetadataCollection();
@@ -1171,6 +1386,10 @@ export async function getContextMetadata(contextCollName: string): Promise<{
       projectPath: payload?.projectPath as string,
       lastIndexedAt: payload?.lastIndexedAt as string,
       artifactCount: (payload?.artifactCount as number) ?? 0,
+      effectiveProfile: profileFromPayload(
+        payload as Record<string, unknown> | undefined,
+        "context",
+      ),
     };
   } catch (err) {
     logger.warn("getContextMetadata failed (returning null)", {

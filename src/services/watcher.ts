@@ -14,10 +14,18 @@ import {
 import { invalidateGraphCache } from "./code-graph.js";
 import { detectExtensionFromSource, readFileHead } from "./extensionless.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
+import {
+  profileExtensionLanguageMap,
+  resolveEffectiveIndexProfile,
+} from "./index-profile.js";
 import { FILE_SCAN_BATCH, isIndexingInProgress, updateProjectIndex } from "./indexer.js";
 import { acquireProjectLock, isProjectLocked, releaseProjectLock } from "./lock.js";
 import { logger } from "./logger.js";
-import { getCollectionInfo, getProjectMetadata } from "./qdrant.js";
+import {
+  getCollectionInfo,
+  getProjectMetadata,
+  loadProjectEffectiveProfile,
+} from "./qdrant.js";
 
 /** Active subscriptions per project path */
 const subscriptions = new Map<string, AsyncSubscription>();
@@ -48,13 +56,16 @@ const EXTERNAL_WATCH_CACHE_TTL_MS = 60_000;
  * unreadable path returns `true` so the change is still reconciled, while a
  * directory/FIFO/other non-regular file returns `false` (never head-read).
  */
-export async function isIndexableFile(filePath: string): Promise<boolean> {
+export async function isIndexableFile(
+  filePath: string,
+  extensionLanguageMap: Map<string, string> = EXTENSION_LANGUAGE_MAP,
+): Promise<boolean> {
   const fileName = path.basename(filePath);
   if (SPECIAL_FILES.has(fileName)) return true;
   const ext = path.extname(filePath).toLowerCase();
-  // EXTENSION_LANGUAGE_MAP extensions are real source files, so edits to them
+  // Effective extension-map entries are real source files, so edits to them
   // must trigger an incremental update like any other supported file.
-  if (SUPPORTED_EXTENSIONS.has(ext) || EXTENSION_LANGUAGE_MAP.has(ext)) return true;
+  if (SUPPORTED_EXTENSIONS.has(ext) || extensionLanguageMap.has(ext)) return true;
   if (ext !== "" || !indexExtensionlessEnabled()) return false;
   // Extensionless: only a regular file can be a code file. @parcel/watcher also
   // emits events for directories/FIFOs/sockets, which must NOT be head-read — a
@@ -160,43 +171,45 @@ export async function startWatching(
   // Reset error count
   watcherErrorCounts.set(resolvedPath, 0);
 
-  const scheduleUpdate = () => {
-    const existing = debounceTimers.get(resolvedPath);
-    if (existing) clearTimeout(existing);
-
-    debounceTimers.set(
-      resolvedPath,
-      setTimeout(async () => {
-        debounceTimers.delete(resolvedPath);
-        try {
-          onProgress?.(`Detected changes, updating index for ${resolvedPath}...`);
-
-          // Invalidate the code graph cache so it will be rebuilt
-          invalidateGraphCache(resolvedPath);
-
-          const result = await updateProjectIndex(resolvedPath, onProgress);
-          onProgress?.(
-            `Auto-update: ${result.added} added, ${result.updated} updated, ${result.removed} removed`,
-          );
-
-          // Note: code graph rebuild is now handled inside updateProjectIndex itself
-        } catch (err) {
-          // Graceful degradation: log but don't crash the watcher
-          const message = err instanceof Error ? err.message : String(err);
-          logger.error("Watch auto-update failed", { projectPath: resolvedPath, error: message });
-          onProgress?.(`Auto-update failed (will retry on next change): ${message}`);
-
-          // If Qdrant is unreachable, don't spam retries — back off
-          if (message.includes("ECONNREFUSED") || message.includes("fetch failed") || message.includes("Request Timeout")) {
-            logger.warn("Infrastructure appears down, pausing watcher updates for 30s", { projectPath: resolvedPath });
-            await new Promise((resolve) => setTimeout(resolve, 30_000));
-          }
-        }
-      }, DEBOUNCE_MS),
-    );
-  };
+  let extensionLanguageMap: Map<string, string> | null = null;
 
   try {
+    const scheduleUpdate = () => {
+      const existing = debounceTimers.get(resolvedPath);
+      if (existing) clearTimeout(existing);
+
+      debounceTimers.set(
+        resolvedPath,
+        setTimeout(async () => {
+          debounceTimers.delete(resolvedPath);
+          try {
+            onProgress?.(`Detected changes, updating index for ${resolvedPath}...`);
+
+            // Invalidate the code graph cache so it will be rebuilt
+            invalidateGraphCache(resolvedPath);
+
+            const result = await updateProjectIndex(resolvedPath, onProgress);
+            onProgress?.(
+              `Auto-update: ${result.added} added, ${result.updated} updated, ${result.removed} removed`,
+            );
+
+            // Note: code graph rebuild is now handled inside updateProjectIndex itself
+          } catch (err) {
+            // Graceful degradation: log but don't crash the watcher
+            const message = err instanceof Error ? err.message : String(err);
+            logger.error("Watch auto-update failed", { projectPath: resolvedPath, error: message });
+            onProgress?.(`Auto-update failed (will retry on next change): ${message}`);
+
+            // If Qdrant is unreachable, do not spam retries; back off.
+            if (message.includes("ECONNREFUSED") || message.includes("fetch failed") || message.includes("Request Timeout")) {
+              logger.warn("Infrastructure appears down, pausing watcher updates for 30s", { projectPath: resolvedPath });
+              await new Promise((resolve) => setTimeout(resolve, 30_000));
+            }
+          }
+        }, DEBOUNCE_MS),
+      );
+    };
+
     const subscription = await watcher.subscribe(
       resolvedPath,
       async (err: Error | null, events: Event[]) => {
@@ -234,6 +247,36 @@ export async function startWatching(
         // crashing the process or silently dropping the batch. Guard the whole
         // body, mirroring the scheduleUpdate debounce ("log but don't crash").
         try {
+          if (extensionLanguageMap === null) {
+            try {
+              const collection = collectionName(projectIdFromPath(resolvedPath));
+              const collectionInfo = await getCollectionInfo(collection);
+              const storedProfile = collectionInfo === null
+                ? null
+                : await loadProjectEffectiveProfile(collection);
+              extensionLanguageMap = profileExtensionLanguageMap(
+                resolveEffectiveIndexProfile(
+                  "code",
+                  storedProfile,
+                  (collectionInfo?.pointsCount ?? 0) > 0,
+                  collectionInfo?.denseVectorSize,
+                ),
+              );
+            } catch (profileErr) {
+              // Do not substitute the requested extension map for an existing
+              // collection. Schedule the canonical update, which resolves the
+              // effective profile before scanning or writing, and retry this
+              // profile read on the next event batch.
+              logger.warn("Watch profile load failed; scheduling profile-aware update", {
+                projectPath: resolvedPath,
+                error: profileErr instanceof Error ? profileErr.message : String(profileErr),
+              });
+              scheduleUpdate();
+              return;
+            }
+          }
+          const effectiveExtensionLanguageMap = extensionLanguageMap;
+
           // Batch the (async, fd-opening) indexability checks like every other
           // scan path (FILE_SCAN_BATCH), so a bulk change coalesced into one
           // callback can't open hundreds of files at once and hit EMFILE.
@@ -246,7 +289,7 @@ export async function startWatching(
                 const relative = path.relative(resolvedPath, event.path);
                 if (!relative || relative.startsWith("..")) return null;
                 if (shouldIgnore(ig, relative)) return null;
-                if (await isIndexableFile(event.path)) return event;
+                if (await isIndexableFile(event.path, effectiveExtensionLanguageMap)) return event;
                 // A previously-indexed extensionless file edited into readable
                 // non-code (detection now → null) is no longer "indexable", but
                 // its stale chunks/symbols must still be reconciled. Let

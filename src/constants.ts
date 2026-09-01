@@ -97,9 +97,16 @@ export const INDEX_BATCH_SIZE = 50; // files per batch for batched/resumable ind
 
 /** Maximum file size in bytes. Files larger than this are skipped during indexing.
  *  Default: 5 MB. Override via MAX_FILE_SIZE_MB env var. */
-export const MAX_FILE_BYTES = Math.round(
-  parseFloat(process.env.MAX_FILE_SIZE_MB || "5") * 1_000_000,
-);
+export const MAX_FILE_BYTES = (() => {
+  const raw = process.env.MAX_FILE_SIZE_MB || "5";
+  const bytes = Math.round(parseFloat(raw) * 1_000_000);
+  if (!Number.isFinite(bytes)) {
+    throw new Error(
+      `Invalid MAX_FILE_SIZE_MB: "${raw}". Must resolve to a finite number of bytes.`,
+    );
+  }
+  return bytes;
+})();
 
 /** Maximum file size in bytes for code graph AST parsing.
  *  Graph parsing loads the entire file into memory for AST analysis,
@@ -181,9 +188,8 @@ const DEFAULT_MAX_CHUNK_CHARS = 2000;
  * reach the stored payload and the BM25 text but are not represented in the
  * vector.
  *
- * Changing this changes the stored chunks, and re-running indexing alone does
- * not apply it — unchanged files are skipped by content hash, so the index has
- * to be rebuilt (`codebase_remove`, then `codebase_index`).
+ * Changing this changes the stored chunks. Existing collections retain their
+ * persisted effective cap until removed and freshly indexed.
  */
 export const MAX_CHUNK_CHARS = (() => {
   const raw = process.env.MAX_CHUNK_CHARS;
