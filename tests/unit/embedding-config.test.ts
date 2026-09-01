@@ -31,6 +31,7 @@ describe("embedding-config", () => {
     delete process.env.LITELLM_SEND_DIMENSIONS;
     delete process.env.EMBEDDING_QUERY_PREFIX;
     delete process.env.EMBEDDING_DOCUMENT_PREFIX;
+    delete process.env.EMBEDDING_DOCUMENT_INCLUDE_PATH;
   });
 
   afterEach(() => {

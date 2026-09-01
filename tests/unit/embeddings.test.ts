@@ -20,13 +20,17 @@ vi.mock("../../src/services/embedding-provider.js", async (importOriginal) => {
 import { getEmbeddingProvider } from "../../src/services/embedding-provider.js";
 
 // ── Ambient env isolation ────────────────────────────────────────────────────
-// These cases assert the default task prefixes, so a prefix exported in the
-// developer's shell — to run a model such as bge-m3 — would otherwise decide
-// what they see. Clear the two variables for every case here;
-// tests/unit/embedding-prefix.test.ts is the place that varies them on purpose.
+// These cases assert the default task prefixes and that prepareDocumentText
+// embeds the file path, so a prefix exported in the developer's shell — to run a
+// model such as bge-m3 — or the variable that turns the path off would otherwise
+// decide what they see. Clear all three for every case here;
+// tests/unit/embedding-prefix.test.ts and
+// tests/unit/embedding-document-path.test.ts are the places that vary them on
+// purpose.
 beforeEach(() => {
   vi.stubEnv("EMBEDDING_QUERY_PREFIX", undefined);
   vi.stubEnv("EMBEDDING_DOCUMENT_PREFIX", undefined);
+  vi.stubEnv("EMBEDDING_DOCUMENT_INCLUDE_PATH", undefined);
 });
 
 afterEach(() => {

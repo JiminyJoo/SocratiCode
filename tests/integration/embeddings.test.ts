@@ -14,13 +14,16 @@ import { waitForOllama } from "../helpers/setup.js";
 
 const dockerAvailable = isDockerAvailable();
 
-// The prepareDocumentText assertions below expect the default task prefixes, so
-// clear the two variables that change them — a developer running a model such
-// as bge-m3 has them exported in the shell.
-// tests/unit/embedding-prefix.test.ts is the place that varies them on purpose.
+// The prepareDocumentText assertions below expect the default task prefixes and
+// the file path, so clear the three variables that change them — a developer
+// running a model such as bge-m3, or indexing without paths, has them exported
+// in the shell. tests/unit/embedding-prefix.test.ts and
+// tests/unit/embedding-document-path.test.ts are the places that vary them on
+// purpose.
 beforeEach(() => {
   vi.stubEnv("EMBEDDING_QUERY_PREFIX", undefined);
   vi.stubEnv("EMBEDDING_DOCUMENT_PREFIX", undefined);
+  vi.stubEnv("EMBEDDING_DOCUMENT_INCLUDE_PATH", undefined);
 });
 
 afterEach(() => {

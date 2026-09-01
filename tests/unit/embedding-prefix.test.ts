@@ -49,10 +49,13 @@ function useMockProvider() {
 
 beforeEach(() => {
   resetEmbeddingConfig();
-  // Start from a clean slate: no prefixes set, and the default provider, so the
-  // config-loading cases don't depend on the developer's shell either.
+  // Start from a clean slate: no prefixes set, the file path embedded as it is
+  // by default — the prepareDocumentText cases below expect it in the output —
+  // and the default provider, so the config-loading cases don't depend on the
+  // developer's shell either.
   vi.stubEnv("EMBEDDING_QUERY_PREFIX", undefined);
   vi.stubEnv("EMBEDDING_DOCUMENT_PREFIX", undefined);
+  vi.stubEnv("EMBEDDING_DOCUMENT_INCLUDE_PATH", undefined);
   vi.stubEnv("EMBEDDING_PROVIDER", "ollama");
 });
 

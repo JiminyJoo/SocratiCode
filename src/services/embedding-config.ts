@@ -66,6 +66,8 @@
  *   EMBEDDING_QUERY_PREFIX:    Task prefix prepended to queries (default "search_query: ").
  *   EMBEDDING_DOCUMENT_PREFIX: Task prefix prepended to documents (default "search_document: ").
  *                              Both must match the model — see queryPrefix() below.
+ *   EMBEDDING_DOCUMENT_INCLUDE_PATH: Whether the file path is embedded with the chunk
+ *                              (default on). See documentIncludesPath() below.
  */
 
 import { logger } from "./logger.js";
@@ -220,6 +222,29 @@ function parseBooleanEnv(name: string, raw: string | undefined, defaultValue: bo
   );
 }
 
+/**
+ * Whether the file path is embedded alongside the chunk content, from
+ * `EMBEDDING_DOCUMENT_INCLUDE_PATH`.
+ *
+ * The path is part of the text handed to the vector store, so it feeds both the
+ * dense embedding and the BM25 sparse vector built from that same string.
+ * Turning it off therefore removes path-derived tokens from lexical search too,
+ * and for context artifacts it drops the `context:<name>:<path>` identifier
+ * those chunks carry. Path tokens help path-shaped queries but add noise on
+ * prose-heavy corpora.
+ *
+ * Defaults to on, which is the pre-existing behaviour, so an index built before
+ * the variable existed stays valid. Read lazily so tests can toggle it via
+ * `vi.stubEnv`.
+ */
+export function documentIncludesPath(): boolean {
+  return parseBooleanEnv(
+    "EMBEDDING_DOCUMENT_INCLUDE_PATH",
+    process.env.EMBEDDING_DOCUMENT_INCLUDE_PATH,
+    true,
+  );
+}
+
 // ── Singleton ─────────────────────────────────────────────────────────────
 
 let _config: EmbeddingConfig | null = null;
@@ -331,14 +356,16 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
 
   const contextLengthEnv = process.env.EMBEDDING_CONTEXT_LENGTH;
 
-  // ── Task prefixes ───────────────────────────────────────────────────
+  // ── Document text composition ───────────────────────────────────────
   // Resolved here, rather than only at the point of use, so that the values are
   // logged where a misconfiguration can be spotted — inside a tool call, where
-  // the message reaches the host.
+  // the message reaches the host. For EMBEDDING_DOCUMENT_INCLUDE_PATH that also
+  // means an invalid value is reported there rather than at module evaluation.
   const resolvedQueryPrefix = queryPrefix();
   const resolvedDocumentPrefix = documentPrefix();
   const querySet = process.env.EMBEDDING_QUERY_PREFIX !== undefined;
   const documentSet = process.env.EMBEDDING_DOCUMENT_PREFIX !== undefined;
+  const includesPath = documentIncludesPath();
 
   _config = {
     embeddingProvider,
@@ -388,6 +415,7 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
     embeddingContextLength: _config.embeddingContextLength || "auto",
     queryPrefix: resolvedQueryPrefix,
     documentPrefix: resolvedDocumentPrefix,
+    documentIncludesPath: includesPath,
     hasApiKey: !!(embeddingProvider === "ollama"
       ? _config.ollamaApiKey
       : embeddingProvider === "openai"

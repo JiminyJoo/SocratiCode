@@ -146,12 +146,13 @@ const DEFAULT_MAX_CHUNK_CHARS = 2000;
  * 2048-char budget, which is what the 2000 default is sized against.
  *
  * The cap bounds the chunk body only. `prepareDocumentText` prepends
- * `documentPrefix()`, the path and a newline, so the text that reaches the
- * provider is longer than the cap by an amount that is not a constant: the
- * prefix is configurable and the path length varies per chunk. A 2000-char
- * chunk under the 17-char default prefix already crosses a 2048-char budget
- * once the path exceeds 30 characters, so lower MAX_CHUNK_CHARS when the whole
- * embedded text has to stay inside the budget.
+ * `documentPrefix()` and — unless EMBEDDING_DOCUMENT_INCLUDE_PATH turns it off
+ * — the path and a newline, so the text that reaches the provider is longer
+ * than the cap by an amount that is not a constant: the prefix is configurable
+ * and the path length varies per chunk. With the path on, a 2000-char chunk
+ * under the 17-char default prefix already crosses a 2048-char budget once the
+ * path exceeds 30 characters. Lower MAX_CHUNK_CHARS when the whole embedded
+ * text has to stay inside the budget.
  *
  * Provider pre-truncation still stands behind this, and it always runs: each
  * provider substitutes a conservative default when the resolved context length

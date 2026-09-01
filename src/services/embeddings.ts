@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
 import {
+  documentIncludesPath,
   documentPrefix,
   getEmbeddingConfig,
   queryPrefix,
@@ -121,11 +122,22 @@ export async function generateQueryEmbedding(query: string): Promise<number[]> {
  * the content. The prefix is configurable through `EMBEDDING_DOCUMENT_PREFIX`;
  * see `documentPrefix` in embedding-config.ts for what each model expects.
  *
+ * The path is included unless `EMBEDDING_DOCUMENT_INCLUDE_PATH` turns it off
+ * (see `documentIncludesPath` in embedding-config.ts). With the path off the
+ * content follows the prefix directly, and nothing separates the two but the
+ * prefix itself: the default ends in a space, so the text still reads as a
+ * prefixed passage, while a prefix configured without one runs straight into
+ * the content.
+ *
  * Callers hand the result to the vector store as the text to embed, so it drives
  * the dense vector and the BM25 sparse vector derived from that same string.
  * It is not what gets stored for display: the payload keeps the raw chunk
- * content, unprefixed.
+ * content, unprefixed. Dropping the path therefore removes path-derived tokens
+ * from lexical search as well as from the dense vector, and for context
+ * artifacts — whose `filePath` is a `context:<name>:<path>` identifier — it
+ * drops the artifact name along with the path.
  */
 export function prepareDocumentText(content: string, filePath: string): string {
-  return `${documentPrefix()}${filePath}\n${content}`;
+  const head = documentIncludesPath() ? `${filePath}\n` : "";
+  return `${documentPrefix()}${head}${content}`;
 }
