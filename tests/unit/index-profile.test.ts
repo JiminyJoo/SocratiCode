@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   getEmbeddingConfig,
   resetEmbeddingConfig,
+  setResolvedOllamaMode,
 } from "../../src/services/embedding-config.js";
 import {
   CURRENT_INDEX_FORMAT_VERSION,
@@ -56,6 +57,8 @@ beforeEach(() => {
   delete process.env.EMBEDDING_DOCUMENT_PREFIX;
   delete process.env.EMBEDDING_DOCUMENT_INCLUDE_PATH;
   delete process.env.LITELLM_SEND_DIMENSIONS;
+  delete process.env.OLLAMA_MODE;
+  delete process.env.OLLAMA_URL;
 });
 
 afterEach(() => {
@@ -233,6 +236,37 @@ describe("pending profile differences", () => {
 });
 
 describe("effective embedding isolation", () => {
+  it("carries a resolved Ollama endpoint into later collection scopes", async () => {
+    const ollama = profile({
+      embedding: {
+        provider: "ollama",
+        model: "nomic-embed-text",
+        dimensions: 768,
+        contextLength: 8192,
+        litellmSendDimensions: false,
+      },
+    });
+
+    await withEffectiveEmbedding(ollama, async () => {
+      expect(getEmbeddingConfig()).toMatchObject({
+        ollamaMode: "auto",
+        ollamaUrl: "http://localhost:11434",
+      });
+      setResolvedOllamaMode("docker", "http://localhost:11435");
+      expect(getEmbeddingConfig()).toMatchObject({
+        ollamaMode: "docker",
+        ollamaUrl: "http://localhost:11435",
+      });
+    });
+
+    await withEffectiveEmbedding(ollama, async () => {
+      expect(getEmbeddingConfig()).toMatchObject({
+        ollamaMode: "docker",
+        ollamaUrl: "http://localhost:11435",
+      });
+    });
+  });
+
   it("keeps concurrent collection profiles isolated across awaits", async () => {
     const a = profile({
       embedding: {

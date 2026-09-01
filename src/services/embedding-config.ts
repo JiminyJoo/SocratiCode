@@ -491,7 +491,6 @@ export function setResolvedOllamaMode(mode: "docker" | "external", url: string):
   if (effective) {
     effective.ollamaMode = mode;
     effective.ollamaUrl = url;
-    return;
   }
   if (_config) {
     _config.ollamaMode = mode;

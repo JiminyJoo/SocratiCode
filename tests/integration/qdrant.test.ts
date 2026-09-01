@@ -290,6 +290,31 @@ describe.skipIf(!dockerAvailable)("qdrant service", () => {
       );
     });
 
+    it("keeps existing metadata when legacy profile adoption is retried", async () => {
+      const stored = requestedIndexProfile("code");
+      const fileHashes = new Map<string, string>([
+        ["src/existing.ts", "hash-existing"],
+      ]);
+      await saveProjectMetadata(
+        metadataCollection,
+        projectPath,
+        1,
+        1,
+        fileHashes,
+        "completed",
+        stored,
+      );
+      const candidate = legacyIndexProfile("code", 7);
+
+      const adopted = await adoptEffectiveIndexProfile(metadataCollection, candidate);
+
+      expect(adopted).toEqual(stored);
+      expect((await getProjectMetadata(metadataCollection))?.effectiveProfile).toEqual(
+        stored,
+      );
+      expect(await loadProjectHashes(metadataCollection)).toEqual(fileHashes);
+    });
+
     it("can delete project metadata", async () => {
       await deleteProjectMetadata(metadataCollection);
       // After deletion, metadata should be gone

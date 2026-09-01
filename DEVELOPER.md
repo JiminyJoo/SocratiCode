@@ -797,9 +797,9 @@ Google Generative AI embedding provider. Requires `GOOGLE_API_KEY`.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings for the texts as given — batching and retries only, no prefixing (callers pass text from `prepareDocumentText`) |
+| `generateEmbeddings` | `(texts: string[]) → Promise<number[][]>` | Batch generate embeddings for the texts as given; batching and retries only, no prefixing (callers pass text from `prepareDocumentText`) |
 | `generateQueryEmbedding` | `(query: string) → Promise<number[]>` | Single query embedding, prefixed with `search_query: ` (default; env-configurable via `EMBEDDING_QUERY_PREFIX`) |
-| `prepareDocumentText` | `(content, filePath) → string` | Build the text to embed: `search_document: ` prefix, then the relative path, then the content (prefix env-configurable via `EMBEDDING_DOCUMENT_PREFIX`; the path is dropped when `EMBEDDING_DOCUMENT_INCLUDE_PATH=false`) |
+| `prepareDocumentText` | `(content, filePath, profile?) → string` | Build the text to embed. `profile.documentPrefix` controls the prefix and `profile.documentIncludesPath` controls whether the file path precedes the content; omitting the profile uses the requested runtime settings. |
 
 ### indexer.ts
 
@@ -1484,7 +1484,8 @@ Edit `CHUNK_SIZE` and `CHUNK_OVERLAP` in `src/constants.ts`. Smaller chunks give
 
 1. Set `EMBEDDING_PROVIDER` in your MCP config env block (`ollama`, `openai`, or `google`).
 2. Optionally override `EMBEDDING_MODEL` and `EMBEDDING_DIMENSIONS` for the chosen provider (auto-detected defaults exist for all built-in models).
-3. Re-index all projects (`codebase_remove` then `codebase_index`) since existing vectors have different dimensions.
+3. Existing collections continue using their stored effective profile. Confirm pending differences with `codebase_status`.
+4. Activate the requested settings for each intended collection with `codebase_remove`, then `codebase_index`.
 
 See `src/services/embedding-config.ts` for all supported environment variables and per-provider defaults.
 

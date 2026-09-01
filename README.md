@@ -1285,7 +1285,7 @@ Code and context collections persist the settings that define their stored repre
 | `SOCRATICODE_LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error` |
 | `SOCRATICODE_LOG_FILE` | *(none)* | Absolute path to a log file. When set, all log entries are appended to this file (a session separator is written on each server start). Useful for debugging when the MCP host doesn't surface log notifications. |
 
-> **Important**: If you change `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, or `EMBEDDING_DIMENSIONS` after indexing, you must re-index your projects (`codebase_remove` then `codebase_index`) since existing vectors have different dimensions.
+> **Important**: Existing collections keep their stored effective provider, model, and dimensions when runtime settings change. `codebase_status` reports requested differences as pending. To activate them, remove the collection with `codebase_remove`, then create a fresh index with `codebase_index`. This explicit rebuild is required for activation, not for continued use of the existing index.
 
 ## Docker Resources
 
@@ -1471,11 +1471,11 @@ AI to *"list all indexed projects"* to see everything currently indexed.
 
 ### What happens if I change my embedding provider or model?
 
-Each collection is created with a fixed vector size matching the model used at index time.
-If you change `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, or `EMBEDDING_DIMENSIONS` in your
-MCP config, any projects indexed with the old model will return a dimension mismatch error.
-Ask your AI to *"remove the index for this project"* and then to index again with the new
-model. Projects you haven't touched are unaffected.
+Each collection keeps the effective provider, model, dimensions, and query behavior recorded
+when its index was created. Changing those settings in the MCP config does not alter an existing
+collection. Indexing and search continue with its stored profile, while `codebase_status` reports
+the requested settings as pending. To activate the new settings, ask your AI to *"remove the index
+for this project"* and then index it again. Other collections continue using their own profiles.
 
 ### How do I remove a project's index (e.g. to switch embedding model or reindex from scratch)?
 

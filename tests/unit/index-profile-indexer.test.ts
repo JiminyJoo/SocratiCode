@@ -249,7 +249,7 @@ describe("code-index effective profile compatibility", () => {
       "fresh source content that is deliberately longer than twenty characters",
     );
     collectionInfo = { pointsCount: 0, status: "green" };
-    storedProfile = legacyIndexProfile("code");
+    storedProfile = legacyIndexProfile("code", 7);
     storedHashes = new Map([["stale.txt", "stale-hash"]]);
 
     await indexer.indexProject(project);
@@ -263,7 +263,7 @@ describe("code-index effective profile compatibility", () => {
       documentIncludesPath: true,
       maxChunkChars: 2000,
     });
-    expect(observedCollectionDimensions).toContain(3);
+    expect(observedCollectionDimensions).toContain(7);
     const points = upsertedBatches.flat();
     expect(points.length).toBeGreaterThan(0);
     expect(points.every((point) =>
