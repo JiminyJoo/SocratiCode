@@ -531,6 +531,9 @@ describe("ignore", () => {
       const ig = createIgnoreFilter(fixture.root);
       expect(ig.isEnvironmentRoot("backend/env")).toBe(true);
       expect(ig.isEnvironmentRoot("backend/env/")).toBe(true);
+      // In the separator the platform's `path.relative` writes (review
+      // finding: on Windows that is `\`, and the roots are kept with `/`).
+      expect(ig.isEnvironmentRoot(["backend", "env"].join(path.sep))).toBe(true);
       expect(ig.isEnvironmentRoot("backend")).toBe(false);
       expect(ig.isEnvironmentRoot("backend/env/lib")).toBe(false);
     });

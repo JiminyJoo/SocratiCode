@@ -159,8 +159,13 @@ export function createIgnoreFilter(projectPath: string): IgnoreFilter {
       if (byPattern.unignored) return false;
       return byPattern.ignored || isUnderAnEnvironment(relativePath, environments);
     },
-    isEnvironmentRoot: (relativePath) =>
-      environments.includes(relativePath.endsWith("/") ? relativePath : `${relativePath}/`),
+    // Normalised here, as `shouldIgnore` normalises for `ignores`: a caller on
+    // Windows hands over `backend\env`, and the roots are kept with `/`
+    // (review finding).
+    isEnvironmentRoot: (relativePath) => {
+      const normalized = relativePath.split(path.sep).join("/");
+      return environments.includes(normalized.endsWith("/") ? normalized : `${normalized}/`);
+    },
   };
 }
 
