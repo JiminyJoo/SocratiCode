@@ -390,7 +390,7 @@ async function persistSymbolGraph(
     fileCount: symbolsByFile.size,
     unresolvedEdgePct: computeUnresolvedPct(outgoingCallsByFile),
     builtAt: Date.now(),
-    schemaVersion: 1,
+    schemaVersion: 2,
   };
   await saveSymbolGraphMeta(projectId, meta);
 

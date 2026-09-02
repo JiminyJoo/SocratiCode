@@ -110,6 +110,7 @@ export type SymbolKind =
   | "enum"
   | "module"
   | "struct"
+  | "type"
   | "variable";
 
 /** A single symbol (definition) extracted from source code */
@@ -167,7 +168,7 @@ export interface SymbolGraphMeta {
   fileCount: number;
   unresolvedEdgePct: number;
   builtAt: number;
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
 }
 
 /** Per-file payload stored in `_symgraph_file` */

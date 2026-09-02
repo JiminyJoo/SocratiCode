@@ -65,6 +65,49 @@ const helper = function () { return 42; };
       expect(names).toContain("validate");
       expect(names).toContain("helper");
     });
+
+    it("extracts interfaces, type aliases, enums, and plain constants (issue #132)", () => {
+      const src = `
+export interface UserProfile { id: string; name: string; }
+export type JobOfferSnapshot = { id: string; score: number; };
+export enum OfferStatus { Active, Expired }
+export const STALE_EVALUATION_WHERE = "status = 'stale'";
+export let retryCount = 3;
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/types.ts");
+      const syms = new Map(out.symbols.map((s) => [s.name, s]));
+      expect(syms.get("UserProfile")?.kind).toBe("interface");
+      expect(syms.get("JobOfferSnapshot")?.kind).toBe("type");
+      expect(syms.get("OfferStatus")?.kind).toBe("enum");
+      expect(syms.get("STALE_EVALUATION_WHERE")?.kind).toBe("variable");
+      expect(syms.get("retryCount")?.kind).toBe("variable");
+    });
+
+    it("extracts import, re-export, and type reference edges (issue #132)", () => {
+      const src = `
+import { JobOfferSnapshot, STALE_EVALUATION_WHERE } from "./types";
+import type { UserProfile } from "./user";
+import DefaultService from "./service";
+export { OfferStatus } from "./enums";
+
+export function processOffer(offer: JobOfferSnapshot): UserProfile {
+  const query = STALE_EVALUATION_WHERE;
+  return { id: "1", name: query };
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/worker.ts");
+      const calleeNames = out.rawCalls.map((c) => c.calleeName);
+      expect(calleeNames).toContain("JobOfferSnapshot");
+      expect(calleeNames).toContain("STALE_EVALUATION_WHERE");
+      expect(calleeNames).toContain("UserProfile");
+      expect(calleeNames).toContain("DefaultService");
+      expect(calleeNames).toContain("OfferStatus");
+
+      const processOfferCall = out.rawCalls.find(
+        (c) => c.calleeName === "JobOfferSnapshot" && c.callerId.includes("::processOffer#"),
+      );
+      expect(processOfferCall).toBeDefined();
+    });
   });
 
   describe("Python", () => {

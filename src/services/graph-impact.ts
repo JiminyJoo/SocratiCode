@@ -16,6 +16,14 @@ import {
 
 // ── Impact (blast radius) ────────────────────────────────────────────────
 
+// ── Impact (blast radius) ────────────────────────────────────────────────
+
+export type ImpactStatus =
+  | "ok"
+  | "not_found"
+  | "ambiguous"
+  | "unsupported_or_incomplete";
+
 export interface ImpactResult {
   target: string;
   targetKind: "file" | "symbol";
@@ -24,9 +32,12 @@ export interface ImpactResult {
   filesByDepth: Map<number, string[]>;
   totalFiles: number;
   truncated: boolean;
+  status: ImpactStatus;
+  message?: string;
+  candidates?: SymbolNode[];
 }
 
-/** BFS over the in-memory `reverseFileIndex`. Polymorphic on target type. */
+/** BFS over symbol call/reference graph or reverseFileIndex. Polymorphic on target type. */
 export async function getImpactRadius(
   cache: SymbolGraphCache,
   target: string,
@@ -39,46 +50,167 @@ export async function getImpactRadius(
     ? "file"
     : "symbol";
 
-  // Resolve to one or more "seed" files
-  let seedFiles: Set<string>;
   if (targetKind === "file") {
-    seedFiles = new Set([target]);
-  } else {
-    seedFiles = new Set();
-    const nameIndex = await cache.getNameIndex();
-    const refs = nameIndex.get(target) ?? [];
-    for (const r of refs) seedFiles.add(r.file);
-  }
-
-  const visited = new Set<string>();
-  const filesByDepth = new Map<number, string[]>();
-  let frontier = new Set(seedFiles);
-  for (const f of seedFiles) visited.add(f);
-
-  let truncated = false;
-  for (let hop = 1; hop <= safeDepth; hop++) {
-    const next = new Set<string>();
-    for (const calleeFile of frontier) {
-      const callers = reverseIndex.get(calleeFile);
-      if (!callers) continue;
-      for (const callerFile of callers) {
-        if (visited.has(callerFile)) continue;
-        next.add(callerFile);
-        visited.add(callerFile);
-      }
+    const normTarget = toForwardSlash(target);
+    const targetPayload = await cache.getFilePayload(normTarget);
+    if (!targetPayload) {
+      return {
+        target,
+        targetKind,
+        depth: safeDepth,
+        filesByDepth: new Map(),
+        totalFiles: 0,
+        truncated: false,
+        status: "not_found",
+        message: `File '${target}' was not found in the index.`,
+      };
     }
-    if (next.size === 0) break;
-    filesByDepth.set(hop, Array.from(next).sort());
-    frontier = next;
-    // After reaching the depth limit, check if more callers exist beyond it.
-    if (hop === safeDepth) {
+
+    const visited = new Set<string>([normTarget]);
+    const filesByDepth = new Map<number, string[]>();
+    let frontier = new Set<string>([normTarget]);
+    let truncated = false;
+
+    for (let hop = 1; hop <= safeDepth; hop++) {
+      const next = new Set<string>();
       for (const calleeFile of frontier) {
         const callers = reverseIndex.get(calleeFile);
         if (!callers) continue;
         for (const callerFile of callers) {
-          if (!visited.has(callerFile)) {
-            truncated = true;
-            break;
+          if (visited.has(callerFile)) continue;
+          next.add(callerFile);
+          visited.add(callerFile);
+        }
+      }
+      if (next.size === 0) break;
+      filesByDepth.set(hop, Array.from(next).sort());
+      frontier = next;
+
+      if (hop === safeDepth) {
+        for (const calleeFile of frontier) {
+          const callers = reverseIndex.get(calleeFile);
+          if (!callers) continue;
+          for (const callerFile of callers) {
+            if (!visited.has(callerFile)) {
+              truncated = true;
+              break;
+            }
+          }
+          if (truncated) break;
+        }
+      }
+    }
+
+    let totalFiles = 0;
+    for (const arr of filesByDepth.values()) totalFiles += arr.length;
+    return {
+      target,
+      targetKind,
+      depth: safeDepth,
+      filesByDepth,
+      totalFiles,
+      truncated,
+      status: "ok",
+    };
+  }
+
+  // Symbol mode: exact symbol resolution and traversal
+  const nameIndex = await cache.getNameIndex();
+  const refs = nameIndex.get(target) ?? [];
+
+  if (refs.length === 0) {
+    return {
+      target,
+      targetKind,
+      depth: safeDepth,
+      filesByDepth: new Map(),
+      totalFiles: 0,
+      truncated: false,
+      status: "not_found",
+      message: `Symbol '${target}' was not found in the symbol graph.`,
+    };
+  }
+
+  const distinctFiles = Array.from(new Set(refs.map((r) => r.file)));
+  if (distinctFiles.length > 1) {
+    const candidates: SymbolNode[] = [];
+    for (const ref of refs) {
+      const payload = await cache.getFilePayload(ref.file);
+      const sym = payload?.symbols.find((s) => s.id === ref.id);
+      if (sym) candidates.push(sym);
+    }
+    return {
+      target,
+      targetKind,
+      depth: safeDepth,
+      filesByDepth: new Map(),
+      totalFiles: 0,
+      truncated: false,
+      status: "ambiguous",
+      message: `Symbol '${target}' is ambiguous (defined in ${distinctFiles.length} files: ${distinctFiles.slice(0, 5).join(", ")}${distinctFiles.length > 5 ? "..." : ""}). Specify the file path or qualified name to disambiguate.`,
+      candidates,
+    };
+  }
+
+  const targetSymbolIds = new Set(refs.map((r) => r.id));
+  const visitedFiles = new Set<string>(distinctFiles);
+  const filesByDepth = new Map<number, string[]>();
+
+  let frontierSymbolIds = new Set(targetSymbolIds);
+  let frontierFiles = new Set<string>(distinctFiles);
+  let truncated = false;
+
+  for (let hop = 1; hop <= safeDepth; hop++) {
+    const nextHopFiles = new Set<string>();
+    const nextSymbolIds = new Set<string>();
+    const nextFiles = new Set<string>();
+
+    // For all files that could call into our current frontier files
+    for (const calleeFile of frontierFiles) {
+      const potentialCallerFiles = reverseIndex.get(calleeFile);
+      if (!potentialCallerFiles) continue;
+
+      for (const callerFile of potentialCallerFiles) {
+        const callerPayload = await cache.getFilePayload(callerFile);
+        if (!callerPayload) continue;
+
+        let matched = false;
+        for (const edge of callerPayload.outgoingCalls) {
+          const callsTarget = edge.calleeCandidates.some((candId) =>
+            frontierSymbolIds.has(candId),
+          );
+          if (callsTarget) {
+            matched = true;
+            nextSymbolIds.add(edge.callerId);
+          }
+        }
+
+        if (matched) {
+          if (!visitedFiles.has(callerFile)) {
+            nextHopFiles.add(callerFile);
+            visitedFiles.add(callerFile);
+          }
+          nextFiles.add(callerFile);
+        }
+      }
+    }
+
+    if (nextHopFiles.size === 0) break;
+    filesByDepth.set(hop, Array.from(nextHopFiles).sort());
+    frontierSymbolIds = nextSymbolIds;
+    frontierFiles = nextFiles;
+
+    if (hop === safeDepth) {
+      for (const calleeFile of frontierFiles) {
+        const potentialCallerFiles = reverseIndex.get(calleeFile);
+        if (!potentialCallerFiles) continue;
+        for (const callerFile of potentialCallerFiles) {
+          if (!visitedFiles.has(callerFile)) {
+            const cp = await cache.getFilePayload(callerFile);
+            if (cp?.outgoingCalls.some((e) => e.calleeCandidates.some((c) => frontierSymbolIds.has(c)))) {
+              truncated = true;
+              break;
+            }
           }
         }
         if (truncated) break;
@@ -88,9 +220,15 @@ export async function getImpactRadius(
 
   let totalFiles = 0;
   for (const arr of filesByDepth.values()) totalFiles += arr.length;
+
   return {
-    target, targetKind, depth: safeDepth, filesByDepth, totalFiles,
+    target,
+    targetKind,
+    depth: safeDepth,
+    filesByDepth,
+    totalFiles,
     truncated,
+    status: "ok",
   };
 }
 

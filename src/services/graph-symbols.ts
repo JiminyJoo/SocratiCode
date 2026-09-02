@@ -754,12 +754,6 @@ function extractFromTsLike(
 
   // Class declarations
   for (const node of safeFindAll(root, "class_declaration")) {
-    // The name FIELD, not a subtree search: safeFind's recursive DFS reaches a
-    // decorator's identifier before the class's own name, so `@sealed class X`
-    // would extract as a class named `sealed` and collide with the real
-    // decorator function at resolution time. The field is grammar-precise on
-    // JS (identifier) and TS/TSX (type_identifier) alike; the searches remain
-    // only as a belt for grammars without the field.
     const nameNode = node.field("name")
       ?? safeFind(node, "type_identifier")
       ?? safeFind(node, "identifier");
@@ -775,11 +769,6 @@ function extractFromTsLike(
     symbols.push(sym);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
 
-    // Methods inside the class — DIRECT children of the class body only. A
-    // recursive scan fabricates phantom methods: an object-literal shorthand
-    // handler inside a field initializer or a call argument, or a nested
-    // class's methods, would all be stamped onto THIS class and persisted into
-    // the name index, corrupting name-based resolution and impact seeds.
     const body = node.field("body");
     // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
     let members: any[] = [];
@@ -790,9 +779,6 @@ function extractFromTsLike(
       members = [];
     }
     for (const m of members) {
-      // Name from the field, accepting only a literal property name: a
-      // computed name like `[Symbol.iterator]` has no static identity, and
-      // searching inside it used to persist a method that does not exist.
       const mNameNode = m.field("name");
       const mName = mNameNode?.kind() === "property_identifier" ? mNameNode.text() : null;
       if (!mName) continue;
@@ -843,30 +829,96 @@ function extractFromTsLike(
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
 
-  // Named arrow functions: `const foo = (...) => {...}` or `const foo = function(...) {...}`
-  for (const node of safeFindAll(root, "lexical_declaration")) {
-    for (const decl of safeFindAll(node, "variable_declarator")) {
-      const idNode = safeFind(decl, "identifier");
-      if (!idNode) continue;
-      const name = idNode.text();
-      const arrow = safeFind(decl, "arrow_function");
-      const fnExpr = safeFind(decl, "function_expression");
-      const fn = arrow ?? fnExpr;
-      if (!fn) continue;
-      const r = fn.range();
-      const startLine = r.start.line + 1;
-      const endLine = r.end.line + 1;
-      const sym: SymbolNode = {
-        id: makeId(file, name, startLine),
-        name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
-      };
-      symbols.push(sym);
-      scopes.push({ name, startLine, endLine, symbolId: sym.id });
+  // Interface declarations (TS / TSX)
+  for (const node of safeFindAll(root, "interface_declaration")) {
+    const nameNode = node.field("name")
+      ?? safeFind(node, "type_identifier")
+      ?? safeFind(node, "identifier");
+    if (!nameNode) continue;
+    const name = nameNode.text();
+    const r = node.range();
+    const startLine = r.start.line + 1;
+    const endLine = r.end.line + 1;
+    const sym: SymbolNode = {
+      id: makeId(file, name, startLine),
+      name, qualifiedName: name, kind: "interface", file, line: startLine, endLine, language,
+    };
+    symbols.push(sym);
+    scopes.push({ name, startLine, endLine, symbolId: sym.id });
+  }
+
+  // Type alias declarations (TS / TSX)
+  for (const node of safeFindAll(root, "type_alias_declaration")) {
+    const nameNode = node.field("name")
+      ?? safeFind(node, "type_identifier")
+      ?? safeFind(node, "identifier");
+    if (!nameNode) continue;
+    const name = nameNode.text();
+    const r = node.range();
+    const startLine = r.start.line + 1;
+    const endLine = r.end.line + 1;
+    const sym: SymbolNode = {
+      id: makeId(file, name, startLine),
+      name, qualifiedName: name, kind: "type", file, line: startLine, endLine, language,
+    };
+    symbols.push(sym);
+    scopes.push({ name, startLine, endLine, symbolId: sym.id });
+  }
+
+  // Enum declarations (TS / TSX)
+  for (const node of safeFindAll(root, "enum_declaration")) {
+    const nameNode = node.field("name")
+      ?? safeFind(node, "identifier");
+    if (!nameNode) continue;
+    const name = nameNode.text();
+    const r = node.range();
+    const startLine = r.start.line + 1;
+    const endLine = r.end.line + 1;
+    const sym: SymbolNode = {
+      id: makeId(file, name, startLine),
+      name, qualifiedName: name, kind: "enum", file, line: startLine, endLine, language,
+    };
+    symbols.push(sym);
+    scopes.push({ name, startLine, endLine, symbolId: sym.id });
+  }
+
+  // Lexical and variable declarations: const, let, var (including arrow functions and plain constants)
+  const declKinds = ["lexical_declaration", "variable_declaration"];
+  for (const declKind of declKinds) {
+    for (const node of safeFindAll(root, declKind)) {
+      for (const decl of safeFindAll(node, "variable_declarator")) {
+        const idNode = decl.field("name") ?? safeFind(decl, "identifier");
+        if (!idNode) continue;
+        const name = idNode.text();
+        const arrow = safeFind(decl, "arrow_function");
+        const fnExpr = safeFind(decl, "function_expression");
+        const fn = arrow ?? fnExpr;
+        const r = (fn ?? decl).range();
+        const startLine = r.start.line + 1;
+        const endLine = r.end.line + 1;
+        const symKind: SymbolKind = fn ? "function" : "variable";
+        const sym: SymbolNode = {
+          id: makeId(file, name, startLine),
+          name, qualifiedName: name, kind: symKind, file, line: startLine, endLine, language,
+        };
+        symbols.push(sym);
+        scopes.push({ name, startLine, endLine, symbolId: sym.id });
+      }
     }
   }
 
-  // Call sites
+  // Track declaration names and lines to avoid self-referencing declaration identifiers
+  const declaredNamesAndLines = new Set<string>();
+  for (const s of symbols) {
+    if (s.name !== "<module>") {
+      declaredNamesAndLines.add(`${s.name}#${s.line}`);
+    }
+  }
+
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
+  const importedNames = new Set<string>();
+
+  // 1. Call sites
   for (const node of safeFindAll(root, "call_expression")) {
     const calleeName = extractCalleeNameJs(node.text());
     if (!calleeName) continue;
@@ -878,6 +930,109 @@ function extractFromTsLike(
       callSite: { file, line: callLine },
     });
   }
+
+  // 2. Import statements: named imports (`import { X, Y as Z }`), type imports (`import type { T }`), default imports (`import D from ...`)
+  for (const imp of safeFindAll(root, "import_statement")) {
+    const r = imp.range();
+    const line = r.start.line + 1;
+
+    for (const spec of safeFindAll(imp, "import_specifier")) {
+      const nameNode = spec.field("name") ?? safeFind(spec, "identifier");
+      if (!nameNode) continue;
+      const importedName = nameNode.text();
+      importedNames.add(importedName);
+      rawCalls.push({
+        callerId: moduleSym.id,
+        calleeName: importedName,
+        callSite: { file, line },
+      });
+    }
+
+    const clause = safeFind(imp, "import_clause");
+    if (clause) {
+      // Direct identifier in import_clause is default import
+      // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+      const kids = (clause as any).children?.() ?? [];
+      for (const k of kids) {
+        if (k.kind() === "identifier") {
+          const defaultName = k.text();
+          importedNames.add(defaultName);
+          rawCalls.push({
+            callerId: moduleSym.id,
+            calleeName: defaultName,
+            callSite: { file, line },
+          });
+        }
+      }
+    }
+  }
+
+  // 3. Re-export statements (`export { X, Y } from '...'` and `export { X }`)
+  for (const exp of safeFindAll(root, "export_statement")) {
+    const r = exp.range();
+    const line = r.start.line + 1;
+    for (const spec of safeFindAll(exp, "export_specifier")) {
+      const nameNode = spec.field("name") ?? safeFind(spec, "identifier");
+      if (!nameNode) continue;
+      const expName = nameNode.text();
+      importedNames.add(expName);
+      rawCalls.push({
+        callerId: moduleSym.id,
+        calleeName: expName,
+        callSite: { file, line },
+      });
+    }
+  }
+
+  // 4. Type references (type annotations, type arguments, implements, extends)
+  const TS_BUILTIN_TYPES = new Set([
+    "string", "number", "boolean", "any", "unknown", "never", "void", "null", "undefined",
+    "symbol", "bigint", "object", "Function", "true", "false",
+    "Array", "Record", "Promise", "Partial", "Required", "Readonly", "Pick", "Omit",
+    "Exclude", "Extract", "NonNullable", "ReturnType", "InstanceType", "Parameters",
+    "ConstructorParameters", "Awaited", "Map", "Set", "WeakMap", "WeakSet", "Error",
+    "RegExp", "Date", "Uint8Array", "Int8Array", "Uint16Array", "Int16Array",
+    "Uint32Array", "Int32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
+    "ArrayBuffer", "DataView", "Iterable", "AsyncIterable", "Iterator", "AsyncIterator",
+    "Generator", "AsyncGenerator", "TemplateStringsArray", "PropertyKey",
+    "T", "K", "V", "U", "R", "P",
+  ]);
+
+  for (const node of safeFindAll(root, "type_identifier")) {
+    const name = node.text();
+    if (TS_BUILTIN_TYPES.has(name)) continue;
+    const r = node.range();
+    const line = r.start.line + 1;
+    if (declaredNamesAndLines.has(`${name}#${line}`)) continue;
+    const callerId = findCallerId(scopes, line, moduleSym.id);
+    rawCalls.push({
+      callerId,
+      calleeName: name,
+      callSite: { file, line },
+    });
+  }
+
+  // 5. Value references to imported identifiers in expressions / statements
+  if (importedNames.size > 0) {
+    for (const idNode of safeFindAll(root, "identifier")) {
+      const name = idNode.text();
+      if (!importedNames.has(name)) continue;
+      const r = idNode.range();
+      const line = r.start.line + 1;
+      const parentKind = idNode.parent()?.kind?.();
+      // Skip import_specifier / export_specifier definition sites themselves
+      if (parentKind === "import_specifier" || parentKind === "import_clause" || parentKind === "export_specifier") {
+        continue;
+      }
+      const callerId = findCallerId(scopes, line, moduleSym.id);
+      rawCalls.push({
+        callerId,
+        calleeName: name,
+        callSite: { file, line },
+      });
+    }
+  }
+
   return { symbols, rawCalls };
 }
 

@@ -270,16 +270,17 @@ async function dispatchGraphTool(
       // the real loader state. Idempotent and cheap after the first call.
       ensureDynamicLanguages();
       const grammarStatus = getDynamicLanguageStatus();
+      const BUILTIN_AST_LANGUAGES = [
+        "csharp", "go", "java", "javascript", "kotlin", "python", "rust", "tsx", "typescript",
+      ];
       const renderGrammarBlock = (): string[] => {
-        if (grammarStatus.loaded.length === 0 && grammarStatus.failed.length === 0) {
-          return [];
-        }
         const block: string[] = ["", "AST grammars:"];
+        block.push(`  Built-in (ast-grep, ${BUILTIN_AST_LANGUAGES.length}): ${BUILTIN_AST_LANGUAGES.join(", ")}`);
         if (grammarStatus.loaded.length > 0) {
-          block.push(`  Loaded (${grammarStatus.loaded.length}): ${grammarStatus.loaded.join(", ")}`);
+          block.push(`  Dynamic loaded (${grammarStatus.loaded.length}): ${grammarStatus.loaded.join(", ")}`);
         }
         if (grammarStatus.failed.length > 0) {
-          block.push(`  Failed (${grammarStatus.failed.length}):`);
+          block.push(`  Dynamic failed (${grammarStatus.failed.length}):`);
           for (const f of grammarStatus.failed) {
             block.push(`    - ${f.name}: ${f.error}`);
           }
@@ -413,13 +414,35 @@ async function dispatchGraphTool(
         return "No symbol graph found. Run codebase_graph_build (or codebase_index) first.";
       }
       const result = await getImpactRadius(cache, target, depth);
+
+      if (result.status === "not_found") {
+        return result.message ?? `Target '${target}' was not found in the graph.`;
+      }
+      if (result.status === "ambiguous") {
+        const lines = [
+          `Target '${target}' is ambiguous:`,
+          result.message ?? "",
+        ];
+        if (result.candidates && result.candidates.length > 0) {
+          lines.push("");
+          lines.push("Candidates:");
+          for (const c of result.candidates) {
+            lines.push(`  - [${c.kind}] ${c.qualifiedName} in ${c.file}:${c.line}`);
+          }
+        }
+        return lines.join("\n").trimEnd();
+      }
+      if (result.status === "unsupported_or_incomplete") {
+        return result.message ?? `Graph analysis for '${target}' is incomplete.`;
+      }
+
       const lines = [
         `Blast radius for ${result.targetKind}: ${result.target}`,
         `Depth: ${result.depth}    Total impacted files: ${result.totalFiles}`,
         "",
       ];
       if (result.totalFiles === 0) {
-        lines.push("No callers found — nothing else depends on this.");
+        lines.push("No callers or references found — nothing else depends on this.");
       } else {
         for (const [hop, files] of result.filesByDepth.entries()) {
           lines.push(`Hop ${hop} (${files.length} files):`);
