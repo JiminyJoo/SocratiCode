@@ -69,12 +69,32 @@ const DEFAULT_IGNORE_PATTERNS = [
 ];
 
 /**
+ * What `createIgnoreFilter` answers with: one question, on a path relative to
+ * the project root and written with forward slashes.
+ *
+ * Two kinds of rule stand behind it. Patterns — the defaults, `.gitignore`
+ * files and `.socraticodeignore` — are gitignore syntax and go to the `ignore`
+ * package. The environments the walk *discovers* are not patterns, they are
+ * directories that exist, and they are kept as the literal prefixes they are.
+ * Writing one as a pattern meant escaping it, and the escape is only as good as
+ * the package's reading of it: `\?` is not understood by the installed
+ * version, so an environment at `env?/` was scanned despite its marker
+ * (review finding), while `\[`, `\*`, `\!`, `\#` and `\\` happened to work.
+ * A prefix compare has no syntax to get wrong.
+ */
+export interface IgnoreFilter {
+  /** Whether the path, relative to the project root, is excluded. */
+  ignores(relativePath: string): boolean;
+}
+
+/**
  * Build an ignore filter for a project directory.
  *
  * Combines (in order):
  *   1. Built-in defaults (node_modules, .git, dist, build, lock files, etc.)
  *   2. .gitignore files (root + nested) — unless RESPECT_GITIGNORE=false
- *   3. .socraticodeignore — optional project-specific exclusions
+ *   3. Python and conda environments found by their markers, as literal prefixes
+ *   4. .socraticodeignore — optional project-specific exclusions
  *
  * Set env RESPECT_GITIGNORE=false to skip .gitignore processing entirely.
  *
@@ -82,8 +102,9 @@ const DEFAULT_IGNORE_PATTERNS = [
  * build a filter per artifact on every staleness check, so an info line here
  * would fire once per artifact per context search.
  */
-export function createIgnoreFilter(projectPath: string): Ignore {
+export function createIgnoreFilter(projectPath: string): IgnoreFilter {
   const ig = ignore();
+  const environments: string[] = [];
 
   // Default patterns
   ig.add(DEFAULT_IGNORE_PATTERNS);
@@ -106,7 +127,7 @@ export function createIgnoreFilter(projectPath: string): Ignore {
   // runs whether or not .gitignore is respected: a virtualenv is not a project
   // preference, it is a directory of installed libraries that no reading of the
   // tree should call source.
-  scanNestedIgnoreSources(projectPath, projectPath, ig, respectGitignore);
+  scanNestedIgnoreSources(projectPath, projectPath, ig, environments, respectGitignore);
 
   // .socraticodeignore
   const socraticodeignorePath = path.join(projectPath, ".socraticodeignore");
@@ -117,19 +138,22 @@ export function createIgnoreFilter(projectPath: string): Ignore {
     logger.debug("Loaded .socraticodeignore rules");
   }
 
-  return ig;
+  return {
+    ignores: (relativePath) =>
+      isUnderAnEnvironment(relativePath, environments) || ig.ignores(relativePath),
+  };
 }
 
 /**
- * A literal path as a gitignore pattern that matches it and nothing else.
- *
- * The syntax reads `*`, `?` and `[` as wildcards, so a directory honestly named
- * `env[3]` became a character class and matched none of its own files. A
- * leading `!` or `#` changes what the whole line means, and both are legal in a
- * directory name.
+ * Whether the path is one of the discovered environment directories or lies
+ * beneath one. `environments` holds each as `dir/` relative to the root, so
+ * `env?/lib/dep.py` and the directory itself, asked as `env?/` or `env?`, all
+ * answer true, and `env?.d/x.py` does not.
  */
-function escapeIgnorePattern(literal: string): string {
-  return literal.replace(/[[\]*?\\!#]/g, (character) => `\\${character}`);
+function isUnderAnEnvironment(relativePath: string, environments: string[]): boolean {
+  return environments.some(
+    (dir) => relativePath.startsWith(dir) || relativePath === dir.slice(0, -1),
+  );
 }
 
 /**
@@ -184,6 +208,7 @@ function scanNestedIgnoreSources(
   rootPath: string,
   currentPath: string,
   ig: Ignore,
+  environments: string[],
   readGitignores: boolean,
 ): void {
   let entries: fs.Dirent[];
@@ -212,19 +237,12 @@ function scanNestedIgnoreSources(
     // whole, and a discarded source file costs far more than a kept one.
     if (isFile(path.join(dirPath, "pyvenv.cfg")) || isDirectory(path.join(dirPath, "conda-meta"))) {
       const relDir = path.relative(rootPath, dirPath).split(path.sep).join("/");
-      // Anchored with a leading slash, because a gitignore pattern carrying no
-      // slash of its own matches that name at **every** depth. An environment
-      // sitting directly under the root produces exactly such a pattern — its
-      // relative path is a bare name — so a root-level `toolbox/` was deleting
+      // Kept as the literal prefix it is, never as a pattern — see
+      // `IgnoreFilter`. A prefix is anchored by nature: `toolbox/` here is the
+      // directory under the root and nothing else, where the pattern
+      // `toolbox/` once matched that name at every depth and deleted
       // `packages/app/toolbox/` too, in any language.
-      //
-      // It also undid this file's own reason for existing: with a root-level
-      // `env/` present, the pattern `env/` came back and excluded
-      // `clap_complete/src/env/mod.rs` again, which is the case the anchoring
-      // of the defaults above was written to keep. Verified against the
-      // installed `ignore` package: `env/` matches that path, `/env/` does not,
-      // and both still catch `env/lib/dep.py` at the root.
-      if (relDir) ig.add(`/${escapeIgnorePattern(relDir)}/`);
+      if (relDir) environments.push(`${relDir}/`);
       continue;
     }
 
@@ -280,14 +298,14 @@ function scanNestedIgnoreSources(
     }
 
     // Recurse into subdirectory
-    scanNestedIgnoreSources(rootPath, dirPath, ig, readGitignores);
+    scanNestedIgnoreSources(rootPath, dirPath, ig, environments, readGitignores);
   }
 }
 
 /**
  * Check if a relative path should be ignored.
  */
-export function shouldIgnore(ig: Ignore, relativePath: string): boolean {
+export function shouldIgnore(ig: IgnoreFilter, relativePath: string): boolean {
   const normalized = relativePath.split(path.sep).join("/");
   return ig.ignores(normalized);
 }
