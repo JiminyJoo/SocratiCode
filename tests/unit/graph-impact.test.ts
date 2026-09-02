@@ -37,6 +37,22 @@ function createMockCache(opts: {
   // @ts-expect-error accessing private field for unit testing
   cache.reverseFileIndex = opts.reverseFileIndex;
 
+  const reverseSymbolIndex = new Map<string, Set<string>>();
+  for (const payload of opts.filePayloads.values()) {
+    for (const e of payload.outgoingCalls) {
+      for (const calleeId of e.calleeCandidates) {
+        let set = reverseSymbolIndex.get(calleeId);
+        if (!set) {
+          set = new Set();
+          reverseSymbolIndex.set(calleeId, set);
+        }
+        set.add(e.callerId);
+      }
+    }
+  }
+  // @ts-expect-error accessing private field for unit testing
+  cache.reverseSymbolIndex = reverseSymbolIndex;
+
   for (const [f, payload] of opts.filePayloads) {
     cache.fileDataLru.set(f, payload);
   }
@@ -295,5 +311,192 @@ describe("graph-impact exact symbol traversal and fail-closed", () => {
     expect(result.status).toBe("ok");
     expect(result.totalFiles).toBe(2);
     expect(result.filesByDepth.get(1)).toEqual(["src/services/evaluator.ts", "src/services/other.ts"]);
+  });
+
+  it("traverses same-file caller and transitively reaches external consumers", async () => {
+    const symTarget: SymbolNode = {
+      id: "src/utils.ts::computeCore#1",
+      name: "computeCore",
+      qualifiedName: "computeCore",
+      kind: "function",
+      file: "src/utils.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+    const symHelper: SymbolNode = {
+      id: "src/utils.ts::publicHelper#10",
+      name: "publicHelper",
+      qualifiedName: "publicHelper",
+      kind: "function",
+      file: "src/utils.ts",
+      line: 10,
+      endLine: 15,
+      language: "typescript",
+    };
+    const symApp: SymbolNode = {
+      id: "src/app.ts::main#1",
+      name: "main",
+      qualifiedName: "main",
+      kind: "function",
+      file: "src/app.ts",
+      line: 1,
+      endLine: 10,
+      language: "typescript",
+    };
+
+    const cache = createMockCache({
+      symbols: [symTarget, symHelper, symApp],
+      reverseFileIndex: new Map(),
+      filePayloads: new Map([
+        ["src/utils.ts", {
+          file: "src/utils.ts",
+          language: "typescript",
+          contentHash: "h_u",
+          symbols: [symTarget, symHelper],
+          outgoingCalls: [
+            // same-file call: publicHelper calls computeCore
+            {
+              callerId: "src/utils.ts::publicHelper#10",
+              calleeName: "computeCore",
+              kind: "call",
+              calleeCandidates: ["src/utils.ts::computeCore#1"],
+              confidence: "local",
+              callSite: { file: "src/utils.ts", line: 12 },
+            },
+          ],
+        }],
+        ["src/app.ts", {
+          file: "src/app.ts",
+          language: "typescript",
+          contentHash: "h_a",
+          symbols: [symApp],
+          outgoingCalls: [
+            // external call: main calls publicHelper
+            {
+              callerId: "src/app.ts::main#1",
+              calleeName: "publicHelper",
+              kind: "call",
+              sourceModule: "./utils",
+              importedName: "publicHelper",
+              calleeCandidates: ["src/utils.ts::publicHelper#10"],
+              confidence: "unique",
+              callSite: { file: "src/app.ts", line: 3 },
+            },
+          ],
+        }],
+      ]),
+    });
+
+    const result = await getImpactRadius(cache, "computeCore", 3);
+    expect(result.status).toBe("ok");
+    expect(result.totalFiles).toBe(2);
+    // Hop 1: same file utils.ts (via publicHelper)
+    expect(result.filesByDepth.get(1)).toEqual(["src/utils.ts"]);
+    // Hop 2: app.ts (via main calling publicHelper)
+    expect(result.filesByDepth.get(2)).toEqual(["src/app.ts"]);
+  });
+
+  it("disambiguates ambiguous symbols when file option is provided", async () => {
+    const symA: SymbolNode = {
+      id: "src/serviceA.ts::init#1",
+      name: "init",
+      qualifiedName: "init",
+      kind: "function",
+      file: "src/serviceA.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+    const symB: SymbolNode = {
+      id: "src/serviceB.ts::init#1",
+      name: "init",
+      qualifiedName: "init",
+      kind: "function",
+      file: "src/serviceB.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+    const callerSym: SymbolNode = {
+      id: "src/app.ts::start#1",
+      name: "start",
+      qualifiedName: "start",
+      kind: "function",
+      file: "src/app.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+
+    const cache = createMockCache({
+      symbols: [symA, symB, callerSym],
+      reverseFileIndex: new Map(),
+      filePayloads: new Map([
+        ["src/serviceA.ts", { file: "src/serviceA.ts", language: "typescript", contentHash: "ha", symbols: [symA], outgoingCalls: [] }],
+        ["src/serviceB.ts", { file: "src/serviceB.ts", language: "typescript", contentHash: "hb", symbols: [symB], outgoingCalls: [] }],
+        ["src/app.ts", {
+          file: "src/app.ts",
+          language: "typescript",
+          contentHash: "happ",
+          symbols: [callerSym],
+          outgoingCalls: [
+            {
+              callerId: "src/app.ts::start#1",
+              calleeName: "init",
+              kind: "call",
+              sourceModule: "./serviceA",
+              importedName: "init",
+              calleeCandidates: ["src/serviceA.ts::init#1"],
+              confidence: "unique",
+              callSite: { file: "src/app.ts", line: 2 },
+            },
+          ],
+        }],
+      ]),
+    });
+
+    const result = await getImpactRadius(cache, "init", 2, { file: "src/serviceA.ts" });
+    expect(result.status).toBe("ok");
+    expect(result.totalFiles).toBe(1);
+    expect(result.filesByDepth.get(1)).toEqual(["src/app.ts"]);
+  });
+
+  it("targets exact symbol when symbolId option is provided", async () => {
+    const symA: SymbolNode = {
+      id: "src/serviceA.ts::init#1",
+      name: "init",
+      qualifiedName: "init",
+      kind: "function",
+      file: "src/serviceA.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+
+    const cache = createMockCache({
+      symbols: [symA],
+      reverseFileIndex: new Map(),
+      filePayloads: new Map([
+        ["src/serviceA.ts", { file: "src/serviceA.ts", language: "typescript", contentHash: "ha", symbols: [symA], outgoingCalls: [] }],
+      ]),
+    });
+
+    const result = await getImpactRadius(cache, "", 2, { symbolId: "src/serviceA.ts::init#1" });
+    expect(result.status).toBe("ok");
+    expect(result.targetKind).toBe("symbol");
+  });
+
+  it("fails immediately with graph_upgrade_required when schemaVersion is 1", async () => {
+    const cache = createMockCache({
+      symbols: [],
+      reverseFileIndex: new Map(),
+      filePayloads: new Map(),
+    });
+    cache.meta.schemaVersion = 1;
+
+    const result = await getImpactRadius(cache, "someSymbol");
+    expect(result.status).toBe("graph_upgrade_required");
+    expect(result.totalFiles).toBe(0);
   });
 });

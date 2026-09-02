@@ -405,8 +405,10 @@ async function dispatchGraphTool(
     }
 
     case "codebase_impact": {
-      const target = (args.target as string)?.trim();
-      if (!target) return "Missing required argument: target";
+      const target = (args.target as string | undefined)?.trim() ?? "";
+      const file = (args.file as string | undefined)?.trim();
+      const symbolId = (args.symbolId as string | undefined)?.trim();
+      if (!target && !symbolId) return "Missing required argument: target or symbolId";
       const depth = typeof args.depth === "number" ? args.depth : 3;
       const projectId = projectIdFromPath(projectPath);
       const cache = await getSymbolGraphCache(projectId);
@@ -416,10 +418,16 @@ async function dispatchGraphTool(
       ensureDynamicLanguages();
       const grammarStatus = getDynamicLanguageStatus();
       const isIncomplete = grammarStatus.failed.length > 0 || (cache.meta.schemaVersion ? cache.meta.schemaVersion < 2 : true);
-      const result = await getImpactRadius(cache, target, depth, { isIncomplete });
+      const result = await getImpactRadius(cache, target || (symbolId as string), depth, { file, symbolId, isIncomplete });
 
+      if (result.status === "graph_upgrade_required") {
+        return result.message ?? "The symbol graph requires an upgrade. Rebuild with codebase_graph_build.";
+      }
+      if (result.status === "storage_error") {
+        return `Storage error: ${result.message}`;
+      }
       if (result.status === "not_found") {
-        return result.message ?? `Target '${target}' was not found in the graph.`;
+        return result.message ?? `Target '${target || symbolId}' was not found in the graph.`;
       }
       if (result.status === "ambiguous") {
         const lines = [
@@ -430,13 +438,13 @@ async function dispatchGraphTool(
           lines.push("");
           lines.push("Candidates:");
           for (const c of result.candidates) {
-            lines.push(`  - [${c.kind}] ${c.qualifiedName} in ${c.file}:${c.line}`);
+            lines.push(`  - [${c.kind}] ${c.qualifiedName} in ${c.file}:${c.line} (ID: ${c.id})`);
           }
         }
         return lines.join("\n").trimEnd();
       }
       if (result.status === "unsupported_or_incomplete") {
-        return result.message ?? `Graph analysis for '${target}' is incomplete.`;
+        return result.message ?? `Graph analysis for '${target || symbolId}' is incomplete.`;
       }
 
       const lines = [
