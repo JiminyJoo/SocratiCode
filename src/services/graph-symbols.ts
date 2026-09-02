@@ -902,7 +902,9 @@ function extractFromTsLike(
           name, qualifiedName: name, kind: symKind, file, line: startLine, endLine, language,
         };
         symbols.push(sym);
-        scopes.push({ name, startLine, endLine, symbolId: sym.id });
+        if (fn) {
+          scopes.push({ name, startLine, endLine, symbolId: sym.id });
+        }
       }
     }
   }
@@ -916,22 +918,10 @@ function extractFromTsLike(
   }
 
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
-  const importedNames = new Set<string>();
+  const localToExportedName = new Map<string, string>();
+  const namespaceNames = new Set<string>();
 
-  // 1. Call sites
-  for (const node of safeFindAll(root, "call_expression")) {
-    const calleeName = extractCalleeNameJs(node.text());
-    if (!calleeName) continue;
-    const r = node.range();
-    const callLine = r.start.line + 1;
-    const callerId = findCallerId(scopes, callLine, moduleSym.id);
-    rawCalls.push({
-      callerId, calleeName,
-      callSite: { file, line: callLine },
-    });
-  }
-
-  // 2. Import statements: named imports (`import { X, Y as Z }`), type imports (`import type { T }`), default imports (`import D from ...`)
+  // 1. Import statements: named imports (`import { X, Y as Z }`), type imports (`import type { T }`), default imports (`import D from ...`), namespace imports (`import * as NS from ...`)
   for (const imp of safeFindAll(root, "import_statement")) {
     const r = imp.range();
     const line = r.start.line + 1;
@@ -939,13 +929,25 @@ function extractFromTsLike(
     for (const spec of safeFindAll(imp, "import_specifier")) {
       const nameNode = spec.field("name") ?? safeFind(spec, "identifier");
       if (!nameNode) continue;
-      const importedName = nameNode.text();
-      importedNames.add(importedName);
+      const originalName = nameNode.text();
+      const aliasNode = spec.field("alias");
+      const localName = aliasNode ? aliasNode.text() : originalName;
+      localToExportedName.set(localName, originalName);
+
       rawCalls.push({
         callerId: moduleSym.id,
-        calleeName: importedName,
+        calleeName: originalName,
         callSite: { file, line },
       });
+    }
+
+    // Namespace import: `import * as NS from "..."`
+    const nsNode = safeFind(imp, "namespace_import");
+    if (nsNode) {
+      const idNode = safeFind(nsNode, "identifier");
+      if (idNode) {
+        namespaceNames.add(idNode.text());
+      }
     }
 
     const clause = safeFind(imp, "import_clause");
@@ -956,7 +958,7 @@ function extractFromTsLike(
       for (const k of kids) {
         if (k.kind() === "identifier") {
           const defaultName = k.text();
-          importedNames.add(defaultName);
+          localToExportedName.set(defaultName, defaultName);
           rawCalls.push({
             callerId: moduleSym.id,
             calleeName: defaultName,
@@ -967,7 +969,7 @@ function extractFromTsLike(
     }
   }
 
-  // 3. Re-export statements (`export { X, Y } from '...'` and `export { X }`)
+  // 2. Re-export statements (`export { X, Y as Z } from '...'` and `export { X }`)
   for (const exp of safeFindAll(root, "export_statement")) {
     const r = exp.range();
     const line = r.start.line + 1;
@@ -975,13 +977,32 @@ function extractFromTsLike(
       const nameNode = spec.field("name") ?? safeFind(spec, "identifier");
       if (!nameNode) continue;
       const expName = nameNode.text();
-      importedNames.add(expName);
+      const aliasNode = spec.field("alias");
+      const localName = aliasNode ? aliasNode.text() : expName;
+      localToExportedName.set(localName, expName);
       rawCalls.push({
         callerId: moduleSym.id,
         calleeName: expName,
         callSite: { file, line },
       });
     }
+  }
+
+  // 3. Call sites
+  for (const node of safeFindAll(root, "call_expression")) {
+    let calleeName = extractCalleeNameJs(node.text());
+    if (!calleeName) continue;
+    const mapped = localToExportedName.get(calleeName);
+    if (mapped) {
+      calleeName = mapped;
+    }
+    const r = node.range();
+    const callLine = r.start.line + 1;
+    const callerId = findCallerId(scopes, callLine, moduleSym.id);
+    rawCalls.push({
+      callerId, calleeName,
+      callSite: { file, line: callLine },
+    });
   }
 
   // 4. Type references (type annotations, type arguments, implements, extends)
@@ -999,11 +1020,15 @@ function extractFromTsLike(
   ]);
 
   for (const node of safeFindAll(root, "type_identifier")) {
-    const name = node.text();
+    let name = node.text();
     if (TS_BUILTIN_TYPES.has(name)) continue;
     const r = node.range();
     const line = r.start.line + 1;
     if (declaredNamesAndLines.has(`${name}#${line}`)) continue;
+    const mapped = localToExportedName.get(name);
+    if (mapped) {
+      name = mapped;
+    }
     const callerId = findCallerId(scopes, line, moduleSym.id);
     rawCalls.push({
       callerId,
@@ -1012,22 +1037,41 @@ function extractFromTsLike(
     });
   }
 
-  // 5. Value references to imported identifiers in expressions / statements
-  if (importedNames.size > 0) {
+  // 5. Value references and namespace member accesses in expressions / statements
+  if (namespaceNames.size > 0) {
+    for (const node of safeFindAll(root, "member_expression")) {
+      const objNode = node.field("object");
+      const propNode = node.field("property");
+      if (objNode && propNode && namespaceNames.has(objNode.text())) {
+        const propName = propNode.text();
+        const r = node.range();
+        const line = r.start.line + 1;
+        const callerId = findCallerId(scopes, line, moduleSym.id);
+        rawCalls.push({
+          callerId,
+          calleeName: propName,
+          callSite: { file, line },
+        });
+      }
+    }
+  }
+
+  if (localToExportedName.size > 0) {
     for (const idNode of safeFindAll(root, "identifier")) {
-      const name = idNode.text();
-      if (!importedNames.has(name)) continue;
+      const localName = idNode.text();
+      const originalName = localToExportedName.get(localName);
+      if (!originalName) continue;
       const r = idNode.range();
       const line = r.start.line + 1;
       const parentKind = idNode.parent()?.kind?.();
-      // Skip import_specifier / export_specifier definition sites themselves
+      // Skip import_specifier / import_clause / export_specifier definition sites themselves
       if (parentKind === "import_specifier" || parentKind === "import_clause" || parentKind === "export_specifier") {
         continue;
       }
       const callerId = findCallerId(scopes, line, moduleSym.id);
       rawCalls.push({
         callerId,
-        calleeName: name,
+        calleeName: originalName,
         callSite: { file, line },
       });
     }

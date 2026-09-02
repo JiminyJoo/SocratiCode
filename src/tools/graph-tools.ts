@@ -413,7 +413,10 @@ async function dispatchGraphTool(
       if (!cache) {
         return "No symbol graph found. Run codebase_graph_build (or codebase_index) first.";
       }
-      const result = await getImpactRadius(cache, target, depth);
+      ensureDynamicLanguages();
+      const grammarStatus = getDynamicLanguageStatus();
+      const isIncomplete = grammarStatus.failed.length > 0 || (cache.meta.schemaVersion ? cache.meta.schemaVersion < 2 : true);
+      const result = await getImpactRadius(cache, target, depth, { isIncomplete });
 
       if (result.status === "not_found") {
         return result.message ?? `Target '${target}' was not found in the graph.`;

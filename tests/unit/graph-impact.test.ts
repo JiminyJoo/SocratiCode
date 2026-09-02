@@ -209,6 +209,76 @@ describe("graph-impact exact symbol traversal and fail-closed", () => {
     expect(result.totalFiles).toBe(0);
   });
 
+  it("returns ambiguous status when multiple symbols share the same unqualified name in the same file (e.g. A.run and B.run)", async () => {
+    const symA: SymbolNode = {
+      id: "src/app.ts::A.run#5",
+      name: "run",
+      qualifiedName: "A.run",
+      kind: "method",
+      file: "src/app.ts",
+      line: 5,
+      endLine: 7,
+      language: "typescript",
+    };
+    const symB: SymbolNode = {
+      id: "src/app.ts::B.run#12",
+      name: "run",
+      qualifiedName: "B.run",
+      kind: "method",
+      file: "src/app.ts",
+      line: 12,
+      endLine: 14,
+      language: "typescript",
+    };
+
+    const cache = createMockCache({
+      symbols: [symA, symB],
+      reverseFileIndex: new Map(),
+      filePayloads: new Map([
+        ["src/app.ts", {
+          file: "src/app.ts",
+          language: "typescript",
+          contentHash: "h_app",
+          symbols: [symA, symB],
+          outgoingCalls: [],
+        }],
+      ]),
+    });
+
+    const result = await getImpactRadius(cache, "run");
+    expect(result.status).toBe("ambiguous");
+    expect(result.totalFiles).toBe(0);
+    expect(result.message).toContain("matches 2 symbols");
+    expect(result.candidates).toHaveLength(2);
+    expect(result.candidates?.map((c) => c.qualifiedName)).toEqual(["A.run", "B.run"]);
+  });
+
+  it("returns unsupported_or_incomplete before zero-impact result when graph is incomplete", async () => {
+    const symUnused: SymbolNode = {
+      id: "src/unused.ts::UNUSED_SYMBOL#1",
+      name: "UNUSED_SYMBOL",
+      qualifiedName: "UNUSED_SYMBOL",
+      kind: "variable",
+      file: "src/unused.ts",
+      line: 1,
+      endLine: 1,
+      language: "typescript",
+    };
+
+    const cache = createMockCache({
+      symbols: [symUnused],
+      reverseFileIndex: new Map(),
+      filePayloads: new Map([
+        ["src/unused.ts", { file: "src/unused.ts", language: "typescript", contentHash: "h_u", symbols: [symUnused], outgoingCalls: [] }],
+      ]),
+    });
+
+    const result = await getImpactRadius(cache, "UNUSED_SYMBOL", 3, { isIncomplete: true });
+    expect(result.status).toBe("unsupported_or_incomplete");
+    expect(result.totalFiles).toBe(0);
+    expect(result.message).toContain("incomplete");
+  });
+
   it("file mode traverses all dependents of a target file", async () => {
     const cache = createMockCache({
       symbols: [],

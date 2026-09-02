@@ -42,8 +42,10 @@ export async function getImpactRadius(
   cache: SymbolGraphCache,
   target: string,
   depth: number = 3,
+  options?: { isIncomplete?: boolean },
 ): Promise<ImpactResult> {
   const safeDepth = Math.max(1, Math.min(depth, MAX_IMPACT_DEPTH));
+  const isIncomplete = options?.isIncomplete ?? (cache.meta.schemaVersion < 2);
   const reverseIndex = await cache.getReverseFileIndex();
 
   const targetKind: "file" | "symbol" = looksLikeFilePath(target)
@@ -103,6 +105,20 @@ export async function getImpactRadius(
 
     let totalFiles = 0;
     for (const arr of filesByDepth.values()) totalFiles += arr.length;
+
+    if (totalFiles === 0 && isIncomplete) {
+      return {
+        target,
+        targetKind,
+        depth: safeDepth,
+        filesByDepth,
+        totalFiles: 0,
+        truncated: false,
+        status: "unsupported_or_incomplete",
+        message: `The symbol graph is incomplete (schema v${cache.meta.schemaVersion ?? 1} or incomplete language parser support). Rebuild with codebase_graph_build before relying on zero-dependent verification.`,
+      };
+    }
+
     return {
       target,
       targetKind,
@@ -131,14 +147,19 @@ export async function getImpactRadius(
     };
   }
 
-  const distinctFiles = Array.from(new Set(refs.map((r) => r.file)));
-  if (distinctFiles.length > 1) {
+  const distinctIds = Array.from(new Set(refs.map((r) => r.id)));
+  if (distinctIds.length > 1) {
     const candidates: SymbolNode[] = [];
     for (const ref of refs) {
       const payload = await cache.getFilePayload(ref.file);
       const sym = payload?.symbols.find((s) => s.id === ref.id);
       if (sym) candidates.push(sym);
     }
+    const distinctFiles = Array.from(new Set(refs.map((r) => r.file)));
+    const locDesc = distinctFiles.length === 1
+      ? `in file ${distinctFiles[0]}`
+      : `across ${distinctFiles.length} files (${distinctFiles.slice(0, 5).join(", ")}${distinctFiles.length > 5 ? "..." : ""})`;
+
     return {
       target,
       targetKind,
@@ -147,12 +168,13 @@ export async function getImpactRadius(
       totalFiles: 0,
       truncated: false,
       status: "ambiguous",
-      message: `Symbol '${target}' is ambiguous (defined in ${distinctFiles.length} files: ${distinctFiles.slice(0, 5).join(", ")}${distinctFiles.length > 5 ? "..." : ""}). Specify the file path or qualified name to disambiguate.`,
+      message: `Symbol '${target}' is ambiguous (matches ${distinctIds.length} symbols ${locDesc}). Specify the file path or qualified name to disambiguate.`,
       candidates,
     };
   }
 
   const targetSymbolIds = new Set(refs.map((r) => r.id));
+  const distinctFiles = Array.from(new Set(refs.map((r) => r.file)));
   const visitedFiles = new Set<string>(distinctFiles);
   const filesByDepth = new Map<number, string[]>();
 
@@ -220,6 +242,19 @@ export async function getImpactRadius(
 
   let totalFiles = 0;
   for (const arr of filesByDepth.values()) totalFiles += arr.length;
+
+  if (totalFiles === 0 && isIncomplete) {
+    return {
+      target,
+      targetKind,
+      depth: safeDepth,
+      filesByDepth,
+      totalFiles: 0,
+      truncated: false,
+      status: "unsupported_or_incomplete",
+      message: `The symbol graph is incomplete (schema v${cache.meta.schemaVersion ?? 1} or incomplete language parser support). Rebuild with codebase_graph_build before relying on zero-dependent verification.`,
+    };
+  }
 
   return {
     target,

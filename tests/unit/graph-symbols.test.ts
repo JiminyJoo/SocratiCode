@@ -108,6 +108,48 @@ export function processOffer(offer: JobOfferSnapshot): UserProfile {
       );
       expect(processOfferCall).toBeDefined();
     });
+
+    it("resolves aliased imports to their original exported names", () => {
+      const src = `
+import { calculateSum as sum, UserConfig as Config, API_KEY as KEY } from "./utils";
+
+export function execute(cfg: Config): number {
+  const secret = KEY;
+  return sum(1, 2);
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/client.ts");
+      const calleeNames = out.rawCalls.map((c) => c.calleeName);
+      expect(calleeNames).toContain("calculateSum");
+      expect(calleeNames).toContain("UserConfig");
+      expect(calleeNames).toContain("API_KEY");
+      expect(calleeNames).not.toContain("sum");
+      expect(calleeNames).not.toContain("Config");
+      expect(calleeNames).not.toContain("KEY");
+
+      const executeCalls = out.rawCalls.filter((c) => c.callerId.includes("::execute#"));
+      const executeCallees = executeCalls.map((c) => c.calleeName);
+      expect(executeCallees).toContain("calculateSum");
+      expect(executeCallees).toContain("UserConfig");
+      expect(executeCallees).toContain("API_KEY");
+    });
+
+    it("resolves namespace imports to the accessed exported symbols", () => {
+      const src = `
+import * as Utils from "./utils";
+
+export function run(config: Utils.DatabaseConfig): number {
+  const defaultVal = Utils.DEFAULT_LIMIT;
+  return Utils.add(defaultVal, 10);
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/caller.ts");
+      const runCalls = out.rawCalls.filter((c) => c.callerId.includes("::run#"));
+      const runCallees = runCalls.map((c) => c.calleeName);
+      expect(runCallees).toContain("DatabaseConfig");
+      expect(runCallees).toContain("DEFAULT_LIMIT");
+      expect(runCallees).toContain("add");
+    });
   });
 
   describe("Python", () => {
