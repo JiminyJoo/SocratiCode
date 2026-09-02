@@ -1898,6 +1898,23 @@ export function resolveRustImport(
     // verified on cargo 1.98.0, where a `compile_error!` in it does not stop
     // the build because rustc never reads the file.
     if (importingCrate?.externalDeps?.includes(name)) return null;
+    // Only what the importing package declares is in its extern prelude. A
+    // sibling of the workspace it does not depend on is not reachable, and
+    // rustc refuses the path with E0432 — yet the raw name used to be searched
+    // across every crate of the project, so `use helper::Thing` drew an edge
+    // into a sibling `helper` the manifest never named (review finding). The
+    // one name a package reaches without declaring it is its own library,
+    // which its binaries, tests and examples import by that name. `aliases`
+    // holds every declared dependency under the name the code writes, renamed
+    // or not, so its keys are the fence. A file outside every manifest has
+    // no package to ask, and is left as it was.
+    if (
+      importingCrate &&
+      name !== importingCrate.name &&
+      !Object.hasOwn(importingCrate.aliases ?? {}, name)
+    ) {
+      return null;
+    }
     // `dep = { package = "real-name" }` renames a dependency for the crate
     // that declares it, and the code then writes the alias. The alias appears
     // in no `[package] name`, so without this the path resolved to nothing —

@@ -1643,7 +1643,9 @@ describe("graph-resolution", () => {
     it("resolves a sibling crate by the name Cargo gives it", () => {
       const crates = rustProject({
         "Cargo.toml": "[workspace]\nmembers = [\"crates/cli\", \"crates/core\"]\n",
-        "crates/cli/Cargo.toml": '[package]\nname = "app-cli"\n',
+        // Declared, as rustc requires: a sibling the manifest never names is
+        // not in the extern prelude, whatever the workspace holds.
+        "crates/cli/Cargo.toml": '[package]\nname = "app-cli"\n\n[dependencies]\napp-core = { path = "../core" }\n',
         "crates/cli/src/main.rs": "",
         "crates/core/Cargo.toml": '[package]\nname = "app-core"\n',
         "crates/core/src/lib.rs": "",
@@ -1652,6 +1654,32 @@ describe("graph-resolution", () => {
 
       expect(resolveRustImport("app_core::config::Config", "crates/cli/src/main.rs", fileSet, crates))
         .toBe("crates/core/src/config.rs");
+    });
+
+    it("does not reach a sibling crate the importing package never declared", () => {
+      // Review finding. Only what a package declares is in its extern prelude:
+      // `use helper::Thing` in a package whose manifest names no `helper` is
+      // E0432 to rustc, yet the raw name used to be searched across every crate
+      // of the workspace and drew an edge into the sibling. Declared under
+      // another name, the alias is what the code writes; the package's own
+      // library is the one name reached without declaring it.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "helper", "util"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\n\n[dependencies]\nutil = { path = "../util" }\ntools = { path = "../helper", package = "helper" }\n',
+        "app/src/lib.rs": "",
+        "app/src/bin/tool.rs": "",
+        "helper/Cargo.toml": '[package]\nname = "helper"\n',
+        "helper/src/lib.rs": "",
+        "util/Cargo.toml": '[package]\nname = "util"\n',
+        "util/src/lib.rs": "",
+        // `util` declares nothing, so `helper` is out of its reach too.
+      });
+
+      expect(resolveRustImport("helper::Thing", "app/src/lib.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("helper::Thing", "util/src/lib.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("tools::Thing", "app/src/lib.rs", fileSet, crates)).toBe("helper/src/lib.rs");
+      expect(resolveRustImport("util::Thing", "app/src/lib.rs", fileSet, crates)).toBe("util/src/lib.rs");
+      expect(resolveRustImport("app::run", "app/src/bin/tool.rs", fileSet, crates)).toBe("app/src/lib.rs");
     });
 
     it("leaves a third-party crate unresolved", () => {
@@ -2084,7 +2112,8 @@ describe("graph-resolution", () => {
     it("lets a local module win over a sibling crate of the same name", () => {
       const crates = rustProject({
         "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
-        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        // Declared, as rustc requires for the sibling to be in scope at all.
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nconfig = { path = "../config" }\n',
         "crates/app/src/lib.rs": "",
         "crates/app/src/config.rs": "",
         "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
@@ -2101,7 +2130,8 @@ describe("graph-resolution", () => {
     it("keeps a leading :: out of the local modules", () => {
       const crates = rustProject({
         "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
-        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        // Declared, as rustc requires for the sibling to be in scope at all.
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nconfig = { path = "../config" }\n',
         "crates/app/src/lib.rs": "",
         "crates/app/src/config.rs": "",
         "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',
@@ -2240,7 +2270,8 @@ describe("graph-resolution", () => {
     it("keeps a leading :: out of the local modules for a bare head too", () => {
       const crates = rustProject({
         "Cargo.toml": '[workspace]\nmembers = ["crates/app", "crates/config"]\n',
-        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
+        // Declared, as rustc requires for the sibling to be in scope at all.
+        "crates/app/Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nconfig = { path = "../config" }\n',
         "crates/app/src/lib.rs": "",
         "crates/app/src/config.rs": "",
         "crates/config/Cargo.toml": '[package]\nname = "config"\nedition = "2021"\n',

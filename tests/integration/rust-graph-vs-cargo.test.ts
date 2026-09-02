@@ -300,3 +300,97 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info (needs ca
     expect([...new Set(strangers)]).toEqual([]);
   });
 });
+
+// A workspace, for what one package may reach in another. Only what a package
+// declares is in its extern prelude: a sibling the manifest never names is
+// E0432 to rustc, whatever the workspace holds. The import that names the
+// undeclared sibling is written under `#[cfg(any())]`, which rustc strips
+// before it resolves names — so the crate builds, and the sibling carries a
+// `compile_error!` that would end the build if cargo ever compiled it as a
+// dependency. The graph fixes no cfg and reads the line; it must still draw
+// nothing from it.
+describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info, across a workspace (needs cargo on PATH)", () => {
+  let root: string;
+  let read: Set<string>;
+
+  beforeAll(() => {
+    ensureDynamicLanguages();
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-cargo-ws-"));
+
+    write(root, "Cargo.toml", ['[workspace]', 'members = ["app", "helper", "util"]', 'resolver = "2"', ""].join("\n"));
+    write(
+      root,
+      "app/Cargo.toml",
+      ['[package]', 'name = "app"', 'version = "0.1.0"', 'edition = "2021"', "", "[dependencies]", 'util = { path = "../util" }', ""].join("\n"),
+    );
+    write(
+      root,
+      "app/src/lib.rs",
+      [
+        "#[cfg(any())]",
+        "use helper::Thing;",
+        "",
+        // Written as a `use`: a path inside an expression is not an import to
+        // the graph, and this fixture is about what a `use` may reach.
+        "use util::value;",
+        "",
+        "pub fn all() -> u32 {",
+        "    value()",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    // Another target of the same package reaches its library by the package's
+    // own name, which no manifest declares.
+    write(root, "app/src/bin/tool.rs", "use app::all;\n\nfn main() {\n    println!(\"{}\", all());\n}\n");
+    write(root, "helper/Cargo.toml", ['[package]', 'name = "helper"', 'version = "0.1.0"', 'edition = "2021"', ""].join("\n"));
+    write(root, "helper/src/lib.rs", 'compile_error!("helper is not a dependency of app and must never be compiled for it");\npub struct Thing;\n');
+    write(root, "util/Cargo.toml", ['[package]', 'name = "util"', 'version = "0.1.0"', 'edition = "2021"', ""].join("\n"));
+    write(root, "util/src/lib.rs", "pub fn value() -> u32 {\n    7\n}\n");
+
+    try {
+      execFileSync("cargo", ["check", "--offline", "--quiet", "-p", "app", "--bins", "--lib"], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 120_000,
+      });
+    } catch (err) {
+      const details = err instanceof Error && "stderr" in err ? String(err.stderr) : String(err);
+      throw new Error(`the fixture workspace did not compile, so there is no oracle:\n${details}`);
+    }
+
+    read = sourcesRustcRead(root);
+  }, 180_000);
+
+  afterAll(() => {
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it("reads a dep-info that names the files rustc opened, and not the sibling", () => {
+    expect(read.has("app/src/lib.rs")).toBe(true);
+    expect(read.has("app/src/bin/tool.rs")).toBe(true);
+    expect(read.has("util/src/lib.rs")).toBe(true);
+    expect(read.has("helper/src/lib.rs")).toBe(false);
+  });
+
+  it("draws no edge into a sibling crate the importing package never declared", async () => {
+    // Review finding: the raw import head used to be searched across every
+    // crate of the workspace, and `use helper::Thing` drew `app -> helper`
+    // though app's manifest names no `helper`.
+    const graph = await buildCodeGraph(root);
+    const intoHelper = graph.edges.filter((e) => String(e.target).startsWith("helper/"));
+    expect(intoHelper.map((e) => `${e.source} -> ${e.target}`)).toEqual([]);
+  });
+
+  it("still reaches a declared dependency, and the package's own library from its binary", async () => {
+    const graph = await buildCodeGraph(root);
+    const pairs = new Set(graph.edges.map((e) => `${e.source} -> ${e.target}`));
+    expect(pairs.has("app/src/lib.rs -> util/src/lib.rs")).toBe(true);
+    expect(pairs.has("app/src/bin/tool.rs -> app/src/lib.rs")).toBe(true);
+  });
+});
