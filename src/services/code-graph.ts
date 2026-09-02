@@ -1036,8 +1036,6 @@ export async function buildCodeGraph(
     // finds nothing, and falls through to a library called `foo` if the
     // workspace has one — an edge into an unrelated crate. Where the
     // declaration does not move anything, the value is the name itself.
-    // Shared and never written: one empty map for every inline-block path in
-    // the build, instead of one per import.
     const declaredMods = new Map<string, string>();
     for (const imp of importInfos) {
       if (imp.declaredName) declaredMods.set(imp.declaredName, imp.moduleSpecifier);

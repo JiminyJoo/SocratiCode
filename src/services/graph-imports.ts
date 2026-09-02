@@ -761,10 +761,12 @@ export function expandRustUseTree(tree: string): string[] {
  * `mod after;` lost the edge it should have had.
  *
  * So the rewritten source is parsed before it is used, and it is kept only when
- * every ERROR node sits inside a macro that was unwrapped. Where one does not,
- * the pass is redone with the bodies that parse as items on their own — the
- * rest stay the token trees they were. `recoveryStaysInside` carries why the
- * test is drawn there and not around the ERROR itself.
+ * every ERROR node sits inside a macro this pass unwrapped, or is one the pass
+ * before already accepted. Where one does not, the pass is redone with the
+ * bodies that parse as items on their own — the rest stay the token trees they
+ * were. `recoveryStaysInside` carries why the test is drawn there and not
+ * around the ERROR itself, and why what an earlier pass hands on is its ERRORs
+ * rather than its regions.
  *
  * The admission rule still decides what a body means: an `if #[cfg(…)]` is not
  * something the language guarantees, it is what one library spells its
@@ -779,7 +781,7 @@ export function expandRustUseTree(tree: string): string[] {
 function rustSourceWithMacroBodiesInlined(
   source: string,
   root: SgNodeLike,
-  carried: MacroRegion[],
+  forgiven: Span[],
 ): UnwrappedSource | null {
   const regions: MacroRegion[] = [];
   for (const node of root.findAll({ rule: { kind: "macro_invocation" } })) {
@@ -803,7 +805,11 @@ function rustSourceWithMacroBodiesInlined(
   }
   if (regions.length === 0) return null;
 
-  const attempts: MacroRegion[][] = [regions];
+  // An ERROR the source has before anything is blanked, outside every macro
+  // about to be unwrapped and not one an earlier pass already accepted, will
+  // reject every attempt below — the check is answered on the tree in hand,
+  // before three parses that cannot pass.
+  if (!recoveryStaysInside(root, regions, forgiven)) return null;
 
   // Recovery reached past a macro's own text, so the tree around it can no
   // longer be trusted — but the macro that let it out is one of the few written
@@ -819,26 +825,52 @@ function rustSourceWithMacroBodiesInlined(
   // libc's `freebsd/mod.rs` parses as one ERROR from line 1 once its fifteen
   // `cfg_if!`s are blanked — and no reading of that tree would be worth
   // trusting.
-  const dirty = (r: MacroRegion): boolean =>
-    !rustBodyIsItemsOnItsOwn(source.slice(r.open + 1, r.close));
-  const outsideBlocks = regions.filter((r) => !(r.insideBlock && dirty(r)));
-  if (outsideBlocks.length < regions.length) attempts.push(outsideBlocks);
-  const clean = regions.filter((r) => !dirty(r));
-  if (clean.length < outsideBlocks.length) attempts.push(clean);
+  //
+  // Each body is parsed on its own at most once, and only once the first
+  // attempt has been refused: the common outcome is that it is not, and a
+  // tokio file with a dozen `cfg_*!` bodies would otherwise pay a dozen
+  // parses for nothing.
+  const parsedAlone = new Map<MacroRegion, boolean>();
+  const dirty = (r: MacroRegion): boolean => {
+    let answer = parsedAlone.get(r);
+    if (answer === undefined) {
+      answer = !rustBodyIsItemsOnItsOwn(source.slice(r.open + 1, r.close));
+      parsedAlone.set(r, answer);
+    }
+    return answer;
+  };
+  const narrower: (() => MacroRegion[])[] = [
+    () => regions.filter((r) => !(r.insideBlock && dirty(r))),
+    () => regions.filter((r) => !dirty(r)),
+  ];
 
-  for (const attempt of attempts) {
-    if (attempt.length === 0) continue;
+  let attempt = regions;
+  for (;;) {
     const rewritten = rustSourceWithRegionsBlanked(source, attempt);
-    // Every macro unwrapped so far counts, not only this pass's own: the second
-    // pass reads what the first one rewrote, so a `cfg_if!` kept there has its
-    // ERROR standing in this pass's input. Blanking preserves every index —
-    // characters become spaces, none are removed — so the regions carried from
-    // the earlier pass still say where its text is.
-    const unwrapped = carried.concat(attempt);
-    const kept = recoveryStaysInside(rewritten, unwrapped);
-    if (kept) return { source: rewritten, root: kept, regions: unwrapped };
+    let tree: SgNodeLike;
+    try {
+      tree = parse("rust" as unknown as Lang, rewritten).root() as unknown as SgNodeLike;
+    } catch {
+      return null;
+    }
+    const errors = recoveryStaysInside(tree, attempt, forgiven);
+    if (errors) return { source: rewritten, root: tree, errors };
+
+    // Retry with fewer bodies, but only when the next rule actually drops one.
+    let next: MacroRegion[] | undefined;
+    while (next === undefined && narrower.length > 0) {
+      const candidate = narrower.shift()?.();
+      if (candidate !== undefined && candidate.length < attempt.length) next = candidate;
+    }
+    if (next === undefined || next.length === 0) return null;
+    attempt = next;
   }
-  return null;
+}
+
+/** A half-open range of character indexes in a source. */
+interface Span {
+  start: number;
+  end: number;
 }
 
 interface UnwrappedSource {
@@ -846,8 +878,12 @@ interface UnwrappedSource {
   source: string;
   /** Its tree, already built by the check that accepted it. */
   root: SgNodeLike;
-  /** Every macro region blanked in it, this pass's and the earlier ones'. */
-  regions: MacroRegion[];
+  /**
+   * Every ERROR node that tree holds — each inside a macro unwrapped in this
+   * pass or an earlier one, or the check would not have accepted it. The next
+   * pass forgives exactly these, and nothing else.
+   */
+  errors: Span[];
 }
 
 interface MacroRegion {
@@ -901,39 +937,53 @@ function rustSourceWithRegionsBlanked(source: string, regions: MacroRegion[]): s
  * to close the 18 would pay for the fix with the case that works: `js-sys`,
  * `backtrace`, `ahash` and `aes` each lose real module edges.
  *
- * `regions` is every macro unwrapped so far, the earlier passes' included, and
- * nothing else earns an exemption. Tolerating the ERROR nodes a source already
- * had is the obvious-looking shortcut and it opens the defect back up: a file
- * carrying an unresolved merge marker inside `mod inner { … }` has an ERROR at
- * the same index the recovery produces, so the damaged pass was accepted and
- * `mod after;` was drawn at file level again. Measured on the live version
- * before this was tightened.
+ * An ERROR earns its exemption one of two ways, and nothing else does. Either it
+ * sits inside a macro *this* pass unwrapped, or it is — start and end — one the
+ * earlier pass already accepted, which still stands in this pass's input since
+ * blanking turns characters into spaces and removes none. The second pass reads
+ * what the first rewrote, so a file-level `cfg_if!` kept there has its ERROR on
+ * the attribute in this pass's text, and that one is forgiven.
+ *
+ * Two shortcuts look equivalent and both reopen the defect. Tolerating the
+ * ERROR nodes a source already had: a file carrying an unresolved merge marker
+ * inside `mod inner { … }` has an ERROR at the same index the recovery produces,
+ * so the damaged pass was accepted and `mod after;` was drawn at file level
+ * again — measured on the live version before this was tightened. Tolerating
+ * anything inside a macro an earlier pass unwrapped: a clean body such as
+ * `outer! { mod k { cfg_if! { … } mod z; } }` is accepted whole on the first
+ * pass, and on the second the `cfg_if!` closes `mod k` early — the orphan `}`
+ * that should reject the pass lies inside `outer!`'s region, and `mod z;` was
+ * drawn at file level exactly as in the case this guard was written for. Found
+ * by review, and the reason the exemption is a list of ERRORs, not of regions.
  *
  * A source that does not parse cleanly for reasons of its own therefore gets no
  * unwrapping at all, which is the conservative side to fall on: 1,771 of 34,655
  * `.rs` files in a registry cache are in that state, and not one of them carries
  * a declaration inside a macro body.
  *
- * Returns the tree when the source is usable, so the caller reads its imports
- * off it instead of parsing the same text again, which is what keeps the check
- * affordable. What it still costs, measured on tokio with nine runs a side
- * alternating between the two: 2,013 ms before this change, 2,123 ms after,
- * against 1,304 ms on `main` — so the guard is 5% of the graph build, on top of
- * the 54% the rest of the Rust work already costs.
+ * Returns the ERROR nodes of an accepted tree, which is what the next pass is
+ * handed, and null where one lies outside. The tree is the one the caller
+ * already built and goes on to read its imports off, so the check adds no
+ * parse of its own. What it still costs, measured on tokio with nine runs a
+ * side alternating between the two: 2,013 ms before this change, 2,123 ms
+ * after, against 1,304 ms on `main` — 5% of the graph build, on top of the 54%
+ * the rest of the Rust work already costs.
  */
-function recoveryStaysInside(rewritten: string, regions: MacroRegion[]): SgNodeLike | null {
-  let root: SgNodeLike;
-  try {
-    root = parse("rust" as unknown as Lang, rewritten).root() as unknown as SgNodeLike;
-  } catch {
-    return null;
-  }
+function recoveryStaysInside(
+  root: SgNodeLike,
+  regions: MacroRegion[],
+  forgiven: Span[],
+): Span[] | null {
+  const errors: Span[] = [];
   for (const error of root.findAll({ rule: { kind: "ERROR" } })) {
-    const { start, end } = error.range();
-    const inside = regions.some((r) => start.index >= r.start && end.index <= r.close + 1);
-    if (!inside) return null;
+    const start = error.range().start.index;
+    const end = error.range().end.index;
+    const inside = regions.some((r) => start >= r.start && end <= r.close + 1);
+    const inherited = forgiven.some((f) => f.start === start && f.end === end);
+    if (!inside && !inherited) return null;
+    errors.push({ start, end });
   }
-  return root;
+  return errors;
 }
 
 /**
@@ -987,7 +1037,19 @@ function standsWhereAnItemMay(node: SgNodeLike): boolean {
   return kind === "source_file" || kind === "declaration_list";
 }
 
-/** A key that tells two extracted imports apart, for the multiset below. */
+/**
+ * A key that tells two extracted imports apart, for the merge below.
+ *
+ * `fromInlineBlock` is left out on purpose: it is not part of what an import
+ * *is* but of how far the pass that read it could see. `mod tests { cfg_test! {
+ * use super::*; } use outer::Thing; }` reads `outer::Thing` as a bare head in a
+ * block on the first pass, because the glob that brings the file's own
+ * declarations into scope is still hidden in the token tree; the second pass
+ * sees the glob and reads the same line as a path the block may answer. Keyed
+ * on the flag, both readings were kept, and the first one — resolved with no
+ * declarations in scope — could reach a workspace crate named `outer` that
+ * rustc would refuse with E0432. Found by review.
+ */
 function importKey(imp: ImportInfo): string {
   return [
     imp.moduleSpecifier,
@@ -995,41 +1057,53 @@ function importKey(imp: ImportInfo): string {
     imp.isCssImport ?? "",
     imp.isModuleDeclaration ?? "",
     imp.declaredName ?? "",
-    imp.fromInlineBlock ?? "",
   ].join("\0");
 }
 
 /**
- * The imports of `found` that `already` does not hold, counting repeats.
+ * `already` with the second pass's reading folded in, counting repeats.
  *
  * The second pass over a macro-unwrapped source re-reads the whole file, so
- * everything the first pass found comes back with it. Subtracting as a multiset
- * adds exactly what the macro bodies were hiding and leaves the existing edges —
- * including their repeats, which consumers count — untouched.
+ * everything the first pass found comes back with it. Each import the second
+ * pass re-reads replaces the first pass's copy of it — the later reading saw
+ * more of the file, and its scope flag is the right one — and what only the
+ * macro bodies held is appended. An import the second pass did not come back
+ * with stays: an `include! { "x.rs" }` written with braces is blanked like any
+ * body, and only the first pass reads the file it names. Repeats survive on
+ * both sides, since consumers count them.
  */
-function importsNotAlreadyFound(found: ImportInfo[], already: ImportInfo[]): ImportInfo[] {
-  const remaining = new Map<string, number>();
-  for (const imp of already) {
+function withMacroPassMerged(already: ImportInfo[], found: ImportInfo[]): ImportInfo[] {
+  const merged = already.slice();
+  const unclaimed = new Map<string, number[]>();
+  already.forEach((imp, at) => {
     const key = importKey(imp);
-    remaining.set(key, (remaining.get(key) ?? 0) + 1);
-  }
-  const fresh: ImportInfo[] = [];
+    const slots = unclaimed.get(key);
+    if (slots) slots.push(at);
+    else unclaimed.set(key, [at]);
+  });
   for (const imp of found) {
-    const key = importKey(imp);
-    const left = remaining.get(key) ?? 0;
-    if (left > 0) remaining.set(key, left - 1);
-    else fresh.push(imp);
+    const at = unclaimed.get(importKey(imp))?.shift();
+    if (at === undefined) merged.push(imp);
+    else merged[at] = imp;
   }
-  return fresh;
+  return merged;
 }
 
 /**
  * How many times a Rust source is re-read after unwrapping macro bodies.
  *
  * One pass covers what is written in a file; a second catches a macro that only
- * became visible when the one around it was unwrapped. The bound is what keeps
- * a pathological file from being re-parsed without end — it is not a limit
- * anything real has been seen to reach.
+ * became visible when the one around it was unwrapped — provided it stands
+ * where an item may. A macro written inside a `cfg_if!` arm does not: after
+ * blanking, the arm is the block of a recovered `if`, and `standsWhereAnItemMay`
+ * turns a block down for the reason it gives. So `cfg_if! { if #[cfg(unix)] {
+ * cfg_io_util! { mod deep; } } }` reads nothing under `cfg_io_util!`, and a
+ * nested `cfg_if!` in an arm — a shape libc writes — reads only its own text.
+ * That is the limit of reading a body in place; reading each body on its own
+ * with the invocation's scope would lift it.
+ *
+ * The bound is what keeps a pathological file from being re-parsed without end
+ * — it is not a limit anything real has been seen to reach.
  */
 const RUST_MACRO_UNWRAP_PASSES = 2;
 
@@ -1379,14 +1453,14 @@ export function extractImports(
         }
 
         // What a macro invocation wraps is read last, on a source with its head
-        // and braces blanked out, and only what the pass above could not see is
-        // kept. See `rustSourceWithMacroBodiesInlined` for why a body has to be
-        // read at all, and why it is not a module level.
+        // and braces blanked out, and folded into what the pass above found. See
+        // `rustSourceWithMacroBodiesInlined` for why a body has to be read at
+        // all, and why it is not a module level.
         if (unwrapPassesLeft > 0) {
           const inlined = rustSourceWithMacroBodiesInlined(
             source,
             sgNode as unknown as SgNodeLike,
-            unwrapped?.regions ?? [],
+            unwrapped?.errors ?? [],
           );
           if (inlined !== null) {
             const withBodies = extractImports(
@@ -1396,7 +1470,7 @@ export function extractImports(
               unwrapPassesLeft - 1,
               inlined,
             );
-            imports.push(...importsNotAlreadyFound(withBodies, imports));
+            imports.splice(0, imports.length, ...withMacroPassMerged(imports, withBodies));
           }
         }
         break;

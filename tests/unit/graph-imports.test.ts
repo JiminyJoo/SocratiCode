@@ -938,6 +938,66 @@ mod inner {
       expect(specs.filter((s) => s.includes("arm_"))).toEqual([]);
     });
 
+    it("does not let a macro accepted on the first pass forgive what the second one breaks", () => {
+      // Found by review. `outer!` wraps items and is accepted whole on the
+      // first pass, with no ERROR anywhere. On the second pass the `cfg_if!`
+      // inside `mod k` closes the block early — the same damage the guard was
+      // written for — but the orphan `}` that should reject the pass now lies
+      // inside `outer!`'s own region. Forgiving everything inside a macro an
+      // earlier pass unwrapped accepted it, and `mod z;` was drawn at file
+      // level again, where rustc never looks for it.
+      //
+      // What an earlier pass hands on is therefore the exact ERRORs its tree
+      // had, and this file has none to hand on.
+      const specs = specsOf(`
+outer! {
+    mod k {
+        mod before;
+        cfg_if! {
+            if #[cfg(unix)] {
+                mod arm_a;
+            } else {
+                mod arm_b;
+            }
+        }
+        mod z;
+    }
+}
+`);
+
+      expect(specs).toContain("self::k::before");
+      expect(specs).toContain("self::k::z");
+      expect(specs).not.toContain("z");
+      expect(specs.filter((s) => s.includes("arm_"))).toEqual([]);
+    });
+
+    it("keeps the second pass's reading of a line the first pass read with less in view", () => {
+      // Found by review. On the first pass the glob is hidden in `cfg_test!`'s
+      // token tree, so `outer::Thing` is a bare head in a block with nothing
+      // anchoring it; the second pass sees the glob and reads the same line as
+      // a path the block may answer. Keyed on that flag, both readings were
+      // kept — and the first, resolved with no declarations in scope, could
+      // reach a workspace crate named `outer` that rustc refuses with E0432.
+      const imports = extractImports(
+        `
+mod outer;
+
+#[cfg(test)]
+mod tests {
+    cfg_test! {
+        use super::*;
+    }
+    use outer::Thing;
+}
+`,
+        "rust",
+        ".rs",
+      ).filter((i) => i.moduleSpecifier === "outer::Thing");
+
+      expect(imports).toHaveLength(1);
+      expect(imports[0].fromInlineBlock).toBeUndefined();
+    });
+
     it("leaves a parenthesised macro invocation alone", () => {
       // Only `{}` is unwrapped: a `()` or `[]` invocation carries an
       // expression, not items. `automod::dir!("tests/builder")` names modules
