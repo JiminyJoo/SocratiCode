@@ -109,6 +109,233 @@ describe("graph-symbol-resolution", () => {
     expect(edges[0].calleeCandidates).toEqual([]);
   });
 
+  it("preserves module identity when two dependencies export the same symbol name", () => {
+    const graph: CodeGraph = {
+      nodes: [
+        {
+          relativePath: "src/app.ts",
+          imports: ["./serviceA", "./serviceB"],
+          exports: [],
+          dependencies: ["src/serviceA.ts", "src/serviceB.ts"],
+          dependents: [],
+        },
+        {
+          relativePath: "src/serviceA.ts",
+          imports: [],
+          exports: ["processData"],
+          dependencies: [],
+          dependents: ["src/app.ts"],
+        },
+        {
+          relativePath: "src/serviceB.ts",
+          imports: [],
+          exports: ["processData"],
+          dependencies: [],
+          dependents: ["src/app.ts"],
+        },
+      ],
+      edges: [],
+    };
+    const symbolsByFile = new Map<string, SymbolNode[]>([
+      [
+        "src/app.ts",
+        [{ id: "src/app.ts::run#1", name: "run", qualifiedName: "run", kind: "function", file: "src/app.ts", line: 1, endLine: 5, language: "typescript" }],
+      ],
+      [
+        "src/serviceA.ts",
+        [{ id: "src/serviceA.ts::processData#1", name: "processData", qualifiedName: "processData", kind: "function", file: "src/serviceA.ts", line: 1, endLine: 5, language: "typescript" }],
+      ],
+      [
+        "src/serviceB.ts",
+        [{ id: "src/serviceB.ts::processData#1", name: "processData", qualifiedName: "processData", kind: "function", file: "src/serviceB.ts", line: 1, endLine: 5, language: "typescript" }],
+      ],
+    ]);
+
+    // app.ts specifically imports processData from serviceA
+    const edges: SymbolEdge[] = [
+      {
+        callerId: "src/app.ts::run#1",
+        calleeName: "processData",
+        kind: "call",
+        sourceModule: "./serviceA",
+        importedName: "processData",
+        calleeCandidates: [],
+        confidence: "unresolved",
+        callSite: { file: "src/app.ts", line: 3 },
+      },
+    ];
+    const outgoing = new Map<string, SymbolEdge[]>([["src/app.ts", edges]]);
+
+    resolveCallSites(graph, symbolsByFile, outgoing);
+
+    expect(edges[0].confidence).toBe("unique");
+    expect(edges[0].calleeCandidates).toEqual(["src/serviceA.ts::processData#1"]);
+  });
+
+  it("resolves default imports to default exported symbol", () => {
+    const graph: CodeGraph = {
+      nodes: [
+        {
+          relativePath: "src/main.ts",
+          imports: ["./logger"],
+          exports: [],
+          dependencies: ["src/logger.ts"],
+          dependents: [],
+        },
+        {
+          relativePath: "src/logger.ts",
+          imports: [],
+          exports: ["default"],
+          dependencies: [],
+          dependents: ["src/main.ts"],
+        },
+      ],
+      edges: [],
+    };
+    const symbolsByFile = new Map<string, SymbolNode[]>([
+      [
+        "src/main.ts",
+        [{ id: "src/main.ts::main#1", name: "main", qualifiedName: "main", kind: "function", file: "src/main.ts", line: 1, endLine: 5, language: "typescript" }],
+      ],
+      [
+        "src/logger.ts",
+        [{ id: "src/logger.ts::Logger#1", name: "Logger", qualifiedName: "Logger", exportedAs: "default", kind: "class", file: "src/logger.ts", line: 1, endLine: 10, language: "typescript" }],
+      ],
+    ]);
+
+    const edges: SymbolEdge[] = [
+      {
+        callerId: "src/main.ts::main#1",
+        calleeName: "Logger",
+        kind: "call",
+        sourceModule: "./logger",
+        importedName: "default",
+        localAlias: "Logger",
+        calleeCandidates: [],
+        confidence: "unresolved",
+        callSite: { file: "src/main.ts", line: 2 },
+      },
+    ];
+    const outgoing = new Map<string, SymbolEdge[]>([["src/main.ts", edges]]);
+
+    resolveCallSites(graph, symbolsByFile, outgoing);
+
+    expect(edges[0].confidence).toBe("unique");
+    expect(edges[0].calleeCandidates).toEqual(["src/logger.ts::Logger#1"]);
+  });
+
+  it("resolves multi-level re-export barrel chains with cycle protection", () => {
+    const graph: CodeGraph = {
+      nodes: [
+        {
+          relativePath: "src/client.ts",
+          imports: ["./barrelA"],
+          exports: [],
+          dependencies: ["src/barrelA.ts"],
+          dependents: [],
+        },
+        {
+          relativePath: "src/barrelA.ts",
+          imports: ["./barrelB"],
+          exports: ["helper"],
+          dependencies: ["src/barrelB.ts"],
+          dependents: ["src/client.ts", "src/barrelB.ts"],
+        },
+        {
+          relativePath: "src/barrelB.ts",
+          imports: ["./barrelA", "./target"],
+          exports: ["helper"],
+          dependencies: ["src/barrelA.ts", "src/target.ts"],
+          dependents: ["src/barrelA.ts"],
+        },
+        {
+          relativePath: "src/target.ts",
+          imports: [],
+          exports: ["helper"],
+          dependencies: [],
+          dependents: ["src/barrelB.ts"],
+        },
+      ],
+      edges: [],
+    };
+    const symbolsByFile = new Map<string, SymbolNode[]>([
+      [
+        "src/client.ts",
+        [{ id: "src/client.ts::run#1", name: "run", qualifiedName: "run", kind: "function", file: "src/client.ts", line: 1, endLine: 3, language: "typescript" }],
+      ],
+      [
+        "src/target.ts",
+        [{ id: "src/target.ts::helper#1", name: "helper", qualifiedName: "helper", kind: "function", file: "src/target.ts", line: 1, endLine: 5, language: "typescript" }],
+      ],
+    ]);
+
+    const outgoing = new Map<string, SymbolEdge[]>([
+      [
+        "src/client.ts",
+        [
+          {
+            callerId: "src/client.ts::run#1",
+            calleeName: "helper",
+            kind: "call",
+            sourceModule: "./barrelA",
+            importedName: "helper",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/client.ts", line: 2 },
+          },
+        ],
+      ],
+      [
+        "src/barrelA.ts",
+        [
+          {
+            callerId: "src/barrelA.ts::<module>#1",
+            calleeName: "helper",
+            kind: "reexport",
+            sourceModule: "./barrelB",
+            importedName: "helper",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/barrelA.ts", line: 1 },
+          },
+        ],
+      ],
+      [
+        "src/barrelB.ts",
+        [
+          // Circular re-export to A plus re-export to target
+          {
+            callerId: "src/barrelB.ts::<module>#1",
+            calleeName: "other",
+            kind: "reexport",
+            sourceModule: "./barrelA",
+            importedName: "other",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/barrelB.ts", line: 1 },
+          },
+          {
+            callerId: "src/barrelB.ts::<module>#1",
+            calleeName: "*",
+            kind: "reexport",
+            sourceModule: "./target",
+            importedName: "*",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/barrelB.ts", line: 2 },
+          },
+        ],
+      ],
+    ]);
+
+    resolveCallSites(graph, symbolsByFile, outgoing);
+
+    const clientEdge = outgoing.get("src/client.ts")?.[0];
+    expect(clientEdge).toBeDefined();
+    expect(clientEdge?.confidence).toBe("unique");
+    expect(clientEdge?.calleeCandidates).toEqual(["src/target.ts::helper#1"]);
+  });
+
   it("computeUnresolvedPct returns 0 when no edges", () => {
     expect(computeUnresolvedPct(new Map())).toBe(0);
   });
@@ -118,8 +345,8 @@ describe("graph-symbol-resolution", () => {
       [
         "src/a.ts",
         [
-          { callerId: "x", calleeName: "y", calleeCandidates: ["x"], confidence: "unique", callSite: { file: "x", line: 1 } },
-          { callerId: "x", calleeName: "z", calleeCandidates: [], confidence: "unresolved", callSite: { file: "x", line: 2 } },
+          { callerId: "x", calleeName: "y", kind: "call", calleeCandidates: ["x"], confidence: "unique", callSite: { file: "x", line: 1 } },
+          { callerId: "x", calleeName: "z", kind: "call", calleeCandidates: [], confidence: "unresolved", callSite: { file: "x", line: 2 } },
         ],
       ],
     ]);
