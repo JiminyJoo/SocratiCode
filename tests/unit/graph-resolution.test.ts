@@ -1805,6 +1805,8 @@ describe("graph-resolution", () => {
         undefined,
         undefined,
         undefined,
+        undefined,
+        undefined,
         crates,
       );
 
