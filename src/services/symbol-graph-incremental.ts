@@ -129,42 +129,29 @@ export async function updateChangedFilesSymbolGraph(
   let filesChangedActual = 0;
   let filesRemovedActual = 0;
 
-  // ── Process removed files ─────────────────────────────────────────────
-  for (const relPath of removedRelPaths) {
-    const oldPayload = await loadFilePayload(projectId, relPath);
-    if (!oldPayload) continue;
-    await applyRemoval(projectId, oldPayload, getNameShard, getReverseShard);
-    await deleteFilePayload(projectId, relPath);
-    symbolsDelta -= countNamedSymbols(oldPayload.symbols);
-    edgesDelta -= oldPayload.outgoingCalls.length;
-    filesRemovedActual++;
+  // ── Pre-process changed files & check for symbol ID modifications ─────
+  // If any symbol IDs changed, cross-file caller edges are invalidated and a
+  // full rebuild is required. Performing this check up front avoids committing
+  // partial changes to storage before bailing out.
+  interface PreparedChange {
+    relPath: string;
+    newPayload: SymbolGraphFilePayload | null; // null if unparseable/loss of grammar
+    oldPayload: SymbolGraphFilePayload | null;
+    wasExtensionlessWithoutGrammar?: boolean;
   }
+  const preparedChanges: PreparedChange[] = [];
 
-  // ── Process changed files (re-extract + diff + upsert) ────────────────
   for (const relPath of changedRelPaths) {
     let ext = path.extname(relPath);
     let lang = getAstGrepLang(ext);
     const isElixirTemplate = isElixirTemplateExtension(ext);
     const wasExtensionless = ext === "";
-    // Detected extensionless files must patch incrementally too, or their
-    // symbols would appear only after a full rebuildGraph() and go stale
-    // between full rebuilds. Grammar-bearing only — `.txt` stays out.
+
     if (!lang && wasExtensionless) {
-      // Distinguish "readable but not code" (→ purge stale symbols below) from a
-      // read/stat failure. The lenient resolver collapses both to null, which
-      // would purge a still-valid payload on a transient I/O blip — and only for
-      // extensionless files (an extensioned file keeps its payload via the
-      // readFile catch below). Use the strict variant so a failure surfaces, and
-      // skip without purging, mirroring the extensioned path.
       let detected: string | null;
       try {
         detected = await resolveExtensionlessExtensionStrict(path.join(projectPath, relPath));
       } catch (err) {
-        // ENOENT (deleted between change-detection and read) is an expected skip —
-        // a real delete is reconciled via removedRelPaths. Any other fault
-        // (EACCES/EIO) means we are keeping a now-stale payload for a changed file
-        // we could not read; surface it at debug, matching the lenient resolver's
-        // non-ENOENT log, rather than swallowing it silently.
         if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
           logger.debug("Could not read changed extensionless file; keeping prior symbols (skipping)", {
             relPath,
@@ -178,34 +165,21 @@ export async function updateChangedFilesSymbolGraph(
         lang = getAstGrepLang(detected);
       }
     }
+
     if (!lang && !isElixirTemplate) {
-      // A *changed* extensionless file that lost its grammar (e.g. its shebang
-      // changed to an unmapped interpreter, so it now detects as .txt) is still
-      // indexable, so it arrives here as changed — never via removedRelPaths.
-      // Drop any prior symbol payload so the incremental graph converges to the
-      // same set as a full rebuild (which excludes grammar-less extensionless
-      // files) rather than leaving phantom symbols behind.
       if (wasExtensionless) {
         const oldPayload = await loadFilePayload(projectId, relPath);
         if (oldPayload) {
-          await applyRemoval(projectId, oldPayload, getNameShard, getReverseShard);
-          await deleteFilePayload(projectId, relPath);
-          symbolsDelta -= countNamedSymbols(oldPayload.symbols);
-          edgesDelta -= oldPayload.outgoingCalls.length;
-          filesRemovedActual++;
+          preparedChanges.push({ relPath, newPayload: null, oldPayload, wasExtensionlessWithoutGrammar: true });
         }
       }
       continue;
     }
+
     let source: string;
     try {
       source = await fs.readFile(path.join(projectPath, relPath), "utf-8");
     } catch (err) {
-      // ENOENT (deleted between change-detection and read) is an expected skip —
-      // a real delete is reconciled via removedRelPaths. Any other fault
-      // (EACCES/EIO) means we are keeping a now-stale payload for a changed file
-      // we could not read; surface it at debug rather than swallowing it, and
-      // skip without purging so a transient blip cannot drop valid symbols.
       if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
         logger.debug("Could not read changed file; keeping prior symbols (skipping)", {
           relPath,
@@ -214,14 +188,11 @@ export async function updateChangedFilesSymbolGraph(
       }
       continue;
     }
+
     const language = getLanguageFromExtension(ext) ?? "plaintext";
     // biome-ignore lint/suspicious/noExplicitAny: ast-grep Lang type unify
     const extracted = extractSymbolsAndCalls(source, (lang ?? "elixir-template") as any, ext, relPath);
 
-    // Resolution: build minimal symbolsByFile/outgoingCallsByFile maps so we
-    // can reuse the existing 3-tier resolver. Other files' symbols are not
-    // available here, so cross-file edges fall back to "unresolved" — that's
-    // acceptable for the watcher path; the next full rebuild will tighten it.
     const symbolsByFile = new Map<string, SymbolNode[]>();
     symbolsByFile.set(relPath, extracted.symbols);
     const unresolvedEdges = rawCallsToUnresolvedEdges(extracted.rawCalls);
@@ -245,8 +216,6 @@ export async function updateChangedFilesSymbolGraph(
     };
 
     const oldPayload = await loadFilePayload(projectId, relPath);
-
-    // Skip work if content hash unchanged (true no-op save).
     if (oldPayload && oldPayload.contentHash === newPayload.contentHash) {
       continue;
     }
@@ -260,22 +229,51 @@ export async function updateChangedFilesSymbolGraph(
 
       if (symbolsChanged) {
         return {
-          filesChanged: filesChangedActual,
-          filesRemoved: filesRemovedActual,
-          symbolsDelta,
-          edgesDelta,
+          filesChanged: 0,
+          filesRemoved: 0,
+          symbolsDelta: 0,
+          edgesDelta: 0,
           fullRebuildRequired: true,
         };
       }
-
-      await applyRemoval(projectId, oldPayload, getNameShard, getReverseShard);
-      symbolsDelta -= countNamedSymbols(oldPayload.symbols);
-      edgesDelta -= oldPayload.outgoingCalls.length;
     }
-    await applyAddition(projectId, newPayload, getNameShard, getReverseShard);
-    await saveFilePayload(projectId, newPayload);
-    symbolsDelta += countNamedSymbols(newPayload.symbols);
-    edgesDelta += newPayload.outgoingCalls.length;
+
+    preparedChanges.push({ relPath, newPayload, oldPayload });
+  }
+
+  // ── Process removed files ─────────────────────────────────────────────
+  for (const relPath of removedRelPaths) {
+    const oldPayload = await loadFilePayload(projectId, relPath);
+    if (!oldPayload) continue;
+    await applyRemoval(projectId, oldPayload, getNameShard, getReverseShard);
+    await deleteFilePayload(projectId, relPath);
+    symbolsDelta -= countNamedSymbols(oldPayload.symbols);
+    edgesDelta -= oldPayload.outgoingCalls.length;
+    filesRemovedActual++;
+  }
+
+  // ── Apply pre-validated changed files ─────────────────────────────────
+  for (const change of preparedChanges) {
+    if (change.wasExtensionlessWithoutGrammar && change.oldPayload) {
+      await applyRemoval(projectId, change.oldPayload, getNameShard, getReverseShard);
+      await deleteFilePayload(projectId, change.relPath);
+      symbolsDelta -= countNamedSymbols(change.oldPayload.symbols);
+      edgesDelta -= change.oldPayload.outgoingCalls.length;
+      filesRemovedActual++;
+      continue;
+    }
+
+    if (!change.newPayload) continue;
+
+    if (change.oldPayload) {
+      await applyRemoval(projectId, change.oldPayload, getNameShard, getReverseShard);
+      symbolsDelta -= countNamedSymbols(change.oldPayload.symbols);
+      edgesDelta -= change.oldPayload.outgoingCalls.length;
+    }
+    await applyAddition(projectId, change.newPayload, getNameShard, getReverseShard);
+    await saveFilePayload(projectId, change.newPayload);
+    symbolsDelta += countNamedSymbols(change.newPayload.symbols);
+    edgesDelta += change.newPayload.outgoingCalls.length;
     filesChangedActual++;
   }
 
@@ -360,18 +358,16 @@ async function applyRemoval(
     if (filtered.length === 0) delete shard[sym.name];
     else shard[sym.name] = filtered;
   }
-  // Remove caller entries from reverse shards.
+  // Remove caller entries from reverse shards (keyed by exact calleeSymbolId).
   for (const edge of payload.outgoingCalls) {
     for (const calleeId of edge.calleeCandidates) {
-      const calleeFile = calleeId.split("::")[0];
-      if (!calleeFile || calleeFile === payload.file) continue;
-      const bucket = reverseShardKey(calleeFile);
+      const bucket = reverseShardKey(calleeId);
       const shard = await getReverseShard(bucket);
-      const arr = shard[calleeFile];
+      const arr = shard[calleeId];
       if (!arr) continue;
-      const filtered = arr.filter((f) => f !== payload.file);
-      if (filtered.length === 0) delete shard[calleeFile];
-      else shard[calleeFile] = filtered;
+      const filtered = arr.filter((callerId) => callerId !== edge.callerId);
+      if (filtered.length === 0) delete shard[calleeId];
+      else shard[calleeId] = filtered;
     }
   }
   // Suppress unused-projectId warning: the helper is closed over the same id
@@ -403,17 +399,16 @@ async function applyAddition(
       shard[sym.name] = [ref];
     }
   }
+  // Add caller entries to reverse shards (keyed by exact calleeSymbolId).
   for (const edge of payload.outgoingCalls) {
     for (const calleeId of edge.calleeCandidates) {
-      const calleeFile = calleeId.split("::")[0];
-      if (!calleeFile || calleeFile === payload.file) continue;
-      const bucket = reverseShardKey(calleeFile);
+      const bucket = reverseShardKey(calleeId);
       const shard = await getReverseShard(bucket);
-      const existing = shard[calleeFile];
+      const existing = shard[calleeId];
       if (existing) {
-        if (!existing.includes(payload.file)) existing.push(payload.file);
+        if (!existing.includes(edge.callerId)) existing.push(edge.callerId);
       } else {
-        shard[calleeFile] = [payload.file];
+        shard[calleeId] = [edge.callerId];
       }
     }
   }

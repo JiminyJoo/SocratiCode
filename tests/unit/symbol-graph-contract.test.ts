@@ -57,6 +57,7 @@ import {
   saveSymbolGraphMeta,
 } from "../../src/services/symbol-graph-store.js";
 import { handleGraphTool } from "../../src/tools/graph-tools.js";
+import type { SymbolGraphMeta } from "../../src/types.js";
 
 describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
   let tmpDir: string;

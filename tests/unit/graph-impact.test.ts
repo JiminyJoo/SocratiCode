@@ -145,6 +145,7 @@ describe("graph-impact exact symbol traversal and fail-closed", () => {
         {
           callerId: "src/services/evaluator.ts::eval#5",
           calleeName: "JobOfferSnapshot",
+          kind: "type_reference",
           calleeCandidates: ["src/domain/snapshot.ts::JobOfferSnapshot#10"],
           confidence: "unique",
           callSite: { file: "src/services/evaluator.ts", line: 6 },
@@ -162,6 +163,7 @@ describe("graph-impact exact symbol traversal and fail-closed", () => {
         {
           callerId: "src/services/other.ts::doOther#2",
           calleeName: "UnrelatedConstant",
+          kind: "value_reference",
           calleeCandidates: ["src/domain/snapshot.ts::UnrelatedConstant#20"],
           confidence: "unique",
           callSite: { file: "src/services/other.ts", line: 3 },

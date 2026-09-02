@@ -339,9 +339,9 @@ describe("graph-symbol-resolution", () => {
   it("resolves aliased named re-export when preceded by wildcard re-export from same dep", () => {
     const graph: CodeGraph = {
       nodes: [
-        { relativePath: "src/barrel.ts", language: "typescript", dependencies: ["src/dep.ts"] },
-        { relativePath: "src/dep.ts", language: "typescript", dependencies: [] },
-        { relativePath: "src/consumer.ts", language: "typescript", dependencies: ["src/barrel.ts"] },
+        { filePath: "/project/src/barrel.ts", relativePath: "src/barrel.ts", language: "typescript", dependencies: ["src/dep.ts"], imports: [], exports: [], dependents: [] },
+        { filePath: "/project/src/dep.ts", relativePath: "src/dep.ts", language: "typescript", dependencies: [], imports: [], exports: [], dependents: [] },
+        { filePath: "/project/src/consumer.ts", relativePath: "src/consumer.ts", language: "typescript", dependencies: ["src/barrel.ts"], imports: [], exports: [], dependents: [] },
       ],
       edges: [],
     };
@@ -421,12 +421,16 @@ describe("graph-symbol-resolution", () => {
     const graph: CodeGraph = {
       nodes: [
         {
+          filePath: "/project/src/app.ts",
           relativePath: "src/app.ts",
           language: "typescript",
           dependencies: ["src/button.ts", "src/components/button.ts"],
+          imports: [],
+          exports: [],
+          dependents: [],
         },
-        { relativePath: "src/button.ts", language: "typescript", dependencies: [] },
-        { relativePath: "src/components/button.ts", language: "typescript", dependencies: [] },
+        { filePath: "/project/src/button.ts", relativePath: "src/button.ts", language: "typescript", dependencies: [], imports: [], exports: [], dependents: [] },
+        { filePath: "/project/src/components/button.ts", relativePath: "src/components/button.ts", language: "typescript", dependencies: [], imports: [], exports: [], dependents: [] },
       ],
       edges: [],
     };
