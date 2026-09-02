@@ -138,10 +138,18 @@ function escapeIgnorePattern(literal: string): string {
  * The `throwIfNoEntry` option only covers a missing entry; an unreadable parent
  * directory still throws EACCES, and the `existsSync` this replaced threw for
  * nothing at all. A marker we cannot stat is simply not a marker.
+ *
+ * `lstat`, not `stat`: a symbolic link is answered as a link, never as what it
+ * points to. That is the same rule the walk applies one level up — a
+ * `readdirSync` entry that is a link is not a directory to it, so a linked
+ * `venv/` is never entered — and the two questions should not disagree. A link
+ * named `pyvenv.cfg` in a source directory otherwise excluded that whole
+ * directory (review finding); and no tool writes its marker as a link, so
+ * nothing real is given up.
  */
 function statOrNull(candidate: string): fs.Stats | null {
   try {
-    return fs.statSync(candidate, { throwIfNoEntry: false }) ?? null;
+    return fs.lstatSync(candidate, { throwIfNoEntry: false }) ?? null;
   } catch {
     return null;
   }

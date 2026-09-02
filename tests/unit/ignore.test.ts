@@ -169,6 +169,42 @@ describe("ignore", () => {
       expect(shouldIgnore(ig, "src/cfg/loader.rs")).toBe(false);
     });
 
+    it("keeps a source directory whose pyvenv.cfg is a symbolic link", () => {
+      // Review finding. A link is answered as a link, never as what it points
+      // to — the rule the walk already applies to directories, where a linked
+      // `venv/` is never entered. Read through `stat`, a link named
+      // `pyvenv.cfg` pointing at a real one made the source directory around
+      // it vanish whole.
+      fixture = createFixtureProject("ignore-pyvenv-marker-is-a-symlink");
+      fs.mkdirSync(path.join(fixture.root, "real-env"), { recursive: true });
+      fs.writeFileSync(path.join(fixture.root, "real-env", "pyvenv.cfg"), "home = /usr\n");
+      fs.mkdirSync(path.join(fixture.root, "src", "tool"), { recursive: true });
+      fs.symlinkSync(
+        path.join(fixture.root, "real-env", "pyvenv.cfg"),
+        path.join(fixture.root, "src", "tool", "pyvenv.cfg"),
+      );
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "src/tool/main.rs")).toBe(false);
+      // The real environment the link points at is still found where it is.
+      expect(shouldIgnore(ig, "real-env/lib/dep.py")).toBe(true);
+    });
+
+    it("keeps a source directory whose conda-meta is a symbolic link", () => {
+      // Its twin, since the two markers are read by two separate calls.
+      fixture = createFixtureProject("ignore-conda-marker-is-a-symlink");
+      fs.mkdirSync(path.join(fixture.root, "real-env", "conda-meta"), { recursive: true });
+      fs.mkdirSync(path.join(fixture.root, "src", "engine"), { recursive: true });
+      fs.symlinkSync(
+        path.join(fixture.root, "real-env", "conda-meta"),
+        path.join(fixture.root, "src", "engine", "conda-meta"),
+      );
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "src/engine/mod.rs")).toBe(false);
+      expect(shouldIgnore(ig, "real-env/lib/dep.py")).toBe(true);
+    });
+
     it("matches an environment directory whose name reads as a wildcard", () => {
       // gitignore syntax reads `[` as a character class, so a directory
       // honestly named `env[3]` produced a pattern matching none of its own
