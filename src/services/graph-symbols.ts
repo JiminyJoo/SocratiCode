@@ -9,7 +9,7 @@
 
 import { Lang, parse } from "@ast-grep/napi";
 import { getLanguageFromExtension } from "../constants.js";
-import type { SymbolEdge, SymbolKind, SymbolNode } from "../types.js";
+import type { EdgeKind, SymbolEdge, SymbolKind, SymbolNode } from "../types.js";
 import { analyzeElixirTemplate, isElixirTemplateExtension } from "./elixir-templates.js";
 import { logger } from "./logger.js";
 
@@ -20,6 +20,10 @@ export interface ExtractedSymbols {
   rawCalls: Array<{
     callerId: string;
     calleeName: string;
+    kind: EdgeKind;
+    sourceModule?: string;
+    importedName?: string;
+    localAlias?: string;
     callSite: { file: string; line: number };
   }>;
 }
@@ -29,13 +33,46 @@ function makeId(file: string, qualifiedName: string, line: number): string {
   return `${file}::${qualifiedName}#${line}`;
 }
 
-/**
- * Wrapper around `node.findAll({rule:{kind}})` that swallows ast-grep
- * "Invalid Kind" errors. Different language grammars expose different node
- * kinds, so a kind that is valid for Kotlin (`object_declaration`) may be
- * rejected by Java's grammar and abort the entire extraction. Logging is
- * intentionally omitted at debug-level to avoid log spam on every file.
- */
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function extractBindingIdentifiers(node: any): Array<{ name: string; node: any }> {
+  if (!node) return [];
+  const kind = node.kind?.();
+  if (kind === "identifier" || kind === "shorthand_property_identifier_pattern") {
+    return [{ name: node.text(), node }];
+  }
+  if (kind === "pair_pattern" || kind === "pair") {
+    const value = node.field?.("value") ?? node.children?.()[2];
+    return extractBindingIdentifiers(value);
+  }
+  if (kind === "assignment_pattern") {
+    const left = node.field?.("left") ?? node.children?.()[0];
+    return extractBindingIdentifiers(left);
+  }
+  if (kind === "rest_pattern") {
+    const kids = node.children?.() ?? [];
+    for (const k of kids) {
+      if (k.kind?.() === "identifier") {
+        return [{ name: k.text(), node: k }];
+      }
+    }
+    return [];
+  }
+  if (kind === "object_pattern" || kind === "array_pattern" || kind === "object_assignment_pattern") {
+    // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+    const result: Array<{ name: string; node: any }> = [];
+    const kids = node.children?.() ?? [];
+    for (const k of kids) {
+      const kKind = k.kind?.();
+      if (kKind !== "{" && kKind !== "}" && kKind !== "[" && kKind !== "]" && kKind !== ",") {
+        result.push(...extractBindingIdentifiers(k));
+      }
+    }
+    return result;
+  }
+  return [];
+}
+
+/** Convert raw call sites to unresolved SymbolEdge objects (resolution in Phase C). */
 // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
 function safeFindAll(node: any, kind: string): any[] {
   try {
@@ -331,6 +368,7 @@ function extractFromElixir(
     rawCalls.push({
       callerId: findCallerId(scopes, line, moduleSym.id),
       calleeName: name,
+      kind: "call",
       callSite: { file, line },
     });
   }
@@ -463,6 +501,7 @@ function extractFromLua(
     rawCalls.push({
       callerId: findCallerId(scopes, line, moduleSym.id),
       calleeName: callee,
+      kind: "call",
       callSite: { file, line },
     });
   }
@@ -732,6 +771,7 @@ function extractFromDart(
     rawCalls.push({
       callerId: findCallerId(scopes, line, moduleSym.id),
       calleeName: callee,
+      kind: "call",
       callSite: { file, line },
     });
   }
@@ -762,9 +802,13 @@ function extractFromTsLike(
     const range = node.range();
     const startLine = range.start.line + 1;
     const endLine = range.end.line + 1;
+    const parentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isDefaultExport = /^\s*export\s+default\b/.test(node.text()) || /^\s*export\s+default\b/.test(parentText);
     const sym: SymbolNode = {
       id: makeId(file, name, startLine),
-      name, qualifiedName: name, kind: "class", file, line: startLine, endLine, language,
+      name, qualifiedName: name, kind: "class",
+      exportedAs: isDefaultExport ? "default" : undefined,
+      file, line: startLine, endLine, language,
     };
     symbols.push(sym);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
@@ -805,9 +849,13 @@ function extractFromTsLike(
     const r = node.range();
     const startLine = r.start.line + 1;
     const endLine = r.end.line + 1;
+    const fnParentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isDefaultExport = /^\s*export\s+default\b/.test(node.text()) || /^\s*export\s+default\b/.test(fnParentText);
     const sym: SymbolNode = {
       id: makeId(file, name, startLine),
-      name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
+      name, qualifiedName: name, kind: "function",
+      exportedAs: isDefaultExport ? "default" : undefined,
+      file, line: startLine, endLine, language,
     };
     symbols.push(sym);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
@@ -882,28 +930,65 @@ function extractFromTsLike(
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
 
-  // Lexical and variable declarations: const, let, var (including arrow functions and plain constants)
-  const declKinds = ["lexical_declaration", "variable_declaration"];
-  for (const declKind of declKinds) {
-    for (const node of safeFindAll(root, declKind)) {
-      for (const decl of safeFindAll(node, "variable_declarator")) {
-        const idNode = decl.field("name") ?? safeFind(decl, "identifier");
-        if (!idNode) continue;
-        const name = idNode.text();
-        const arrow = safeFind(decl, "arrow_function");
-        const fnExpr = safeFind(decl, "function_expression");
-        const fn = arrow ?? fnExpr;
+  // Lexical and variable declarations: const, let, var (top-level only, direct declarators)
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const topLevelDeclNodes: any[] = [];
+  try {
+    for (const child of root.children()) {
+      if (child.kind() === "export_statement") {
+        const decl = child.field("declaration");
+        if (decl) {
+          if (decl.kind() === "lexical_declaration" || decl.kind() === "variable_declaration") {
+            topLevelDeclNodes.push(decl);
+          }
+        } else {
+          for (const sub of child.children()) {
+            if (sub.kind() === "lexical_declaration" || sub.kind() === "variable_declaration") {
+              topLevelDeclNodes.push(sub);
+            }
+          }
+        }
+      } else if (child.kind() === "lexical_declaration" || child.kind() === "variable_declaration") {
+        topLevelDeclNodes.push(child);
+      }
+    }
+  } catch {
+    // fallback if root.children() is unavailable
+  }
+
+  for (const node of topLevelDeclNodes) {
+    // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+    const declarators = (node.children?.() ?? []).filter((c: any) => c.kind() === "variable_declarator");
+    for (const decl of declarators) {
+      // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+      const nameNode = decl.field("name") ?? (decl.children?.().find((c: any) => c.kind() === "identifier" || c.kind() === "object_pattern" || c.kind() === "array_pattern"));
+      if (!nameNode) continue;
+      const bindings = extractBindingIdentifiers(nameNode);
+      const arrow = safeFind(decl, "arrow_function");
+      const fnExpr = safeFind(decl, "function_expression");
+      const fn = arrow ?? fnExpr;
+      if (fn && bindings.length === 1) {
+        const name = bindings[0].name;
         const r = (fn ?? decl).range();
         const startLine = r.start.line + 1;
         const endLine = r.end.line + 1;
-        const symKind: SymbolKind = fn ? "function" : "variable";
         const sym: SymbolNode = {
           id: makeId(file, name, startLine),
-          name, qualifiedName: name, kind: symKind, file, line: startLine, endLine, language,
+          name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
         };
         symbols.push(sym);
-        if (fn) {
-          scopes.push({ name, startLine, endLine, symbolId: sym.id });
+        scopes.push({ name, startLine, endLine, symbolId: sym.id });
+      } else {
+        for (const b of bindings) {
+          const name = b.name;
+          const r = b.node.range();
+          const startLine = r.start.line + 1;
+          const endLine = r.end.line + 1;
+          const sym: SymbolNode = {
+            id: makeId(file, name, startLine),
+            name, qualifiedName: name, kind: "variable", file, line: startLine, endLine, language,
+          };
+          symbols.push(sym);
         }
       }
     }
@@ -919,12 +1004,16 @@ function extractFromTsLike(
 
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
   const localToExportedName = new Map<string, string>();
+  const localToImportInfo = new Map<string, { sourceModule: string; importedName: string }>();
   const namespaceNames = new Set<string>();
+  const namespaceToModule = new Map<string, string>();
 
   // 1. Import statements: named imports (`import { X, Y as Z }`), type imports (`import type { T }`), default imports (`import D from ...`), namespace imports (`import * as NS from ...`)
   for (const imp of safeFindAll(root, "import_statement")) {
     const r = imp.range();
     const line = r.start.line + 1;
+    const sourceNode = imp.field("source") ?? safeFind(imp, "string");
+    const sourceModule = sourceNode ? sourceNode.text().replace(/^['"`]|['"`]$/g, "") : undefined;
 
     for (const spec of safeFindAll(imp, "import_specifier")) {
       const nameNode = spec.field("name") ?? safeFind(spec, "identifier");
@@ -933,10 +1022,17 @@ function extractFromTsLike(
       const aliasNode = spec.field("alias");
       const localName = aliasNode ? aliasNode.text() : originalName;
       localToExportedName.set(localName, originalName);
+      if (sourceModule) {
+        localToImportInfo.set(localName, { sourceModule, importedName: originalName });
+      }
 
       rawCalls.push({
         callerId: moduleSym.id,
         calleeName: originalName,
+        kind: "import",
+        sourceModule,
+        importedName: originalName,
+        localAlias: localName !== originalName ? localName : undefined,
         callSite: { file, line },
       });
     }
@@ -946,7 +1042,20 @@ function extractFromTsLike(
     if (nsNode) {
       const idNode = safeFind(nsNode, "identifier");
       if (idNode) {
-        namespaceNames.add(idNode.text());
+        const nsName = idNode.text();
+        namespaceNames.add(nsName);
+        if (sourceModule) {
+          namespaceToModule.set(nsName, sourceModule);
+        }
+        rawCalls.push({
+          callerId: moduleSym.id,
+          calleeName: nsName,
+          kind: "import",
+          sourceModule,
+          importedName: "*",
+          localAlias: nsName,
+          callSite: { file, line },
+        });
       }
     }
 
@@ -959,9 +1068,16 @@ function extractFromTsLike(
         if (k.kind() === "identifier") {
           const defaultName = k.text();
           localToExportedName.set(defaultName, defaultName);
+          if (sourceModule) {
+            localToImportInfo.set(defaultName, { sourceModule, importedName: "default" });
+          }
           rawCalls.push({
             callerId: moduleSym.id,
             calleeName: defaultName,
+            kind: "import",
+            sourceModule,
+            importedName: "default",
+            localAlias: defaultName,
             callSite: { file, line },
           });
         }
@@ -973,6 +1089,21 @@ function extractFromTsLike(
   for (const exp of safeFindAll(root, "export_statement")) {
     const r = exp.range();
     const line = r.start.line + 1;
+    const sourceNode = exp.field("source") ?? safeFind(exp, "string");
+    const sourceModule = sourceNode ? sourceNode.text().replace(/^['"`]|['"`]$/g, "") : undefined;
+
+    const expText = exp.text();
+    if (sourceModule && /export\s+\*\s+from/.test(expText)) {
+      rawCalls.push({
+        callerId: moduleSym.id,
+        calleeName: "*",
+        kind: "reexport",
+        sourceModule,
+        importedName: "*",
+        callSite: { file, line },
+      });
+    }
+
     for (const spec of safeFindAll(exp, "export_specifier")) {
       const nameNode = spec.field("name") ?? safeFind(spec, "identifier");
       if (!nameNode) continue;
@@ -983,26 +1114,39 @@ function extractFromTsLike(
       rawCalls.push({
         callerId: moduleSym.id,
         calleeName: expName,
+        kind: "reexport",
+        sourceModule,
+        importedName: expName,
+        localAlias: localName !== expName ? localName : undefined,
         callSite: { file, line },
       });
     }
   }
 
-  // 3. Call sites
-  for (const node of safeFindAll(root, "call_expression")) {
-    let calleeName = extractCalleeNameJs(node.text());
-    if (!calleeName) continue;
-    const mapped = localToExportedName.get(calleeName);
-    if (mapped) {
-      calleeName = mapped;
+  // 3. Call sites and instantiations
+  for (const k of ["call_expression", "new_expression"]) {
+    for (const node of safeFindAll(root, k)) {
+      let calleeName = extractCalleeNameJs(node.text());
+      if (!calleeName) continue;
+      const impInfo = localToImportInfo.get(calleeName);
+      const mapped = localToExportedName.get(calleeName);
+      const localAlias = mapped && mapped !== calleeName ? calleeName : undefined;
+      if (mapped) {
+        calleeName = mapped;
+      }
+      const r = node.range();
+      const callLine = r.start.line + 1;
+      const callerId = findCallerId(scopes, callLine, moduleSym.id);
+      rawCalls.push({
+        callerId,
+        calleeName,
+        kind: "call",
+        sourceModule: impInfo?.sourceModule,
+        importedName: impInfo?.importedName,
+        localAlias,
+        callSite: { file, line: callLine },
+      });
     }
-    const r = node.range();
-    const callLine = r.start.line + 1;
-    const callerId = findCallerId(scopes, callLine, moduleSym.id);
-    rawCalls.push({
-      callerId, calleeName,
-      callSite: { file, line: callLine },
-    });
   }
 
   // 4. Type references (type annotations, type arguments, implements, extends)
@@ -1025,7 +1169,9 @@ function extractFromTsLike(
     const r = node.range();
     const line = r.start.line + 1;
     if (declaredNamesAndLines.has(`${name}#${line}`)) continue;
+    const impInfo = localToImportInfo.get(name);
     const mapped = localToExportedName.get(name);
+    const localAlias = mapped && mapped !== name ? name : undefined;
     if (mapped) {
       name = mapped;
     }
@@ -1033,6 +1179,10 @@ function extractFromTsLike(
     rawCalls.push({
       callerId,
       calleeName: name,
+      kind: "type_reference",
+      sourceModule: impInfo?.sourceModule,
+      importedName: impInfo?.importedName,
+      localAlias,
       callSite: { file, line },
     });
   }
@@ -1043,13 +1193,18 @@ function extractFromTsLike(
       const objNode = node.field("object");
       const propNode = node.field("property");
       if (objNode && propNode && namespaceNames.has(objNode.text())) {
+        const objText = objNode.text();
         const propName = propNode.text();
+        const sourceModule = namespaceToModule.get(objText);
         const r = node.range();
         const line = r.start.line + 1;
         const callerId = findCallerId(scopes, line, moduleSym.id);
         rawCalls.push({
           callerId,
           calleeName: propName,
+          kind: "value_reference",
+          sourceModule,
+          importedName: propName,
           callSite: { file, line },
         });
       }
@@ -1068,10 +1223,15 @@ function extractFromTsLike(
       if (parentKind === "import_specifier" || parentKind === "import_clause" || parentKind === "export_specifier") {
         continue;
       }
+      const impInfo = localToImportInfo.get(localName);
       const callerId = findCallerId(scopes, line, moduleSym.id);
       rawCalls.push({
         callerId,
         calleeName: originalName,
+        kind: "value_reference",
+        sourceModule: impInfo?.sourceModule,
+        importedName: impInfo?.importedName,
+        localAlias: localName !== originalName ? localName : undefined,
         callSite: { file, line },
       });
     }
@@ -1080,10 +1240,11 @@ function extractFromTsLike(
   return { symbols, rawCalls };
 }
 
-/** Pull the callee's bare name from the start of a call expression's text. */
+/** Pull the callee's bare name from the start of a call/new expression's text. */
 function extractCalleeNameJs(text: string): string | null {
+  const cleaned = text.replace(/^\s*new\s+/, "");
   // `foo(...)` → "foo"  ;  `obj.foo(...)` → "foo"  ;  `obj.bar.foo(...)` → "foo"
-  const m = text.match(/^([\w$.]+)\s*\(/);
+  const m = cleaned.match(/^([\w$.]+)\s*(?:\(|$)/);
   if (!m) return null;
   const chain = m[1];
   const parts = chain.split(".");
@@ -1221,6 +1382,7 @@ function extractFromPython(
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
       calleeName,
+      kind: "call",
       callSite: { file, line: callLine },
     });
   }
@@ -1276,7 +1438,9 @@ function extractFromGo(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1317,7 +1481,9 @@ function extractFromRust(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   for (const node of safeFindAll(root, "macro_invocation")) {
@@ -1327,7 +1493,9 @@ function extractFromRust(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName: nameNode.text(), callSite: { file, line: callLine },
+      calleeName: nameNode.text(),
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1403,7 +1571,9 @@ function extractFromJvm(
       const callLine = r.start.line + 1;
       rawCalls.push({
         callerId: findCallerId(scopes, callLine, moduleSym.id),
-        calleeName, callSite: { file, line: callLine },
+        calleeName,
+        kind: "call",
+        callSite: { file, line: callLine },
       });
     }
   }
@@ -1500,7 +1670,9 @@ function extractFromCSharp(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1568,7 +1740,9 @@ function extractFromCFamily(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1623,15 +1797,6 @@ function extractFromRuby(
 
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
   for (const node of safeFindAll(root, "call")) {
-    // Ask the grammar, not the text. tree-sitter-ruby's `call` node carries the
-    // callee in its `method` field for every call shape — parenthesised or not,
-    // command style (`has_many :posts`), safe navigation (`a&.b`), block calls,
-    // and each link of a fluent chain as its own node. The previous
-    // extractCalleeNameJs(text) parse required a `(` before the name, so every
-    // parenthesis-less call — the dominant Ruby idiom — was silently dropped
-    // and Ruby files contributed almost no call edges. (A bare receiverless,
-    // argumentless `helper` parses as a plain identifier, indistinguishable
-    // from a variable read, so it is not a `call` node and stays out.)
     const methodNode = node.field("method");
     const calleeName = methodNode ? methodNode.text() : extractCalleeNameJs(node.text());
     if (!calleeName) continue;
@@ -1639,7 +1804,9 @@ function extractFromRuby(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1703,7 +1870,9 @@ function extractFromPhp(
       const callLine = r.start.line + 1;
       rawCalls.push({
         callerId: findCallerId(scopes, callLine, moduleSym.id),
-        calleeName, callSite: { file, line: callLine },
+        calleeName,
+        kind: "call",
+        callSite: { file, line: callLine },
       });
     }
   }
@@ -1768,7 +1937,9 @@ function extractFromSwift(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1812,7 +1983,9 @@ function extractFromBash(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName: name, callSite: { file, line: callLine },
+      calleeName: name,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1869,8 +2042,10 @@ function extractFromRegex(
         const callLine = i + 1;
         rawCalls.push({
           callerId: findCallerId(scopes, callLine, moduleSym.id),
-        calleeName: name, callSite: { file, line: callLine },
-      });
+          calleeName: name,
+          kind: "call",
+          callSite: { file, line: callLine },
+        });
       }
       m = callRegex.exec(lines[i]);
     }
@@ -1887,6 +2062,10 @@ export function rawCallsToUnresolvedEdges(
     calleeName: c.calleeName,
     calleeCandidates: [],
     confidence: "unresolved" as const,
+    kind: c.kind,
+    sourceModule: c.sourceModule,
+    importedName: c.importedName,
+    localAlias: c.localAlias,
     callSite: c.callSite,
   }));
 }

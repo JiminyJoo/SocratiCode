@@ -133,6 +133,14 @@ export interface SymbolNode {
   language: string;
 }
 
+/** Kind of relationship an edge represents */
+export type EdgeKind =
+  | "call"
+  | "value_reference"
+  | "type_reference"
+  | "import"
+  | "reexport";
+
 /** Confidence level for a resolved call edge */
 export type SymbolEdgeConfidence =
   | "local"
@@ -149,6 +157,13 @@ export interface SymbolEdge {
   /** Resolved SymbolNode.ids: 0 = external, 1 = unique, >1 = ambiguous */
   calleeCandidates: string[];
   confidence: SymbolEdgeConfidence;
+  kind: EdgeKind;
+  /** Source module specifier from import statement (e.g. "./utils") */
+  sourceModule?: string;
+  /** Original imported or exported name in the source module */
+  importedName?: string;
+  /** Local binding alias in the caller file */
+  localAlias?: string;
   callSite: { file: string; line: number };
 }
 
