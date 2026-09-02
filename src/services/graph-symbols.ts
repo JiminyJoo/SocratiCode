@@ -1241,11 +1241,11 @@ function extractFromTsLike(
     }
   }
 
-  // Deduplicate rawCalls sharing (callerId, calleeName, kind, sourceModule) to keep graph compact
+  // Deduplicate rawCalls sharing (callerId, calleeName, kind, sourceModule, importedName, localAlias) to keep graph compact
   const dedupedCalls: ExtractedSymbols["rawCalls"] = [];
   const seenCalls = new Set<string>();
   for (const call of rawCalls) {
-    const key = `${call.callerId}::${call.calleeName}::${call.kind}::${call.sourceModule ?? ""}`;
+    const key = `${call.callerId}::${call.calleeName}::${call.kind}::${call.sourceModule ?? ""}::${call.importedName ?? ""}::${call.localAlias ?? ""}`;
     if (!seenCalls.has(key)) {
       seenCalls.add(key);
       dedupedCalls.push(call);
