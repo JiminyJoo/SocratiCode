@@ -87,7 +87,9 @@ export class SymbolGraphCache {
   meta: SymbolGraphMeta;
   /** name → list of symbol refs (lazy-loaded as a whole) */
   private nameIndex: Map<string, SymbolRef[]> | null = null;
-  /** calleeFile → set of caller files (lazy-loaded as a whole) */
+  /** calleeSymbolId → set of caller symbol IDs (lazy-loaded as a whole) */
+  private reverseSymbolIndex: Map<string, Set<string>> | null = null;
+  /** calleeFile → set of caller files (derived from reverseSymbolIndex) */
   private reverseFileIndex: Map<string, Set<string>> | null = null;
   /** lazy per-file payloads, LRU-bounded */
   fileDataLru: LRUCache<string, SymbolGraphFilePayload>;
@@ -133,9 +135,9 @@ export class SymbolGraphCache {
     return merged;
   }
 
-  /** Get the full reverse-call file index, loading all shards on first access. */
-  async getReverseFileIndex(): Promise<Map<string, Set<string>>> {
-    if (this.reverseFileIndex) return this.reverseFileIndex;
+  /** Get the full reverse symbol index (calleeSymbolId -> Set<callerSymbolId>), loading all shards on first access. */
+  async getReverseSymbolIndex(): Promise<Map<string, Set<string>>> {
+    if (this.reverseSymbolIndex) return this.reverseSymbolIndex;
     const merged = new Map<string, Set<string>>();
     const buckets: number[] = [];
     for (let i = 0; i < SYMBOL_REVERSE_SHARDS; i++) buckets.push(i);
@@ -144,18 +146,43 @@ export class SymbolGraphCache {
     );
     for (const shard of shards) {
       if (!shard) continue;
-      for (const [calleeFile, callerFiles] of Object.entries(shard)) {
-        const existing = merged.get(calleeFile);
+      for (const [calleeKey, callerList] of Object.entries(shard)) {
+        const existing = merged.get(calleeKey);
         if (existing) {
-          for (const f of callerFiles) existing.add(f);
+          for (const f of callerList) existing.add(f);
         } else {
-          merged.set(calleeFile, new Set(callerFiles));
+          merged.set(calleeKey, new Set(callerList));
         }
       }
     }
-    this.reverseFileIndex = merged;
+    this.reverseSymbolIndex = merged;
     this.stats.reverseIndexLoaded = true;
     return merged;
+  }
+
+  /** Get the full reverse-call file index, derived from reverseSymbolIndex. */
+  async getReverseFileIndex(): Promise<Map<string, Set<string>>> {
+    if (this.reverseFileIndex) return this.reverseFileIndex;
+    const symIndex = await this.getReverseSymbolIndex();
+    const fileIndex = new Map<string, Set<string>>();
+
+    for (const [calleeKey, callerList] of symIndex.entries()) {
+      const calleeFile = calleeKey.includes("::") ? calleeKey.split("::")[0] : calleeKey;
+      let callerSet = fileIndex.get(calleeFile);
+      if (!callerSet) {
+        callerSet = new Set<string>();
+        fileIndex.set(calleeFile, callerSet);
+      }
+      for (const callerId of callerList) {
+        const callerFile = callerId.includes("::") ? callerId.split("::")[0] : callerId;
+        if (callerFile !== calleeFile) {
+          callerSet.add(callerFile);
+        }
+      }
+    }
+
+    this.reverseFileIndex = fileIndex;
+    return fileIndex;
   }
 
   /** Get a per-file payload, hitting the LRU first then Qdrant. */
@@ -202,34 +229,31 @@ export class SymbolGraphCache {
     }
   }
 
-  /** Patch the in-memory reverse-file index for an updated file payload. */
+  /** Patch the in-memory reverse-symbol and reverse-file indices for an updated file payload. */
   patchReverseFileIndexForFile(
     oldPayload: SymbolGraphFilePayload | null,
     newPayload: SymbolGraphFilePayload,
   ): void {
-    if (!this.reverseFileIndex) return;
-    const callerFile = newPayload.file;
-    if (oldPayload) {
-      for (const e of oldPayload.outgoingCalls) {
+    if (this.reverseSymbolIndex) {
+      if (oldPayload) {
+        for (const e of oldPayload.outgoingCalls) {
+          for (const calleeId of e.calleeCandidates) {
+            const callers = this.reverseSymbolIndex.get(calleeId);
+            if (!callers) continue;
+            callers.delete(e.callerId);
+            if (callers.size === 0) this.reverseSymbolIndex.delete(calleeId);
+          }
+        }
+      }
+      for (const e of newPayload.outgoingCalls) {
         for (const calleeId of e.calleeCandidates) {
-          const calleeFile = symbolIdToFile(calleeId);
-          if (!calleeFile) continue;
-          const callers = this.reverseFileIndex.get(calleeFile);
-          if (!callers) continue;
-          callers.delete(callerFile);
-          if (callers.size === 0) this.reverseFileIndex.delete(calleeFile);
+          const callers = this.reverseSymbolIndex.get(calleeId);
+          if (callers) callers.add(e.callerId);
+          else this.reverseSymbolIndex.set(calleeId, new Set([e.callerId]));
         }
       }
     }
-    for (const e of newPayload.outgoingCalls) {
-      for (const calleeId of e.calleeCandidates) {
-        const calleeFile = symbolIdToFile(calleeId);
-        if (!calleeFile) continue;
-        const callers = this.reverseFileIndex.get(calleeFile);
-        if (callers) callers.add(callerFile);
-        else this.reverseFileIndex.set(calleeFile, new Set([callerFile]));
-      }
-    }
+    this.reverseFileIndex = null; // Re-derive lazily
   }
 
   /** Replace the cached payload for a file (used after rebuild of one file). */

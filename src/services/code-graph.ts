@@ -351,22 +351,22 @@ async function persistSymbolGraph(
   }
 
   const reverseShards = new Map<number, Record<string, string[]>>();
-  for (const [callerFile, edges] of outgoingCallsByFile.entries()) {
+  for (const edges of outgoingCallsByFile.values()) {
     for (const e of edges) {
       for (const calleeId of e.calleeCandidates) {
         const calleeFile = calleeId.split("::")[0];
-        if (!calleeFile || calleeFile === callerFile) continue;
+        if (!calleeFile) continue;
         const bucket = reverseShardKey(calleeFile);
         let shard = reverseShards.get(bucket);
         if (!shard) {
           shard = {};
           reverseShards.set(bucket, shard);
         }
-        const existing = shard[calleeFile];
+        const existing = shard[calleeId];
         if (existing) {
-          if (!existing.includes(callerFile)) existing.push(callerFile);
+          if (!existing.includes(e.callerId)) existing.push(e.callerId);
         } else {
-          shard[calleeFile] = [callerFile];
+          shard[calleeId] = [e.callerId];
         }
       }
     }

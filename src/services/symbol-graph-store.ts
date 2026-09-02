@@ -321,11 +321,18 @@ async function saveShardPoints<V>(
   }
 }
 
+export class StorageReadError extends Error {
+  constructor(message: string, public readonly context?: Record<string, unknown>) {
+    super(message);
+    this.name = "StorageReadError";
+  }
+}
+
 /**
  * Read a shard written by {@link saveShardPoints}: the point at the shard's
  * original id, plus continuation parts when it declares any. Returns the
- * merged entries, or null when a declared part is missing — the shard is then
- * incomplete and pretending otherwise would under-report quietly.
+ * merged entries, or null when genuinely absent (primary point missing), or
+ * throws StorageReadError when a declared part or payload is corrupted/missing.
  */
 async function loadShardPoints<V>(
   collName: string,
@@ -340,7 +347,9 @@ async function loadShardPoints<V>(
 
   const payload = primary[0].payload as Record<string, unknown> | null | undefined;
   const first = entriesOf(payload);
-  if (first === null) return null;
+  if (first === null) {
+    throw new StorageReadError("Shard primary payload is malformed or missing entries", logContext);
+  }
 
   const declared = payload?.parts;
   const parts = typeof declared === "number" && declared > 1 ? declared : 1;
@@ -352,12 +361,15 @@ async function loadShardPoints<V>(
   // absent identity must not slide through as `undefined === undefined`.
   const writeId = payload?.write;
   if (!Number.isInteger(parts) || typeof writeId !== "string" || writeId.length === 0) {
-    logger.warn("Multipart shard has a malformed header (returning null)", {
+    logger.warn("Multipart shard has a malformed header", {
       ...logContext,
       declaredParts: declared,
       hasWriteId: typeof writeId === "string" && writeId.length > 0,
     });
-    return null;
+    throw new StorageReadError("Multipart shard has a malformed header", {
+      ...logContext,
+      declaredParts: declared,
+    });
   }
 
   const restIds: string[] = [];
@@ -376,24 +388,21 @@ async function loadShardPoints<V>(
     rest.push(...(await qdrant.retrieve(collName, { ids: restIds.slice(i, i + RETRIEVE_PART_CHUNK), with_payload: true })));
   }
   if (rest.length !== restIds.length) {
-    logger.warn("Shard is missing continuation parts (returning null)", {
+    logger.warn("Shard is missing continuation parts", {
       ...logContext,
       declaredParts: parts,
       found: rest.length + 1,
     });
-    return null;
+    throw new StorageReadError("Shard is missing continuation parts", {
+      ...logContext,
+      declaredParts: parts,
+      found: rest.length + 1,
+    });
   }
 
   const merged: Record<string, V> = { ...first };
   for (const point of rest) {
     const partPayload = point.payload as Record<string, unknown> | null | undefined;
-    // A continuation part from a DIFFERENT write than part 0 means a rewrite
-    // died partway: the ids line up (they are deterministic) but the contents
-    // are two writes interleaved. Serving the merge would return a record
-    // equal to neither write, silently — treat it exactly like a missing part.
-    // The part/parts headers are cross-checked by expected id, not response
-    // order, so a point sitting at the right id with the wrong headers is
-    // rejected as corruption too.
     const expectedPart = expectedPartById.get(String(point.id));
     if (
       partPayload?.write !== writeId ||
@@ -401,17 +410,21 @@ async function loadShardPoints<V>(
       partPayload?.part !== expectedPart ||
       partPayload?.parts !== parts
     ) {
-      logger.warn("Shard continuation part belongs to a different write or is malformed (returning null)", {
+      logger.warn("Shard continuation part belongs to a different write or is malformed", {
         ...logContext,
         declaredParts: parts,
         pointId: String(point.id),
       });
-      return null;
+      throw new StorageReadError("Shard continuation part belongs to a different write or is malformed", {
+        ...logContext,
+        declaredParts: parts,
+        pointId: String(point.id),
+      });
     }
     const entries = entriesOf(partPayload);
     if (entries === null) {
-      logger.warn("Shard continuation part has no entries (returning null)", { ...logContext });
-      return null;
+      logger.warn("Shard continuation part has no entries", { ...logContext });
+      throw new StorageReadError("Shard continuation part has no entries", logContext);
     }
     Object.assign(merged, entries);
   }
@@ -611,12 +624,11 @@ export async function loadNameShard(
       { projectId, shardKey },
     );
   } catch (err) {
-    logger.warn("loadNameShard failed (returning null)", {
-      projectId,
-      shardKey,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
+    if (err instanceof StorageReadError) throw err;
+    throw new StorageReadError(
+      `loadNameShard failed for shard '${shardKey}': ${err instanceof Error ? err.message : String(err)}`,
+      { projectId, shardKey },
+    );
   }
 }
 
@@ -659,12 +671,11 @@ export async function loadReverseShard(
       { projectId, bucket },
     );
   } catch (err) {
-    logger.warn("loadReverseShard failed (returning null)", {
-      projectId,
-      bucket,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
+    if (err instanceof StorageReadError) throw err;
+    throw new StorageReadError(
+      `loadReverseShard failed for bucket ${bucket}: ${err instanceof Error ? err.message : String(err)}`,
+      { projectId, bucket },
+    );
   }
 }
 
