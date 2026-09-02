@@ -1983,10 +1983,33 @@ export function resolveRustImport(
   // the marker names an external crate only where the extern prelude exists. In
   // 2015 it is the same crate root an unanchored path counts from, and letting
   // it through sent the path looking for a workspace crate of that name — or,
-  // finding none, to nothing at all.
+  // finding none, to nothing at all. That case is answered first below, from
+  // the root and nowhere else.
   const global = globalMarker && !edition2015;
 
   const target = ((): string | null => {
+    // In edition 2015 the leading `::` is the crate root, and the crate root
+    // only: the same one `crate::` names, never this file's scope. Read
+    // through the file's own declarations, `use ::foo::Item` in a child that
+    // carried `#[path = "local.rs"] mod foo;` was answered with that local
+    // file, while rustc reaches the root's `foo` — a review finding left open
+    // from an earlier round. So the file's declaration map is not consulted
+    // at all here. The root module is tried first, and a crate the package
+    // declares second: in 2015 `extern crate foo;` at the root puts the crate
+    // there too, and a root that declares both is E0260, so only one exists.
+    // Without a target root there is nothing to count from, and the path is
+    // left unresolved rather than guessed.
+    if (globalMarker && edition2015) {
+      if (!own) return null;
+      const atRoot = resolveRustModulePath(own.moduleDir, segments, own.root, fileSet);
+      if (atRoot) return atRoot;
+      const crate = crateNamed(head);
+      if (!crate?.libRoot) return null;
+      return segments.length === 1
+        ? crate.libRoot
+        : resolveRustModulePath(rustModuleDir(crate.libRoot, true), segments.slice(1), crate.libRoot, fileSet);
+    }
+
     // A bare specifier is a `mod foo;` declaration (see extractImports), which
     // names a file in the declaring file's own module directory. `use foo;` —
     // a whole crate, no path — and `extern crate foo;` arrive in the same

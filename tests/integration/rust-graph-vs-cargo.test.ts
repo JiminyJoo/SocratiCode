@@ -394,3 +394,81 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info, across a
     expect(pairs.has("app/src/bin/tool.rs -> app/src/lib.rs")).toBe(true);
   });
 });
+
+// Edition 2015, where a leading `::` is the crate root. The child declares a
+// `foo` of its own, moved by `#[path]`, and writes `use ::foo::Item` — which
+// compiles only because `::foo` is the root's module: the local one defines
+// no `Item`. rustc is the oracle for the meaning; the graph has to draw the
+// edge to the file rustc read the name from.
+describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info, in edition 2015 (needs cargo on PATH)", () => {
+  let root: string;
+  let read: Set<string>;
+
+  beforeAll(() => {
+    ensureDynamicLanguages();
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-cargo-2015-"));
+
+    write(root, "Cargo.toml", ['[package]', 'name = "old"', 'version = "0.1.0"', 'edition = "2015"', ""].join("\n"));
+    write(root, "src/lib.rs", "pub mod foo;\npub mod deep;\n");
+    write(root, "src/foo.rs", "pub struct Item;\n");
+    write(root, "src/deep/mod.rs", "pub mod child;\n");
+    write(
+      root,
+      "src/deep/child.rs",
+      [
+        '#[path = "local.rs"]',
+        "pub mod foo;",
+        "",
+        "use ::foo::Item;",
+        "",
+        "pub fn item() -> Item {",
+        "    Item",
+        "}",
+        "",
+        "pub fn other() -> foo::Other {",
+        "    foo::Other",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    write(root, "src/deep/local.rs", "pub struct Other;\n");
+
+    try {
+      execFileSync("cargo", ["check", "--offline", "--quiet"], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 120_000,
+      });
+    } catch (err) {
+      const details = err instanceof Error && "stderr" in err ? String(err.stderr) : String(err);
+      throw new Error(`the fixture crate did not compile, so there is no oracle:\n${details}`);
+    }
+
+    read = sourcesRustcRead(root);
+  }, 180_000);
+
+  afterAll(() => {
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it("reads a dep-info that names both files called foo", () => {
+    expect(read.has("src/foo.rs")).toBe(true);
+    expect(read.has("src/deep/local.rs")).toBe(true);
+  });
+
+  it("answers the child's leading :: with the root's module, not the one it moved", async () => {
+    // Review finding, left open from an earlier round: the child's own
+    // `#[path]` declaration used to capture `::foo`, and the edge to the
+    // root's `foo` — the one rustc reads `Item` from — was never drawn.
+    const graph = await buildCodeGraph(root);
+    const pairs = new Set(graph.edges.map((e) => `${e.source} -> ${e.target}`));
+    expect(pairs.has("src/deep/child.rs -> src/foo.rs")).toBe(true);
+    // The declaration still draws its own edge to the moved file.
+    expect(pairs.has("src/deep/child.rs -> src/deep/local.rs")).toBe(true);
+  });
+});

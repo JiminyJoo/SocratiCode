@@ -2164,6 +2164,44 @@ describe("graph-resolution", () => {
         .toBe("crates/app/src/config.rs");
     });
 
+    it("answers a 2015 leading :: from the crate root, not from the child's own declarations", () => {
+      // Review finding, left open from an earlier round. `src/deep/child.rs`
+      // declares `#[path = "local.rs"] mod foo;` of its own, and the root
+      // declares `mod foo;` too. `use ::foo::Item` written in the child names
+      // the root's — `::` is the crate root in 2015 — yet the child's
+      // declaration map was consulted first and answered with `local.rs`.
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n',
+        "src/lib.rs": "",
+        "src/foo.rs": "",
+        "src/deep/mod.rs": "",
+        "src/deep/child.rs": "",
+        "src/deep/local.rs": "",
+      });
+      const childDeclares = new Map([["foo", "local.rs"]]);
+
+      expect(resolveRustImport("::foo::Item", "src/deep/child.rs", fileSet, crates, childDeclares))
+        .toBe("src/foo.rs");
+      expect(resolveRustImport("::foo", "src/deep/child.rs", fileSet, crates, childDeclares))
+        .toBe("src/foo.rs");
+      // Without the marker the child's own `foo` is the one in scope.
+      expect(resolveRustImport("foo::Item", "src/deep/child.rs", fileSet, crates, childDeclares))
+        .toBe("src/deep/local.rs");
+    });
+
+    it("leaves a 2015 leading :: unresolved when no target root covers the file", () => {
+      // A file outside every Cargo target has no root to count from, and a
+      // guess would be an edge rustc never draws.
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n',
+        "src/lib.rs": "",
+        "src/foo.rs": "",
+        "scratch/loose.rs": "",
+      });
+
+      expect(resolveRustImport("::foo::Item", "scratch/loose.rs", fileSet, crates)).toBeNull();
+    });
+
     it("lets an unanchored path reach a module the file declares, and only then", () => {
       const crates = rustProject({
         "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n\n[dependencies]\nserde = "1"\n',
