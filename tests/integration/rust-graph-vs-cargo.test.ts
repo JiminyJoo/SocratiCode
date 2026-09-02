@@ -317,11 +317,23 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info, across a
     ensureDynamicLanguages();
     root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-cargo-ws-"));
 
-    write(root, "Cargo.toml", ['[workspace]', 'members = ["app", "helper", "util"]', 'resolver = "2"', ""].join("\n"));
+    write(root, "Cargo.toml", ['[workspace]', 'members = ["app", "helper", "util", "other"]', 'resolver = "2"', ""].join("\n"));
     write(
       root,
       "app/Cargo.toml",
-      ['[package]', 'name = "app"', 'version = "0.1.0"', 'edition = "2021"', "", "[dependencies]", 'util = { path = "../util" }', ""].join("\n"),
+      [
+        "[package]",
+        'name = "app"',
+        'version = "0.1.0"',
+        'edition = "2021"',
+        "",
+        "[dependencies]",
+        'util = { path = "../util" }',
+        // Declared under its package name; its code is imported under the
+        // library name it sets, which is the name cargo hands rustc.
+        'other = { path = "../other" }',
+        "",
+      ].join("\n"),
     );
     write(
       root,
@@ -333,13 +345,20 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info, across a
         // Written as a `use`: a path inside an expression is not an import to
         // the graph, and this fixture is about what a `use` may reach.
         "use util::value;",
+        "use otherlib::other_value;",
         "",
         "pub fn all() -> u32 {",
-        "    value()",
+        "    value() + other_value()",
         "}",
         "",
       ].join("\n"),
     );
+    write(
+      root,
+      "other/Cargo.toml",
+      ['[package]', 'name = "other"', 'version = "0.1.0"', 'edition = "2021"', "", "[lib]", 'name = "otherlib"', ""].join("\n"),
+    );
+    write(root, "other/src/lib.rs", "pub fn other_value() -> u32 {\n    11\n}\n");
     // Another target of the same package reaches its library by the package's
     // own name, which no manifest declares.
     write(root, "app/src/bin/tool.rs", "use app::all;\n\nfn main() {\n    println!(\"{}\", all());\n}\n");
@@ -392,6 +411,12 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info, across a
     const pairs = new Set(graph.edges.map((e) => `${e.source} -> ${e.target}`));
     expect(pairs.has("app/src/lib.rs -> util/src/lib.rs")).toBe(true);
     expect(pairs.has("app/src/bin/tool.rs -> app/src/lib.rs")).toBe(true);
+    // Declared as `other`, imported as `otherlib`: the first cut of the fence
+    // keyed on declared names alone and turned this edge away, a regression
+    // against the head before it (review finding). rustc reads
+    // `other/src/lib.rs` here, and `use other::…` would be E0432.
+    expect(read.has("other/src/lib.rs")).toBe(true);
+    expect(pairs.has("app/src/lib.rs -> other/src/lib.rs")).toBe(true);
   });
 });
 

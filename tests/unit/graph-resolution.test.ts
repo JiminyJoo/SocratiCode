@@ -1370,11 +1370,26 @@ describe("graph-resolution", () => {
         {
           dir: ".",
           name: "my_app_core",
+          packageName: "my_app_core",
           libRoot: "src/lib.rs",
           roots: ["src/lib.rs"],
           edition: "2021",
         },
       ]);
+    });
+
+    it("keeps the package name beside a library name that differs from it", () => {
+      // A dependency on this crate is declared under the package name; the
+      // code that uses it writes the library name. Both are needed to tell
+      // whether an import names a crate the importing package declared.
+      const crates = rustProject({
+        "Cargo.toml": '[package]\nname = "rust-crypto"\n\n[lib]\nname = "crypto"\n',
+        "src/lib.rs": "",
+      });
+
+      expect(crates[0].name).toBe("crypto");
+      expect(crates[0].packageName).toBe("rust_crypto");
+      expect(crates[0].manifestUnread).toBeUndefined();
     });
 
     it("inherits the edition a workspace declares for its members", () => {
@@ -1680,6 +1695,49 @@ describe("graph-resolution", () => {
       expect(resolveRustImport("tools::Thing", "app/src/lib.rs", fileSet, crates)).toBe("helper/src/lib.rs");
       expect(resolveRustImport("util::Thing", "app/src/lib.rs", fileSet, crates)).toBe("util/src/lib.rs");
       expect(resolveRustImport("app::run", "app/src/bin/tool.rs", fileSet, crates)).toBe("app/src/lib.rs");
+    });
+
+    it("admits a declared dependency by the library name its code is imported under", () => {
+      // Review finding on the fence's first cut. A dependency is declared
+      // under its package name, and the code writes its library name: `other`
+      // in the manifest, `otherlib` in the `use`, wherever `[lib] name` is
+      // set — `rust-crypto` is imported as `crypto`. Keyed on the declared
+      // names alone, the fence turned that edge away, a regression against the
+      // head before it. Renamed, the alias is the only name in scope: with
+      // `dep = { package = "other" }` the code writes `dep`, and `otherlib`
+      // is E0432.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "renamer", "other"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\n\n[dependencies]\nother = { path = "../other" }\n',
+        "app/src/lib.rs": "",
+        "renamer/Cargo.toml": '[package]\nname = "renamer"\n\n[dependencies]\ndep = { path = "../other", package = "other" }\n',
+        "renamer/src/lib.rs": "",
+        "other/Cargo.toml": '[package]\nname = "other"\n\n[lib]\nname = "otherlib"\n',
+        "other/src/lib.rs": "",
+        "other/src/deep.rs": "",
+      });
+
+      expect(resolveRustImport("otherlib::deep::Thing", "app/src/lib.rs", fileSet, crates)).toBe("other/src/deep.rs");
+      expect(resolveRustImport("other::Thing", "app/src/lib.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("dep::deep::Thing", "renamer/src/lib.rs", fileSet, crates)).toBe("other/src/deep.rs");
+      expect(resolveRustImport("otherlib::Thing", "renamer/src/lib.rs", fileSet, crates)).toBeNull();
+    });
+
+    it("does not fence a package whose manifest could not be read", () => {
+      // Review finding. An unparseable `Cargo.toml` declares nothing that can
+      // be known, and reading that as "declares nothing" cost the package every
+      // cross-crate edge — where the map's own promise is that one unreadable
+      // manifest must not cost the project its Rust edges.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "util"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\n\n[[[broken\n',
+        "app/src/lib.rs": "",
+        "util/Cargo.toml": '[package]\nname = "util"\n',
+        "util/src/lib.rs": "",
+      });
+
+      expect(crates.find((c) => c.dir === "app")?.manifestUnread).toBe(true);
+      expect(resolveRustImport("util::Thing", "app/src/lib.rs", fileSet, crates)).toBe("util/src/lib.rs");
     });
 
     it("leaves a third-party crate unresolved", () => {
@@ -2189,17 +2247,52 @@ describe("graph-resolution", () => {
         .toBe("src/deep/local.rs");
     });
 
-    it("leaves a 2015 leading :: unresolved when no target root covers the file", () => {
-      // A file outside every Cargo target has no root to count from, and a
-      // guess would be an edge rustc never draws.
+    it("answers a 2015 leading :: with a declared crate when the root has no such module", () => {
+      // Review finding on the branch's first cut: the walk from the root fell
+      // back on the root file whenever nothing matched, so the crate lookup
+      // after it never ran — a declared sibling lost its edge to the
+      // importer's own `lib.rs`, and a registry crate gained one. In 2015
+      // `extern crate foo;` at the root puts the crate at the root; the
+      // sibling resolves, the registry crate resolves to nothing, and a name
+      // rustc provides on its own — `core` — is not an item of this crate.
       const crates = rustProject({
-        "Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n',
-        "src/lib.rs": "",
-        "src/foo.rs": "",
-        "scratch/loose.rs": "",
+        "Cargo.toml": '[workspace]\nmembers = ["old", "foo"]\n',
+        "old/Cargo.toml": '[package]\nname = "old"\nedition = "2015"\n\n[dependencies]\nfoo = { path = "../foo" }\ncfg-if = "1"\n',
+        "old/src/lib.rs": "",
+        "old/src/bar.rs": "",
+        "old/src/deep/mod.rs": "",
+        "old/src/deep/child.rs": "",
+        "old/tests/it.rs": "",
+        "foo/Cargo.toml": '[package]\nname = "foo"\n',
+        "foo/src/lib.rs": "",
+        "foo/src/item.rs": "",
       });
 
-      expect(resolveRustImport("::foo::Item", "scratch/loose.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("::foo::item::Item", "old/src/deep/child.rs", fileSet, crates)).toBe("foo/src/item.rs");
+      expect(resolveRustImport("::foo", "old/src/deep/child.rs", fileSet, crates)).toBe("foo/src/lib.rs");
+      expect(resolveRustImport("::cfg_if::cfg_if", "old/src/deep/child.rs", fileSet, crates)).toBeNull();
+      expect(resolveRustImport("::core::fmt", "old/src/deep/child.rs", fileSet, crates)).toBeNull();
+      // A module of the root still wins, and an item of the root is the root.
+      expect(resolveRustImport("::bar::BarItem", "old/src/deep/child.rs", fileSet, crates)).toBe("old/src/bar.rs");
+      expect(resolveRustImport("::RootItem", "old/src/deep/child.rs", fileSet, crates)).toBe("old/src/lib.rs");
+      // An integration test reaches the library by its crate name.
+      expect(resolveRustImport("::old::bar::BarItem", "old/tests/it.rs", fileSet, crates)).toBe("old/src/bar.rs");
+    });
+
+    it("leaves a 2015 leading :: unresolved when no target root covers the file", () => {
+      // A file outside every Cargo target has no root to count from, and a
+      // guess would be an edge rustc never draws. `foo` is declared, so the
+      // fence is not what answers here: it is the missing root.
+      const crates = rustProject({
+        "Cargo.toml": '[workspace]\nmembers = ["app", "foo"]\n',
+        "app/Cargo.toml": '[package]\nname = "app"\nedition = "2015"\n\n[dependencies]\nfoo = { path = "../foo" }\n',
+        "app/src/lib.rs": "",
+        "app/scratch/loose.rs": "",
+        "foo/Cargo.toml": '[package]\nname = "foo"\n',
+        "foo/src/lib.rs": "",
+      });
+
+      expect(resolveRustImport("::foo::Item", "app/scratch/loose.rs", fileSet, crates)).toBeNull();
     });
 
     it("lets an unanchored path reach a module the file declares, and only then", () => {

@@ -547,8 +547,10 @@ describe("buildCodeGraph — Rust crate resolution", () => {
         "}",
       ].join("\n"),
 
+      // `app-core` declared, as rustc requires for the sibling to be in
+      // scope at all: a package reaches only the crates its manifest names.
       "crates/cli/Cargo.toml":
-        '[package]\nname = "app-cli"\nedition = "2021"\n\n[dependencies]\nserde = "1"\n',
+        '[package]\nname = "app-cli"\nedition = "2021"\n\n[dependencies]\nserde = "1"\napp-core = { path = "../core" }\n',
       "crates/cli/src/main.rs": [
         "mod runner;",
         "",

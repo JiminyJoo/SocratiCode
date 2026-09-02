@@ -1190,6 +1190,20 @@ export interface RustCrate {
    * library target, neither of which anything can import by name.
    */
   name: string | null;
+  /**
+   * `[package] name` with dashes turned into underscores, which is the name a
+   * dependency on this crate is declared under — while `name` above is what
+   * the code writes, and the two differ wherever `[lib] name` is set. Null for
+   * a manifest that declares no package.
+   */
+  packageName: string | null;
+  /**
+   * Set when the manifest could not be parsed. The crate still contributes its
+   * convention targets, but nothing is known about what it declares, and a
+   * check that reads "declares nothing" off an unread manifest would cost the
+   * package every cross-crate edge — one unreadable `Cargo.toml` must not.
+   */
+  manifestUnread?: true;
   /** Project-relative path of the library root module, when the crate has one. */
   libRoot: string | null;
   /**
@@ -1694,7 +1708,15 @@ export function buildRustCrateMap(fileSet: Set<string>, projectPath: string): Ru
       if (gitDeps.has(alias)) continue;
       if (patchedLocally.has(aliases[alias] ?? alias)) externalDeps.delete(alias);
     }
-    const crateEntry: RustCrate = { dir, name, libRoot, roots: [...roots].sort(), edition };
+    const crateEntry: RustCrate = {
+      dir,
+      name,
+      packageName: packageName?.replace(/-/g, "_") ?? null,
+      libRoot,
+      roots: [...roots].sort(),
+      edition,
+    };
+    if (manifest === null) crateEntry.manifestUnread = true;
     if (Object.keys(aliases).length > 0) {
       crateEntry.aliases = aliases;
     }
@@ -1820,6 +1842,13 @@ function resolveRustModulePath(
 }
 
 /**
+ * The crates rustc provides without any manifest declaring them: `std` and
+ * its two pieces, the proc-macro bridge, and the test harness. A path that
+ * names one reaches no file of this project, in any edition.
+ */
+const RUST_BUILTIN_CRATES = new Set(["std", "core", "alloc", "proc_macro", "test"]);
+
+/**
  * Resolve one Rust module path to the project file it names.
  *
  * `relSourceFile` is the importing file, project-relative and forward-slashed.
@@ -1904,23 +1933,49 @@ export function resolveRustImport(
     // across every crate of the project, so `use helper::Thing` drew an edge
     // into a sibling `helper` the manifest never named (review finding). The
     // one name a package reaches without declaring it is its own library,
-    // which its binaries, tests and examples import by that name. `aliases`
-    // holds every declared dependency under the name the code writes, renamed
-    // or not, so its keys are the fence. A file outside every manifest has
-    // no package to ask, and is left as it was.
-    if (
-      importingCrate &&
-      name !== importingCrate.name &&
-      !Object.hasOwn(importingCrate.aliases ?? {}, name)
-    ) {
-      return null;
+    // which its binaries, tests and examples import by that name.
+    //
+    // A dependency is declared under its package name (or an alias of it), but
+    // the code writes its *library* name, and the two differ wherever the
+    // dependency sets `[lib] name` — `rust-crypto` is imported as `crypto`. So
+    // the fence admits a name in two ways: it is a key of `aliases`, which
+    // holds every declared dependency under the name the code writes for it;
+    // or it is the library name of a project crate declared under its own
+    // package name — not renamed, since `tools = { package = "helper" }` puts
+    // the crate in scope as `tools` and nothing else. A manifest that could not be read
+    // declares nothing that can be known, and is not fenced at all — the
+    // alternative costs that package every cross-crate edge. A file outside
+    // every manifest has no package to ask, and is left as it was.
+    if (importingCrate && !importingCrate.manifestUnread && name !== importingCrate.name) {
+      const declared = Object.entries(importingCrate.aliases ?? {});
+      // Renamed, the alias is what cargo hands rustc as the crate's name.
+      const renamed = declared.some(([alias, target]) => alias !== target && alias === name);
+      // Declared under its own package name, the crate's name to rustc is its
+      // library name — cargo passes `--extern otherlib=…` for a dependency
+      // written `other = { path = "../other" }` whose `[lib] name` is
+      // `otherlib`, and `use other::Thing` is E0432 there. Where the project
+      // holds no crate of that package name, the dependency comes from outside
+      // and the package name is all that is known of it.
+      const plain = new Set(declared.filter(([alias, target]) => alias === target).map(([alias]) => alias));
+      const libraryOfPlain = crates.some(
+        (crate) => crate.name === name && crate.packageName !== null && plain.has(crate.packageName),
+      );
+      const plainFromOutside =
+        plain.has(name) && !crates.some((crate) => crate.packageName === name && crate.libRoot);
+      if (!renamed && !libraryOfPlain && !plainFromOutside) return null;
     }
     // `dep = { package = "real-name" }` renames a dependency for the crate
     // that declares it, and the code then writes the alias. The alias appears
     // in no `[package] name`, so without this the path resolved to nothing —
     // or worse, to a local module that happened to carry the alias.
     const declared = importingCrate?.aliases?.[name] ?? name;
-    const candidates = crates.filter((crate) => crate.name === declared && crate.libRoot);
+    // What the alias resolves to is a package name, and what the code wrote
+    // may be a library name; a crate answers to either. `dep = { path = "…",
+    // package = "other" }` where `other` sets `[lib] name = "otherlib"` reached
+    // nothing when only the library name was compared.
+    const candidates = crates.filter(
+      (crate) => (crate.name === declared || crate.packageName === declared) && crate.libRoot,
+    );
     if (candidates.length === 0) return null;
     return (
       candidates.sort((a, b) => {
@@ -1994,20 +2049,37 @@ export function resolveRustImport(
     // carried `#[path = "local.rs"] mod foo;` was answered with that local
     // file, while rustc reaches the root's `foo` — a review finding left open
     // from an earlier round. So the file's declaration map is not consulted
-    // at all here. The root module is tried first, and a crate the package
-    // declares second: in 2015 `extern crate foo;` at the root puts the crate
-    // there too, and a root that declares both is E0260, so only one exists.
-    // Without a target root there is nothing to count from, and the path is
-    // left unresolved rather than guessed.
-    if (globalMarker && edition2015) {
+    // at all here.
+    //
+    // Three things a name at the root can be, tried in this order. A module
+    // of the root, found by walking from the root's directory — with no file
+    // to fall back on, since a walk that lands on the root whenever nothing
+    // matches would answer every other case with the root too (found by
+    // review: it made the two branches below unreachable). A crate the package
+    // declares, which `extern crate foo;` at the root puts there — a root
+    // declaring both a module and a crate of one name is E0260, so only one
+    // exists; a registry crate is such a crate and resolves to nothing. And
+    // otherwise an item the root defines or re-exports — `use ::BrotliResult;`
+    // — which is the root file itself, unless the name is one of the crates
+    // rustc provides without any manifest: those are not items of this crate.
+    //
+    // A 2015 file outside every target has no root to count from, and is left
+    // unresolved rather than guessed.
+    if (globalMarker && importingCrate?.edition === "2015") {
       if (!own) return null;
-      const atRoot = resolveRustModulePath(own.moduleDir, segments, own.root, fileSet);
+      const atRoot = resolveRustModulePath(own.moduleDir, segments, null, fileSet);
       if (atRoot) return atRoot;
       const crate = crateNamed(head);
-      if (!crate?.libRoot) return null;
-      return segments.length === 1
-        ? crate.libRoot
-        : resolveRustModulePath(rustModuleDir(crate.libRoot, true), segments.slice(1), crate.libRoot, fileSet);
+      if (crate?.libRoot) {
+        return segments.length === 1
+          ? crate.libRoot
+          : resolveRustModulePath(rustModuleDir(crate.libRoot, true), segments.slice(1), crate.libRoot, fileSet);
+      }
+      const declaresIt =
+        importingCrate.externalDeps?.includes(head) ||
+        Object.hasOwn(importingCrate.aliases ?? {}, head) ||
+        RUST_BUILTIN_CRATES.has(head);
+      return declaresIt ? null : own.root;
     }
 
     // A bare specifier is a `mod foo;` declaration (see extractImports), which
