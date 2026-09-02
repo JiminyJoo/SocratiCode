@@ -34,38 +34,53 @@ function normalizePath(p: string): string {
   return stack.join("/");
 }
 
+const KNOWN_CODE_EXT =
+  /\.(?:[jt]sx?|m[jt]s|c[jt]s|py|rb|php|go|rs|java|kt|scala|cs|swift|dart|c|cpp|h|hpp|ex|exs|vue|svelte|lua|sh)$/i;
+
+function stripKnownExt(p: string): string {
+  const lastSlash = p.lastIndexOf("/");
+  const dir = lastSlash >= 0 ? p.slice(0, lastSlash + 1) : "";
+  const fileName = lastSlash >= 0 ? p.slice(lastSlash + 1) : p;
+  const stripped = fileName.replace(KNOWN_CODE_EXT, "");
+  return dir + stripped;
+}
+
 /** Resolve an import's module specifier to a dependency file path */
 function resolveDepFile(callerFile: string, sourceModule: string, deps: string[]): string | null {
   if (!sourceModule) return null;
   const callerDir = callerFile.includes("/") ? callerFile.slice(0, callerFile.lastIndexOf("/")) : "";
   const rawCombined = callerDir ? `${callerDir}/${sourceModule}` : sourceModule;
-  const normalized = normalizePath(rawCombined.replace(/^\.\//, "")).replace(/\.[a-zA-Z0-9]+$/, "");
-  const cleanSpec = sourceModule.replace(/^[./\\]+/, "").replace(/\.[a-zA-Z0-9]+$/, "");
+  const normalized = stripKnownExt(normalizePath(rawCombined.replace(/^\.\//, "")));
+  const cleanSpec = stripKnownExt(sourceModule.replace(/^[./\\]+/, ""));
 
   // Pass 1: exact normalized match or normalized/index
   for (const dep of deps) {
-    const depWithoutExt = dep.replace(/\.[a-zA-Z0-9]+$/, "");
+    const depWithoutExt = stripKnownExt(dep);
     if (depWithoutExt === normalized || depWithoutExt === `${normalized}/index`) {
       return dep;
     }
   }
 
-  // Pass 2: suffix match (e.g. relative subpath within dependency)
+  // Pass 2: suffix match (only if uniquely matched among dependencies)
+  const suffixMatches: string[] = [];
   for (const dep of deps) {
-    const depWithoutExt = dep.replace(/\.[a-zA-Z0-9]+$/, "");
+    const depWithoutExt = stripKnownExt(dep);
     if (
       depWithoutExt.endsWith(`/${cleanSpec}`) ||
       depWithoutExt.endsWith(`/${cleanSpec}/index`)
     ) {
-      return dep;
+      suffixMatches.push(dep);
     }
+  }
+  if (suffixMatches.length === 1) {
+    return suffixMatches[0];
   }
 
   // Fallback: match by basename if unique among dependencies
   const baseSpec = cleanSpec.split("/").pop();
   if (baseSpec) {
     const matches = deps.filter((d) => {
-      const depBase = d.split("/").pop()?.replace(/\.[a-zA-Z0-9]+$/, "");
+      const depBase = stripKnownExt(d.split("/").pop() ?? "");
       return depBase === baseSpec || d.includes(`/${baseSpec}/index.`);
     });
     if (matches.length === 1) return matches[0];

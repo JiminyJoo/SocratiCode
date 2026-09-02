@@ -488,6 +488,140 @@ describe("graph-symbol-resolution", () => {
     expect(edge?.calleeCandidates).toEqual(["src/button.ts::render#1"]);
   });
 
+  it("resolves modules located in dotted directories such as v1.0", () => {
+    const graph: CodeGraph = {
+      nodes: [
+        {
+          filePath: "/project/src/client.ts",
+          relativePath: "src/client.ts",
+          language: "typescript",
+          dependencies: ["src/api/v1.0/service.ts"],
+          imports: [],
+          exports: [],
+          dependents: [],
+        },
+        {
+          filePath: "/project/src/api/v1.0/service.ts",
+          relativePath: "src/api/v1.0/service.ts",
+          language: "typescript",
+          dependencies: [],
+          imports: [],
+          exports: [],
+          dependents: [],
+        },
+      ],
+      edges: [],
+    };
+
+    const symService: SymbolNode = {
+      id: "src/api/v1.0/service.ts::fetchData#1",
+      name: "fetchData",
+      qualifiedName: "fetchData",
+      kind: "function",
+      file: "src/api/v1.0/service.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+
+    const symbolsByFile = new Map<string, SymbolNode[]>([
+      ["src/api/v1.0/service.ts", [symService]],
+      ["src/client.ts", []],
+    ]);
+
+    const outgoing = new Map<string, SymbolEdge[]>([
+      [
+        "src/client.ts",
+        [
+          {
+            callerId: "src/client.ts::main#1",
+            calleeName: "fetchData",
+            kind: "call",
+            sourceModule: "./api/v1.0/service",
+            importedName: "fetchData",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/client.ts", line: 2 },
+          },
+        ],
+      ],
+    ]);
+
+    resolveCallSites(graph, symbolsByFile, outgoing);
+    const edge = outgoing.get("src/client.ts")?.[0];
+    expect(edge?.confidence).toBe("unique");
+    expect(edge?.calleeCandidates).toEqual(["src/api/v1.0/service.ts::fetchData#1"]);
+  });
+
+  it("does not arbitrarily resolve when suffix matches are ambiguous across dependencies", () => {
+    const graph: CodeGraph = {
+      nodes: [
+        {
+          filePath: "/project/src/app.ts",
+          relativePath: "src/app.ts",
+          language: "typescript",
+          dependencies: ["packages/pkg-a/utils.ts", "packages/pkg-b/utils.ts"],
+          imports: [],
+          exports: [],
+          dependents: [],
+        },
+        { filePath: "/project/packages/pkg-a/utils.ts", relativePath: "packages/pkg-a/utils.ts", language: "typescript", dependencies: [], imports: [], exports: [], dependents: [] },
+        { filePath: "/project/packages/pkg-b/utils.ts", relativePath: "packages/pkg-b/utils.ts", language: "typescript", dependencies: [], imports: [], exports: [], dependents: [] },
+      ],
+      edges: [],
+    };
+
+    const symA: SymbolNode = {
+      id: "packages/pkg-a/utils.ts::helper#1",
+      name: "helper",
+      qualifiedName: "helper",
+      kind: "function",
+      file: "packages/pkg-a/utils.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+    const symB: SymbolNode = {
+      id: "packages/pkg-b/utils.ts::helper#1",
+      name: "helper",
+      qualifiedName: "helper",
+      kind: "function",
+      file: "packages/pkg-b/utils.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+
+    const symbolsByFile = new Map<string, SymbolNode[]>([
+      ["packages/pkg-a/utils.ts", [symA]],
+      ["packages/pkg-b/utils.ts", [symB]],
+      ["src/app.ts", []],
+    ]);
+
+    const outgoing = new Map<string, SymbolEdge[]>([
+      [
+        "src/app.ts",
+        [
+          {
+            callerId: "src/app.ts::main#1",
+            calleeName: "helper",
+            kind: "call",
+            sourceModule: "utils",
+            importedName: "helper",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/app.ts", line: 2 },
+          },
+        ],
+      ],
+    ]);
+
+    resolveCallSites(graph, symbolsByFile, outgoing);
+    const edge = outgoing.get("src/app.ts")?.[0];
+    expect(edge?.confidence).toBe("unresolved");
+    expect(edge?.calleeCandidates).toHaveLength(0);
+  });
+
   it("computeUnresolvedPct returns 0 when no edges", () => {
     expect(computeUnresolvedPct(new Map())).toBe(0);
   });
