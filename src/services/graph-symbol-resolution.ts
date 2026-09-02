@@ -42,11 +42,18 @@ function resolveDepFile(callerFile: string, sourceModule: string, deps: string[]
   const normalized = normalizePath(rawCombined.replace(/^\.\//, "")).replace(/\.[a-zA-Z0-9]+$/, "");
   const cleanSpec = sourceModule.replace(/^[./\\]+/, "").replace(/\.[a-zA-Z0-9]+$/, "");
 
+  // Pass 1: exact normalized match or normalized/index
+  for (const dep of deps) {
+    const depWithoutExt = dep.replace(/\.[a-zA-Z0-9]+$/, "");
+    if (depWithoutExt === normalized || depWithoutExt === `${normalized}/index`) {
+      return dep;
+    }
+  }
+
+  // Pass 2: suffix match (e.g. relative subpath within dependency)
   for (const dep of deps) {
     const depWithoutExt = dep.replace(/\.[a-zA-Z0-9]+$/, "");
     if (
-      depWithoutExt === normalized ||
-      depWithoutExt === `${normalized}/index` ||
       depWithoutExt.endsWith(`/${cleanSpec}`) ||
       depWithoutExt.endsWith(`/${cleanSpec}/index`)
     ) {
@@ -107,8 +114,9 @@ export function resolveCallSites(
     symbolName: string,
     visited = new Set<string>(),
   ): string[] {
-    if (visited.has(targetFile)) return [];
-    visited.add(targetFile);
+    const visitKey = `${targetFile}::${symbolName}`;
+    if (visited.has(visitKey)) return [];
+    visited.add(visitKey);
 
     const candidates: string[] = [];
     const targetIdx = symbolIndexByFile.get(targetFile);

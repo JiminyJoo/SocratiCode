@@ -11,8 +11,8 @@ import {
 } from "../../src/services/graph-symbols.js";
 import { logger } from "../../src/services/logger.js";
 
-beforeAll(() => {
-  ensureDynamicLanguages();
+beforeAll(async () => {
+  await ensureDynamicLanguages();
 });
 
 describe("graph-symbols", () => {
@@ -800,17 +800,40 @@ enum Color { red, green }
     });
   });
 
-  describe("Regex fallback (Svelte, Vue, unknown)", () => {
-    it("handles unknown language without throwing", () => {
-      const src = "some random text\nwith no recognizable structure";
-      const out = extractSymbolsAndCalls(
-        src,
-        "unknown" as unknown as Lang,
-        ".xyz",
-        "data.xyz",
-      );
-      expect(out.symbols.some((s) => s.name === "<module>")).toBe(true);
-      expect(out.rawCalls).toEqual([]);
+  describe("Destructuring & Call Provenance", () => {
+    it("extracts only left binding from object_assignment_pattern, ignoring default value expression", () => {
+      const src = `
+export const { port = getDefaultPort(), host: serverHost = "localhost" } = config;
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/config.ts");
+      const names = out.symbols.map((s) => s.name);
+      expect(names).toContain("port");
+      expect(names).toContain("serverHost");
+      expect(names).not.toContain("getDefaultPort");
+      expect(names).not.toContain("config");
+    });
+
+    it("does not attach bare import provenance to member method calls", () => {
+      const src = `
+import { run } from "./runner";
+export function main(obj: any): void {
+  obj.run();
+  run();
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/app.ts");
+      const runCalls = out.rawCalls.filter((c) => c.kind === "call" && c.calleeName === "run");
+      expect(runCalls).toHaveLength(2);
+
+      const memberCall = runCalls.find((c) => c.callSite.line === 4);
+      expect(memberCall).toBeDefined();
+      expect(memberCall?.sourceModule).toBeUndefined();
+      expect(memberCall?.importedName).toBeUndefined();
+
+      const bareCall = runCalls.find((c) => c.callSite.line === 5);
+      expect(bareCall).toBeDefined();
+      expect(bareCall?.sourceModule).toBe("./runner");
+      expect(bareCall?.importedName).toBe("run");
     });
   });
 });

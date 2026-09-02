@@ -303,13 +303,13 @@ describe("graph-symbol-resolution", () => {
       [
         "src/barrelB.ts",
         [
-          // Circular re-export to A plus re-export to target
+          // Circular wildcard re-export to A plus wildcard re-export to target
           {
             callerId: "src/barrelB.ts::<module>#1",
-            calleeName: "other",
+            calleeName: "*",
             kind: "reexport",
             sourceModule: "./barrelA",
-            importedName: "other",
+            importedName: "*",
             calleeCandidates: [],
             confidence: "unresolved",
             callSite: { file: "src/barrelB.ts", line: 1 },
@@ -334,6 +334,154 @@ describe("graph-symbol-resolution", () => {
     expect(clientEdge).toBeDefined();
     expect(clientEdge?.confidence).toBe("unique");
     expect(clientEdge?.calleeCandidates).toEqual(["src/target.ts::helper#1"]);
+  });
+
+  it("resolves aliased named re-export when preceded by wildcard re-export from same dep", () => {
+    const graph: CodeGraph = {
+      nodes: [
+        { relativePath: "src/barrel.ts", language: "typescript", dependencies: ["src/dep.ts"] },
+        { relativePath: "src/dep.ts", language: "typescript", dependencies: [] },
+        { relativePath: "src/consumer.ts", language: "typescript", dependencies: ["src/barrel.ts"] },
+      ],
+      edges: [],
+    };
+
+    const symOriginal: SymbolNode = {
+      id: "src/dep.ts::computeCore#1",
+      name: "computeCore",
+      qualifiedName: "computeCore",
+      kind: "function",
+      file: "src/dep.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+
+    const symbolsByFile = new Map<string, SymbolNode[]>([
+      ["src/dep.ts", [symOriginal]],
+      ["src/barrel.ts", []],
+      ["src/consumer.ts", []],
+    ]);
+
+    const outgoing = new Map<string, SymbolEdge[]>([
+      [
+        "src/barrel.ts",
+        [
+          // 1. Wildcard re-export from dep
+          {
+            callerId: "src/barrel.ts::<module>#1",
+            calleeName: "*",
+            kind: "reexport",
+            sourceModule: "./dep",
+            importedName: "*",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/barrel.ts", line: 1 },
+          },
+          // 2. Aliased re-export from same dep: export { computeCore as customAlias } from './dep'
+          {
+            callerId: "src/barrel.ts::<module>#1",
+            calleeName: "customAlias",
+            kind: "reexport",
+            sourceModule: "./dep",
+            importedName: "computeCore",
+            localAlias: "customAlias",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/barrel.ts", line: 2 },
+          },
+        ],
+      ],
+      [
+        "src/consumer.ts",
+        [
+          {
+            callerId: "src/consumer.ts::main#1",
+            calleeName: "customAlias",
+            kind: "call",
+            sourceModule: "./barrel",
+            importedName: "customAlias",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/consumer.ts", line: 3 },
+          },
+        ],
+      ],
+    ]);
+
+    resolveCallSites(graph, symbolsByFile, outgoing);
+
+    const edge = outgoing.get("src/consumer.ts")?.[0];
+    expect(edge).toBeDefined();
+    expect(edge?.confidence).toBe("unique");
+    expect(edge?.calleeCandidates).toEqual(["src/dep.ts::computeCore#1"]);
+  });
+
+  it("prioritizes exact normalized module match over suffix match in resolveDepFile", () => {
+    const graph: CodeGraph = {
+      nodes: [
+        {
+          relativePath: "src/app.ts",
+          language: "typescript",
+          dependencies: ["src/button.ts", "src/components/button.ts"],
+        },
+        { relativePath: "src/button.ts", language: "typescript", dependencies: [] },
+        { relativePath: "src/components/button.ts", language: "typescript", dependencies: [] },
+      ],
+      edges: [],
+    };
+
+    const symButton: SymbolNode = {
+      id: "src/button.ts::render#1",
+      name: "render",
+      qualifiedName: "render",
+      kind: "function",
+      file: "src/button.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+    const symCompButton: SymbolNode = {
+      id: "src/components/button.ts::render#1",
+      name: "render",
+      qualifiedName: "render",
+      kind: "function",
+      file: "src/components/button.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+
+    const symbolsByFile = new Map<string, SymbolNode[]>([
+      ["src/button.ts", [symButton]],
+      ["src/components/button.ts", [symCompButton]],
+      ["src/app.ts", []],
+    ]);
+
+    const outgoing = new Map<string, SymbolEdge[]>([
+      [
+        "src/app.ts",
+        [
+          {
+            callerId: "src/app.ts::main#1",
+            calleeName: "render",
+            kind: "call",
+            sourceModule: "./button",
+            importedName: "render",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/app.ts", line: 2 },
+          },
+        ],
+      ],
+    ]);
+
+    resolveCallSites(graph, symbolsByFile, outgoing);
+
+    const edge = outgoing.get("src/app.ts")?.[0];
+    expect(edge).toBeDefined();
+    expect(edge?.confidence).toBe("unique");
+    expect(edge?.calleeCandidates).toEqual(["src/button.ts::render#1"]);
   });
 
   it("computeUnresolvedPct returns 0 when no edges", () => {

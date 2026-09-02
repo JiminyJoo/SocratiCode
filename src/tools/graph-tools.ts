@@ -543,13 +543,13 @@ async function dispatchGraphTool(
         lines.push("");
         lines.push(`Callers (${ctx.callers.length}):`);
         if (ctx.callers.length === 0) lines.push("  (none — possibly an entry point or unused)");
-        else for (const c of ctx.callers.slice(0, 30)) lines.push(`  ← ${c.file}:${c.line}`);
+        else for (const c of ctx.callers.slice(0, 30)) lines.push(`  ← ${c.file}:${c.line}${c.kind ? ` (${c.kind})` : ""}`);
         if (ctx.callers.length > 30) lines.push(`  ... and ${ctx.callers.length - 30} more`);
         lines.push("");
         lines.push(`Callees (${ctx.callees.length}):`);
         if (ctx.callees.length === 0) lines.push("  (none)");
         else for (const c of ctx.callees.slice(0, 30)) {
-          lines.push(`  → ${c.name} [${c.confidence}${c.resolved.length > 0 ? `, ${c.resolved.length} candidate(s)` : ""}]`);
+          lines.push(`  → ${c.name} [${c.confidence}${c.resolved.length > 0 ? `, ${c.resolved.length} candidate(s)` : ""}${c.kind ? `, ${c.kind}` : ""}]`);
         }
         if (ctx.callees.length > 30) lines.push(`  ... and ${ctx.callees.length - 30} more`);
         lines.push("---");

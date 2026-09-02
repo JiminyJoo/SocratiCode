@@ -272,6 +272,25 @@ describe("multi-part symbol shards (#99)", () => {
     );
   });
 
+  it("refuses a shard with invalid declared parts count (0, 1, or non-numeric)", async () => {
+    await saveNameShard(PROJ, "k", { sym: refsFor("sym", 1) });
+    const coll = store.get(INDEX_COLL);
+    const primary = pointsInIndex()[0];
+    expect(primary).toBeDefined();
+
+    // 1. parts: 0
+    coll?.set(String(primary.id), { ...primary, payload: { ...primary.payload, parts: 0, write: "w1" } });
+    await expect(loadNameShard(PROJ, "k")).rejects.toThrow(StorageReadError);
+
+    // 2. parts: 1 (only multipart >= 2 is valid when declared)
+    coll?.set(String(primary.id), { ...primary, payload: { ...primary.payload, parts: 1, write: "w1" } });
+    await expect(loadNameShard(PROJ, "k")).rejects.toThrow(StorageReadError);
+
+    // 3. parts: "two" (non-numeric)
+    coll?.set(String(primary.id), { ...primary, payload: { ...primary.payload, parts: "two", write: "w1" } });
+    await expect(loadNameShard(PROJ, "k")).rejects.toThrow(StorageReadError);
+  });
+
   it("throws a named error when one ENTRY alone exceeds a part budget", async () => {
     // One symbol name with an absurd number of references — the only shape
     // entry-level splitting cannot place. Must fail loudly by name.

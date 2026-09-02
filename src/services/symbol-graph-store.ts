@@ -352,7 +352,19 @@ async function loadShardPoints<V>(
   }
 
   const declared = payload?.parts;
-  const parts = typeof declared === "number" && declared > 1 ? declared : 1;
+  if (declared !== undefined) {
+    if (typeof declared !== "number" || !Number.isInteger(declared) || declared < 2) {
+      logger.warn("Multipart shard has a malformed header", {
+        ...logContext,
+        declaredParts: declared,
+      });
+      throw new StorageReadError("Multipart shard has a malformed header", {
+        ...logContext,
+        declaredParts: declared,
+      });
+    }
+  }
+  const parts = declared ?? 1;
   if (parts === 1) return first; // every pre-split graph, and most shards after
 
   // Fail closed on a malformed multipart header. Only saveShardPoints writes
@@ -360,7 +372,7 @@ async function loadShardPoints<V>(
   // identity, so a missing/non-integer/empty header here is corruption, and an
   // absent identity must not slide through as `undefined === undefined`.
   const writeId = payload?.write;
-  if (!Number.isInteger(parts) || typeof writeId !== "string" || writeId.length === 0) {
+  if (typeof writeId !== "string" || writeId.length === 0) {
     logger.warn("Multipart shard has a malformed header", {
       ...logContext,
       declaredParts: declared,
@@ -494,7 +506,11 @@ export async function loadSymbolGraphMeta(
     });
     if (points.length === 0) return null;
     const payload = points[0].payload;
-    return (payload?.meta as SymbolGraphMeta) ?? null;
+    const meta = (payload?.meta as SymbolGraphMeta) ?? null;
+    if (meta && meta.schemaVersion === undefined) {
+      meta.schemaVersion = 1;
+    }
+    return meta;
   } catch (err) {
     logger.warn("loadSymbolGraphMeta failed (returning null)", {
       projectId,

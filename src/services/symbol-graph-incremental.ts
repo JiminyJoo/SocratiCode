@@ -252,6 +252,22 @@ export async function updateChangedFilesSymbolGraph(
     }
 
     if (oldPayload) {
+      const oldSymbolIds = new Set(oldPayload.symbols.map((s) => s.id));
+      const newSymbolIds = new Set(newPayload.symbols.map((s) => s.id));
+      const symbolsChanged =
+        oldSymbolIds.size !== newSymbolIds.size ||
+        [...oldSymbolIds].some((id) => !newSymbolIds.has(id));
+
+      if (symbolsChanged) {
+        return {
+          filesChanged: filesChangedActual,
+          filesRemoved: filesRemovedActual,
+          symbolsDelta,
+          edgesDelta,
+          fullRebuildRequired: true,
+        };
+      }
+
       await applyRemoval(projectId, oldPayload, getNameShard, getReverseShard);
       symbolsDelta -= countNamedSymbols(oldPayload.symbols);
       edgesDelta -= oldPayload.outgoingCalls.length;

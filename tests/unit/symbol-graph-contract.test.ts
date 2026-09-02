@@ -51,10 +51,12 @@ import { rebuildGraph } from "../../src/services/code-graph.js";
 import { getImpactRadius, getSymbolContext } from "../../src/services/graph-impact.js";
 import { getSymbolGraphCache, resetSymbolGraphCacheRegistry } from "../../src/services/symbol-graph-cache.js";
 import {
+  loadSymbolGraphMeta,
   resetSymbolGraphCollectionCache,
   StorageReadError,
   saveSymbolGraphMeta,
 } from "../../src/services/symbol-graph-store.js";
+import { handleGraphTool } from "../../src/tools/graph-tools.js";
 
 describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
   let tmpDir: string;
@@ -64,7 +66,7 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     store.clear();
     resetSymbolGraphCollectionCache();
     resetSymbolGraphCacheRegistry();
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-contract-"));
+    tmpDir = path.resolve(fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-contract-")));
     projId = projectIdFromPath(tmpDir);
   });
 
@@ -252,6 +254,9 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     expect(ctx[0].callers).toHaveLength(1);
     expect(ctx[0].callers[0].file).toBe("src/target.ts");
     expect(ctx[0].callers[0].kind).toBe("call");
+
+    const toolOutput = await handleGraphTool("codebase_symbol", { name: "execute", projectPath: tmpDir });
+    expect(toolOutput).toContain("← src/target.ts:4 (call)");
   });
 
   it("handles schema v1 graphs safely with graph_upgrade_required", async () => {
@@ -265,6 +270,24 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     const impact = await getImpactRadius(cache, "dummy");
     expect(impact.status).toBe("graph_upgrade_required");
     expect(impact.totalFiles).toBe(0);
+  });
+
+  it("normalizes metadata without schemaVersion to 1 and triggers graph_upgrade_required", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "dummy.ts"), `export function dummy() {}`);
+
+    const { cache } = await runPipeline();
+    const { schemaVersion: _, ...legacyMeta } = cache.meta;
+    await saveSymbolGraphMeta(projId, legacyMeta as SymbolGraphMeta);
+
+    const loaded = await loadSymbolGraphMeta(projId);
+    expect(loaded).toBeDefined();
+    if (!loaded) throw new Error("Expected loaded meta to be defined");
+    expect(loaded.schemaVersion).toBe(1);
+
+    cache.meta = loaded;
+    const impact = await getImpactRadius(cache, "dummy");
+    expect(impact.status).toBe("graph_upgrade_required");
   });
 
   it("propagates storage read failures as storage_error (fail-closed)", async () => {

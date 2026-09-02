@@ -44,7 +44,7 @@ function extractBindingIdentifiers(node: any): Array<{ name: string; node: any }
     const value = node.field?.("value") ?? node.children?.()[2];
     return extractBindingIdentifiers(value);
   }
-  if (kind === "assignment_pattern") {
+  if (kind === "assignment_pattern" || kind === "object_assignment_pattern") {
     const left = node.field?.("left") ?? node.children?.()[0];
     return extractBindingIdentifiers(left);
   }
@@ -57,7 +57,7 @@ function extractBindingIdentifiers(node: any): Array<{ name: string; node: any }
     }
     return [];
   }
-  if (kind === "object_pattern" || kind === "array_pattern" || kind === "object_assignment_pattern") {
+  if (kind === "object_pattern" || kind === "array_pattern") {
     // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
     const result: Array<{ name: string; node: any }> = [];
     const kids = node.children?.() ?? [];
@@ -1126,10 +1126,11 @@ function extractFromTsLike(
   // 3. Call sites and instantiations
   for (const k of ["call_expression", "new_expression"]) {
     for (const node of safeFindAll(root, k)) {
-      let calleeName = extractCalleeNameJs(node.text());
-      if (!calleeName) continue;
-      const impInfo = localToImportInfo.get(calleeName);
-      const mapped = localToExportedName.get(calleeName);
+      const info = extractCalleeInfoJs(node.text());
+      if (!info) continue;
+      let calleeName = info.calleeName;
+      const impInfo = info.isBare ? localToImportInfo.get(calleeName) : undefined;
+      const mapped = info.isBare ? localToExportedName.get(calleeName) : undefined;
       const localAlias = mapped && mapped !== calleeName ? calleeName : undefined;
       if (mapped) {
         calleeName = mapped;
@@ -1237,19 +1238,36 @@ function extractFromTsLike(
     }
   }
 
-  return { symbols, rawCalls };
+  // Deduplicate rawCalls sharing (callerId, calleeName, kind, sourceModule) to keep graph compact
+  const dedupedCalls: ExtractedSymbols["rawCalls"] = [];
+  const seenCalls = new Set<string>();
+  for (const call of rawCalls) {
+    const key = `${call.callerId}::${call.calleeName}::${call.kind}::${call.sourceModule ?? ""}`;
+    if (!seenCalls.has(key)) {
+      seenCalls.add(key);
+      dedupedCalls.push(call);
+    }
+  }
+
+  return { symbols, rawCalls: dedupedCalls };
 }
 
-/** Pull the callee's bare name from the start of a call/new expression's text. */
-function extractCalleeNameJs(text: string): string | null {
+/** Pull the callee name and whether it was an unqualified bare identifier (not a member call). */
+function extractCalleeInfoJs(text: string): { calleeName: string; isBare: boolean } | null {
   const cleaned = text.replace(/^\s*new\s+/, "");
   // `foo(...)` → "foo"  ;  `obj.foo(...)` → "foo"  ;  `obj.bar.foo(...)` → "foo"
   const m = cleaned.match(/^([\w$.]+)\s*(?:\(|$)/);
   if (!m) return null;
   const chain = m[1];
+  const isBare = !chain.includes(".");
   const parts = chain.split(".");
   const last = parts[parts.length - 1];
-  return /^[A-Za-z_$][\w$]*$/.test(last) ? last : null;
+  return /^[A-Za-z_$][\w$]*$/.test(last) ? { calleeName: last, isBare } : null;
+}
+
+/** Pull the callee's bare name from the start of a call/new expression's text. */
+function extractCalleeNameJs(text: string): string | null {
+  return extractCalleeInfoJs(text)?.calleeName ?? null;
 }
 
 /**
