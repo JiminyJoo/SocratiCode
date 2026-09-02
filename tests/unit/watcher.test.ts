@@ -35,7 +35,7 @@ vi.mock("../../src/services/ignore.js", async (importOriginal) => ({
   // The marker test is the real one: it is what the watcher relies on to see
   // an environment appear or vanish, and a stub would prove nothing about it.
   ...(await importOriginal<typeof import("../../src/services/ignore.js")>()),
-  createIgnoreFilter: vi.fn(() => ({ ignores: () => false })),
+  createIgnoreFilter: vi.fn(() => ({ ignores: () => false, isEnvironmentRoot: () => false })),
   shouldIgnore: vi.fn(() => false),
 }));
 
@@ -420,86 +420,161 @@ describe("watcher (unit)", () => {
       vi.useRealTimers();
     });
 
-    it("schedules a reconcile when an environment marker appears, though nothing about it is indexable", async () => {
-      // Review finding. A `pyvenv.cfg` is not a source file, and once the
-      // environment exists its directory is excluded by the filter — so an
-      // event on the marker used to fail both checks and schedule nothing,
-      // leaving the environment's installed libraries in the index until some
-      // unrelated change came along. The marker is recognised before either
-      // check. Here the filter excludes everything, which is the harder case.
-      vi.useFakeTimers();
-      vi.mocked(shouldIgnore).mockReturnValue(true);
+    // ── Environments appearing and vanishing under the watcher ──────────
+    //
+    // Review finding: the filter was built once, at start, and the tree
+    // changes under a watcher. These run on a real directory, because the
+    // gate lets an event through only where the filter and the disk disagree
+    // — a stubbed path would prove nothing about that. `backend/env` rather
+    // than a root `env/`, since the native watcher never reports the latter
+    // (it is skipped at the top level, as `/env` is by the defaults).
+    describe("environments", () => {
+      let root: string;
+      const filterOf = (excluded: (relative: string) => boolean, roots: string[] = []) => ({
+        ignores: excluded,
+        isEnvironmentRoot: (relative: string) => roots.includes(relative.replace(/\/$/, "")),
+      });
+      const underEnv = (relative: string) =>
+        relative === "backend/env" || relative.startsWith("backend/env/");
+      const marker = () => path.join(root, "backend", "env", "pyvenv.cfg");
 
-      await startWatching(TEST_PROJECT);
+      beforeEach(() => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-watch-env-"));
+        vi.useFakeTimers();
+        vi.mocked(shouldIgnore).mockImplementation((ig, relative) => ig.ignores(relative));
+      });
 
-      mockSubscribeCallback?.(null, [
-        { path: path.join(RESOLVED_PROJECT, "crates", "venv", "backend", "env", "pyvenv.cfg"), type: "create" },
-      ]);
-      await vi.advanceTimersByTimeAsync(2100);
-      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+      afterEach(async () => {
+        vi.useRealTimers();
+        await stopAllWatchers();
+        vi.mocked(shouldIgnore).mockReturnValue(false);
+        vi.mocked(createIgnoreFilter).mockReset().mockImplementation(() => filterOf(() => false));
+        fs.rmSync(root, { recursive: true, force: true });
+      });
 
-      // Conda's marker is a directory, and its creation arrives as the files
-      // inside it.
-      mockSubscribeCallback?.(null, [
-        { path: path.join(RESOLVED_PROJECT, "tools", "env", "conda-meta", "history"), type: "create" },
-      ]);
-      await vi.advanceTimersByTimeAsync(2100);
-      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(2);
+      const updatesAfter = async (events: Array<{ path: string; type: "create" | "update" | "delete" }>) => {
+        mockSubscribeCallback?.(null, events);
+        await vi.advanceTimersByTimeAsync(2100);
+        return mockUpdateProjectIndex.mock.calls.length;
+      };
 
-      vi.useRealTimers();
-    });
+      it("schedules a reconcile when a marker appears, though nothing about it is indexable", async () => {
+        // A `pyvenv.cfg` is not a source file, so an event on it used to fail
+        // the indexability check and schedule nothing, leaving the
+        // environment's installed libraries in the index until some unrelated
+        // change came along.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(() => false));
+        await startWatching(root);
 
-    it("rebuilds its filter after each update, in both directions", async () => {
-      // Review finding. The filter was built once, at start, and the tree
-      // changes under a watcher: a virtualenv created afterwards kept
-      // scheduling updates for every file installed into it, and one removed
-      // kept hiding the source files that took its place. After each
-      // successful update the filter is read off the tree again.
-      vi.useFakeTimers();
-      vi.mocked(shouldIgnore).mockImplementation((ig, relative) => ig.ignores(relative));
-      const nothing = { ignores: () => false };
-      const envExcluded = { ignores: (relative: string) => relative.startsWith("env/") };
-      vi.mocked(createIgnoreFilter)
-        .mockReturnValueOnce(nothing)       // at start: no environment yet
-        .mockReturnValueOnce(envExcluded)   // after the update that saw it appear
-        .mockReturnValueOnce(nothing);      // after the update that saw it go
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+        expect(await updatesAfter([{ path: marker(), type: "create" }])).toBe(1);
 
-      await startWatching(TEST_PROJECT);
-      expect(createIgnoreFilter).toHaveBeenCalledTimes(1);
+        // Conda's marker is a directory, and its creation arrives as the
+        // files inside it.
+        const history = path.join(root, "tools", "env", "conda-meta", "history");
+        fs.mkdirSync(path.dirname(history), { recursive: true });
+        fs.writeFileSync(history, "");
+        expect(await updatesAfter([{ path: history, type: "create" }])).toBe(2);
+      });
 
-      // The environment appears: its marker schedules the update, and the
-      // filter rebuilt after it now excludes the directory.
-      mockSubscribeCallback?.(null, [
-        { path: path.join(RESOLVED_PROJECT, "env", "pyvenv.cfg"), type: "create" },
-      ]);
-      await vi.advanceTimersByTimeAsync(2100);
-      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
-      expect(createIgnoreFilter).toHaveBeenCalledTimes(2);
+      it("schedules a reconcile when a marker is deleted from a directory the filter excludes", async () => {
+        // Once the environment exists its directory is excluded, so the
+        // marker's deletion used to be dropped by the filter before anything
+        // looked at it — and the source files written in its place stayed
+        // hidden.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(underEnv, ["backend/env"]));
+        await startWatching(root);
 
-      // A library installed into it no longer schedules anything.
-      mockSubscribeCallback?.(null, [
-        { path: path.join(RESOLVED_PROJECT, "env", "lib", "dep.py"), type: "create" },
-      ]);
-      await vi.advanceTimersByTimeAsync(2100);
-      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+        expect(await updatesAfter([{ path: marker(), type: "delete" }])).toBe(1);
+      });
 
-      // The environment goes: the marker's deletion is seen through the
-      // exclusion, the update runs, and the filter rebuilt after it lets the
-      // source files written in its place through again.
-      mockSubscribeCallback?.(null, [
-        { path: path.join(RESOLVED_PROJECT, "env", "pyvenv.cfg"), type: "delete" },
-      ]);
-      await vi.advanceTimersByTimeAsync(2100);
-      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(2);
-      expect(createIgnoreFilter).toHaveBeenCalledTimes(3);
+      it("rebuilds its filter after each update, in both directions", async () => {
+        const nothing = filterOf(() => false);
+        const envExcluded = filterOf(underEnv, ["backend/env"]);
+        vi.mocked(createIgnoreFilter)
+          .mockReturnValueOnce(nothing)       // at start: no environment yet
+          .mockReturnValueOnce(envExcluded)   // after the update that saw it appear
+          .mockReturnValueOnce(nothing);      // after the update that saw it go
+        await startWatching(root);
+        expect(createIgnoreFilter).toHaveBeenCalledTimes(1);
 
-      mockSubscribeCallback?.(null, [
-        { path: path.join(RESOLVED_PROJECT, "env", "main.py"), type: "create" },
-      ]);
-      await vi.advanceTimersByTimeAsync(2100);
-      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(3);
+        // The environment appears: its marker schedules the update, and the
+        // filter rebuilt after it excludes the directory.
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+        expect(await updatesAfter([{ path: marker(), type: "create" }])).toBe(1);
+        expect(createIgnoreFilter).toHaveBeenCalledTimes(2);
 
-      vi.useRealTimers();
+        // A library installed into it no longer schedules anything.
+        const dep = path.join(root, "backend", "env", "lib", "dep.py");
+        fs.mkdirSync(path.dirname(dep), { recursive: true });
+        fs.writeFileSync(dep, "");
+        expect(await updatesAfter([{ path: dep, type: "create" }])).toBe(1);
+
+        // The environment goes: the marker's deletion is seen through the
+        // exclusion, the update runs, and the filter rebuilt after it lets
+        // the source files written in its place through again.
+        fs.rmSync(marker());
+        expect(await updatesAfter([{ path: marker(), type: "delete" }])).toBe(2);
+        expect(createIgnoreFilter).toHaveBeenCalledTimes(3);
+
+        const source = path.join(root, "backend", "env", "main.py");
+        fs.writeFileSync(source, "");
+        expect(await updatesAfter([{ path: source, type: "create" }])).toBe(3);
+      });
+
+      it("sees an environment moved away, which arrives as one event on its directory", async () => {
+        // Review finding. `mv env env.old` is reported by FSEvents and inotify
+        // as `delete env` and nothing on the marker inside it; the directory
+        // is not a marker and the filter excludes it, so the event was
+        // dropped and the filter stayed stale.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(underEnv, ["backend/env"]));
+        await startWatching(root);
+
+        expect(await updatesAfter([{ path: path.join(root, "backend", "env"), type: "delete" }])).toBe(1);
+      });
+
+      it("sees an environment moved into place, which arrives as one event on a directory it never heard of", async () => {
+        // The other half of a rename: one `create` on the directory, and the
+        // marker inside it produces nothing. The directory is asked for its
+        // marker on disk.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(() => false));
+        await startWatching(root);
+
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+        expect(await updatesAfter([{ path: path.join(root, "backend", "env"), type: "create" }])).toBe(1);
+
+        // A plain directory moved into place is not one.
+        const plain = path.join(root, "backend", "lib");
+        fs.mkdirSync(plain, { recursive: true });
+        expect(await updatesAfter([{ path: plain, type: "create" }])).toBe(1);
+      });
+
+      it("drops a marker event that changes nothing the filter answers", async () => {
+        // Review finding. `conda install` rewrites `conda-meta/` on every run,
+        // and `uv venv` rewrites `pyvenv.cfg`; in an environment the filter
+        // already excludes, each of those used to reconcile the whole tree.
+        // Present on disk and excluded by the filter is agreement, and
+        // agreement schedules nothing.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(underEnv, ["backend/env"]));
+        await startWatching(root);
+
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+        const history = path.join(root, "backend", "env", "conda-meta", "history");
+        fs.mkdirSync(path.dirname(history), { recursive: true });
+        fs.writeFileSync(history, "");
+        const installed = path.join(root, "backend", "env", "conda-meta", "numpy.json");
+        fs.writeFileSync(installed, "{}");
+
+        expect(await updatesAfter([
+          { path: marker(), type: "update" },
+          { path: history, type: "update" },
+          { path: installed, type: "create" },
+        ])).toBe(0);
+      });
     });
 
     it("ignores files outside the project tree", async () => {

@@ -81,10 +81,25 @@ const DEFAULT_IGNORE_PATTERNS = [
  * version, so an environment at `env?/` was scanned despite its marker
  * (review finding), while `\[`, `\*`, `\!`, `\#` and `\\` happened to work.
  * A prefix compare has no syntax to get wrong.
+ *
+ * The one thing the pattern route allowed that a bare prefix would not: a
+ * negation written later — `!tests/fixtures/sample-venv/**` in
+ * `.socraticodeignore`, for a checked-in fixture that any tool parsing
+ * `pyvenv.cfg` has — re-included the environment. That precedence is kept
+ * (review finding): a path an explicit negation claims is not excluded by a
+ * discovered prefix either. `unignored` is what the package answers exactly
+ * when a negative rule spoke last and no positive one stands over it.
  */
 export interface IgnoreFilter {
   /** Whether the path, relative to the project root, is excluded. */
   ignores(relativePath: string): boolean;
+  /**
+   * Whether the path, with or without its trailing slash, is the root of an
+   * environment the walk discovered. The watcher asks this of a directory
+   * event, since an environment moved away arrives as one event on the
+   * directory and nothing on the marker inside it.
+   */
+  isEnvironmentRoot(relativePath: string): boolean;
 }
 
 /**
@@ -139,8 +154,13 @@ export function createIgnoreFilter(projectPath: string): IgnoreFilter {
   }
 
   return {
-    ignores: (relativePath) =>
-      isUnderAnEnvironment(relativePath, environments) || ig.ignores(relativePath),
+    ignores: (relativePath) => {
+      const byPattern = ig.test(relativePath);
+      if (byPattern.unignored) return false;
+      return byPattern.ignored || isUnderAnEnvironment(relativePath, environments);
+    },
+    isEnvironmentRoot: (relativePath) =>
+      environments.includes(relativePath.endsWith("/") ? relativePath : `${relativePath}/`),
   };
 }
 
@@ -209,6 +229,24 @@ function isDirectory(candidate: string): boolean {
 }
 
 /**
+ * Whether the directory is an environment: it carries a marker, in the shape
+ * its tool writes it. Two markers, because two tools build these directories —
+ * `pyvenv.cfg` for a PEP 405 virtualenv, `conda-meta/` for a conda
+ * environment. Both hold installed libraries and neither is source.
+ *
+ * The shape matters. Merely existing is not enough: a source directory holding
+ * a file named `conda-meta` would otherwise disappear whole, and a discarded
+ * source file costs far more than a kept one.
+ *
+ * Shared with the watcher, which asks it of a directory that has just
+ * appeared: an environment moved into place arrives as one event on the
+ * directory, and nothing on the marker inside it.
+ */
+export function isEnvironmentDirectory(dirPath: string): boolean {
+  return isFile(path.join(dirPath, "pyvenv.cfg")) || isDirectory(path.join(dirPath, "conda-meta"));
+}
+
+/**
  * Walk the subdirectories once, collecting what the tree itself says should be
  * ignored: the rules of every nested .gitignore, and every environment
  * directory holding installed libraries.
@@ -220,8 +258,10 @@ function isDirectory(candidate: string): boolean {
  * They are matched at the project root only now, and the proof covers what that
  * anchoring gives up: a virtualenv nested deeper, whatever it is called.
  *
- * The extra cost is one `existsSync` per directory visited, in a walk that was
- * already making one for `.gitignore`.
+ * The extra cost is up to two `lstat` per directory visited — `pyvenv.cfg`,
+ * then `conda-meta` — in a walk that was already making an `existsSync` for
+ * `.gitignore`. Measured on a 1,916-directory registry cache: 121 ms for the
+ * whole filter against 125 ms on `main`, inside the noise.
  */
 function scanNestedIgnoreSources(
   rootPath: string,
@@ -244,17 +284,9 @@ function scanNestedIgnoreSources(
     const dirPath = path.join(currentPath, dirName);
 
     // Checked before the skip list below, which would otherwise walk past a
-    // `venv/` without ever looking inside it.
-    //
-    // Two markers, because two tools build these directories: `pyvenv.cfg` for
-    // a PEP 405 virtualenv, `conda-meta/` for a conda environment. Both hold
-    // installed libraries and neither is source.
-    //
-    // Each marker is checked in the shape its tool actually writes — a file for
-    // one, a directory for the other. Merely existing is not enough: a source
-    // directory holding a file named `conda-meta` would otherwise disappear
-    // whole, and a discarded source file costs far more than a kept one.
-    if (isFile(path.join(dirPath, "pyvenv.cfg")) || isDirectory(path.join(dirPath, "conda-meta"))) {
+    // `venv/` without ever looking inside it. See `isEnvironmentDirectory` for
+    // the two markers and why their shape matters.
+    if (isEnvironmentDirectory(dirPath)) {
       const relDir = path.relative(rootPath, dirPath).split(path.sep).join("/");
       // Kept as the literal prefix it is, never as a pattern — see
       // `IgnoreFilter`. A prefix is anchored by nature: `toolbox/` here is the

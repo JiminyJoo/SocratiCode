@@ -499,6 +499,43 @@ describe("ignore", () => {
     });
   });
 
+  describe("a negation against a discovered environment", () => {
+    it("re-includes it, as the pattern route used to", () => {
+      // Review finding. Kept as a bare prefix, a discovered environment had no
+      // override left: a checked-in fixture venv — any tool that parses
+      // `pyvenv.cfg` has one — could no longer be brought back by a negation
+      // in `.socraticodeignore`, where the pattern route honoured it. An
+      // explicit negation still wins.
+      fixture = createFixtureProject("ignore-negation-over-environment");
+      const venv = path.join(fixture.root, "tests", "fixtures", "sample-venv");
+      fs.mkdirSync(path.join(venv, "lib"), { recursive: true });
+      fs.writeFileSync(path.join(venv, "pyvenv.cfg"), "home = /usr\n");
+      fs.writeFileSync(
+        path.join(fixture.root, ".socraticodeignore"),
+        "!tests/fixtures/sample-venv/\n!tests/fixtures/sample-venv/**\n",
+      );
+      // A second environment, with no negation, stays excluded.
+      fs.mkdirSync(path.join(fixture.root, "backend", "env", "lib"), { recursive: true });
+      fs.writeFileSync(path.join(fixture.root, "backend", "env", "pyvenv.cfg"), "home = /usr\n");
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(shouldIgnore(ig, "tests/fixtures/sample-venv/lib/probe.py")).toBe(false);
+      expect(shouldIgnore(ig, "backend/env/lib/dep.py")).toBe(true);
+    });
+
+    it("names the roots it discovered, and nothing else", () => {
+      fixture = createFixtureProject("ignore-environment-roots");
+      fs.mkdirSync(path.join(fixture.root, "backend", "env"), { recursive: true });
+      fs.writeFileSync(path.join(fixture.root, "backend", "env", "pyvenv.cfg"), "home = /usr\n");
+
+      const ig = createIgnoreFilter(fixture.root);
+      expect(ig.isEnvironmentRoot("backend/env")).toBe(true);
+      expect(ig.isEnvironmentRoot("backend/env/")).toBe(true);
+      expect(ig.isEnvironmentRoot("backend")).toBe(false);
+      expect(ig.isEnvironmentRoot("backend/env/lib")).toBe(false);
+    });
+  });
+
   describe("isEnvironmentMarker", () => {
     it("names the two markers, at any depth and in either separator", () => {
       // What the watcher lets through ahead of its filter: a change here can

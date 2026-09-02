@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { AsyncSubscription, Event } from "@parcel/watcher";
@@ -13,7 +14,13 @@ import {
 } from "../constants.js";
 import { invalidateGraphCache } from "./code-graph.js";
 import { detectExtensionFromSource, readFileHead } from "./extensionless.js";
-import { createIgnoreFilter, isEnvironmentMarker, shouldIgnore } from "./ignore.js";
+import {
+  createIgnoreFilter,
+  type IgnoreFilter,
+  isEnvironmentDirectory,
+  isEnvironmentMarker,
+  shouldIgnore,
+} from "./ignore.js";
 import {
   profileExtensionLanguageMap,
   resolveEffectiveIndexProfile,
@@ -101,6 +108,57 @@ export async function isIndexableFile(
       });
     }
     return true;
+  }
+}
+
+/**
+ * Whether this event means an environment has appeared or vanished — which is
+ * to say, whether the ignore filter's answer for the tree has changed.
+ *
+ * Three shapes reach here, because the native watcher reports them
+ * differently. A marker written or deleted in place (`env/pyvenv.cfg`,
+ * `env/conda-meta/history`) is an event on the marker. An environment moved
+ * away (`mv env env.old`) is one event on the directory, `delete env`, and
+ * nothing on the marker inside it — FSEvents and inotify both report the
+ * renamed directory only — so a directory the filter knows as an environment
+ * root counts too. And one moved into place is one `create` on a directory the
+ * filter has never heard of, which is asked for its marker on disk.
+ *
+ * An event is let through only where the filter and the disk disagree: a
+ * marker present in a directory already excluded, or gone from one never
+ * excluded, changes nothing, and dropping it is what keeps `conda install` —
+ * which rewrites `conda-meta/` on every run — from reconciling the whole tree
+ * (review finding).
+ *
+ * The disk is consulted only where the name alone cannot answer: a marker or
+ * a known root, and a created path without an extension, which is the same
+ * rule `isIndexableFile` applies — a `.png` never costs a stat here either. An
+ * environment directory carrying a dot in its name and moved into place is
+ * the case this leaves to the next unrelated change.
+ */
+export function environmentChanged(event: Event, relative: string, ig: IgnoreFilter): boolean {
+  if (isEnvironmentMarker(relative) || ig.isEnvironmentRoot(relative)) {
+    const excluded = shouldIgnore(ig, relative);
+    return excluded !== (lstatOrNull(event.path) !== null);
+  }
+  if (event.type !== "create" || path.extname(event.path) !== "") return false;
+  return (
+    lstatOrNull(event.path)?.isDirectory() === true &&
+    isEnvironmentDirectory(event.path) &&
+    !shouldIgnore(ig, `${relative}/`)
+  );
+}
+
+/**
+ * Synchronous on purpose: the question is asked of a handful of paths per
+ * batch, and an answer that arrives through the event loop is one the debounce
+ * cannot be made to wait for.
+ */
+function lstatOrNull(filePath: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(filePath, { throwIfNoEntry: false }) ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -299,14 +357,14 @@ export async function startWatching(
                 // never triggers the async head-read (matches getIndexableFiles).
                 const relative = path.relative(resolvedPath, event.path);
                 if (!relative || relative.startsWith("..")) return null;
-                // An environment marker is neither indexable nor, once the
-                // environment exists, outside the filter — so it has to be
-                // recognised before either check. Its creation, change or
-                // removal changes what the filter should answer, and the
-                // reconciliation it schedules is what removes the files of a
-                // new environment from the index, or brings back the source
-                // files of a directory that has stopped being one.
-                if (isEnvironmentMarker(relative)) return event;
+                // An environment appearing or vanishing changes what the
+                // filter should answer, and the reconciliation it schedules is
+                // what removes a new environment's files from the index, or
+                // brings back the source files of a directory that has stopped
+                // being one. Neither event passes the checks below on its own
+                // — a marker is not indexable, and once the environment exists
+                // its directory is excluded — so they are recognised first.
+                if (environmentChanged(event, relative, ig)) return event;
                 if (shouldIgnore(ig, relative)) return null;
                 if (await isIndexableFile(event.path, effectiveExtensionLanguageMap)) return event;
                 // A previously-indexed extensionless file edited into readable
