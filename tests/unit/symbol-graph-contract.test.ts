@@ -14,31 +14,33 @@ interface StoredPoint {
 }
 const store = new Map<string, Map<string, StoredPoint>>();
 
+const clientInstance = {
+  getCollections: async () => ({
+    collections: Array.from(store.keys()).map((name) => ({ name })),
+  }),
+  createCollection: async (name: string) => {
+    if (!store.has(name)) store.set(name, new Map());
+  },
+  upsert: async (name: string, body: { points: StoredPoint[] }) => {
+    const coll = store.get(name) ?? new Map<string, StoredPoint>();
+    for (const p of body.points) coll.set(String(p.id), p);
+    store.set(name, coll);
+  },
+  retrieve: async (name: string, opts: { ids: Array<string | number> }) => {
+    const coll = store.get(name) ?? new Map<string, StoredPoint>();
+    return opts.ids.map((id) => coll.get(String(id))).filter((p): p is StoredPoint => p !== undefined);
+  },
+  delete: async (name: string, opts: { points: Array<string | number> }) => {
+    const coll = store.get(name);
+    if (coll) for (const id of opts.points) coll.delete(String(id));
+  },
+};
+
 vi.mock("../../src/services/qdrant.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../src/services/qdrant.js")>();
   return {
     ...actual,
-    getClient: () => ({
-      getCollections: async () => ({
-        collections: Array.from(store.keys()).map((name) => ({ name })),
-      }),
-      createCollection: async (name: string) => {
-        if (!store.has(name)) store.set(name, new Map());
-      },
-      upsert: async (name: string, body: { points: StoredPoint[] }) => {
-        const coll = store.get(name) ?? new Map<string, StoredPoint>();
-        for (const p of body.points) coll.set(String(p.id), p);
-        store.set(name, coll);
-      },
-      retrieve: async (name: string, opts: { ids: Array<string | number> }) => {
-        const coll = store.get(name) ?? new Map<string, StoredPoint>();
-        return opts.ids.map((id) => coll.get(String(id))).filter((p): p is StoredPoint => p !== undefined);
-      },
-      delete: async (name: string, opts: { points: Array<string | number> }) => {
-        const coll = store.get(name);
-        if (coll) for (const id of opts.points) coll.delete(String(id));
-      },
-    }),
+    getClient: () => clientInstance,
     saveGraphData: async () => {},
     loadGraphData: async () => null,
     deleteGraphData: async () => {},
@@ -49,8 +51,12 @@ vi.mock("../../src/services/qdrant.js", async (importOriginal) => {
 import { projectIdFromPath } from "../../src/config.js";
 import { rebuildGraph } from "../../src/services/code-graph.js";
 import { getImpactRadius, getSymbolContext } from "../../src/services/graph-impact.js";
+import { getClient } from "../../src/services/qdrant.js";
 import { getSymbolGraphCache, resetSymbolGraphCacheRegistry } from "../../src/services/symbol-graph-cache.js";
+import { updateChangedFilesSymbolGraph } from "../../src/services/symbol-graph-incremental.js";
 import {
+  deleteFilePayload,
+  loadFilePayload,
   loadSymbolGraphMeta,
   resetSymbolGraphCollectionCache,
   StorageReadError,
@@ -305,5 +311,30 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     const impact = await getImpactRadius(cache, "dummy");
     expect(impact.status).toBe("storage_error");
     expect(impact.message).toContain("Mock Qdrant shard connection failure");
+  });
+
+  it("throws StorageReadError from loadFilePayload and deleteFilePayload on retrieval/deletion errors", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "dummy.ts"), `export function dummy() {}`);
+    const { fileGraph } = await runPipeline();
+
+    const qdrant = getClient();
+    vi.spyOn(qdrant, "retrieve").mockRejectedValueOnce(new Error("Network timeout"));
+    await expect(loadFilePayload(projId, "src/dummy.ts")).rejects.toThrow(StorageReadError);
+
+    vi.spyOn(qdrant, "delete").mockRejectedValueOnce(new Error("Disk IO error"));
+    await expect(deleteFilePayload(projId, "src/dummy.ts")).rejects.toThrow(StorageReadError);
+
+    // Incremental update propagates storage failures on file payload retrieval
+    const meta = await loadSymbolGraphMeta(projId);
+    expect(meta).toBeDefined();
+    if (!meta) throw new Error("Expected meta to be defined");
+    vi.spyOn(qdrant, "retrieve")
+      .mockResolvedValueOnce([{ id: "meta", vector: [0], payload: { meta } }])
+      .mockRejectedValueOnce(new Error("Qdrant payload load error"));
+
+    await expect(
+      updateChangedFilesSymbolGraph(projId, tmpDir, fileGraph, ["src/dummy.ts"], []),
+    ).rejects.toThrow(StorageReadError);
   });
 });

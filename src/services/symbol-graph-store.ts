@@ -574,12 +574,16 @@ export async function loadFilePayload(
     if (points.length === 0) return null;
     return (points[0].payload?.filePayload as SymbolGraphFilePayload) ?? null;
   } catch (err) {
-    logger.warn("loadFilePayload failed (returning null)", {
+    logger.warn("loadFilePayload failed", {
       projectId,
       file: relativePath,
       error: err instanceof Error ? err.message : String(err),
     });
-    return null;
+    throw new StorageReadError("loadFilePayload failed", {
+      projectId,
+      file: relativePath,
+      cause: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
@@ -595,10 +599,15 @@ export async function deleteFilePayload(
       points: [filePointId(projectId, relativePath)],
     });
   } catch (err) {
-    logger.warn("deleteFilePayload failed (ignored)", {
+    logger.warn("deleteFilePayload failed", {
       projectId,
       file: relativePath,
       error: err instanceof Error ? err.message : String(err),
+    });
+    throw new StorageReadError("deleteFilePayload failed", {
+      projectId,
+      file: relativePath,
+      cause: err instanceof Error ? err.message : String(err),
     });
   }
 }
