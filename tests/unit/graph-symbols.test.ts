@@ -835,5 +835,29 @@ export function main(obj: any): void {
       expect(bareCall?.sourceModule).toBe("./runner");
       expect(bareCall?.importedName).toBe("run");
     });
+
+    it("extracts namespace re-export with export * as ns from './dep'", () => {
+      const src = `
+export * as utils from "./utils";
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/index.ts");
+      const reexport = out.rawCalls.find((c) => c.kind === "reexport");
+      expect(reexport).toBeDefined();
+      expect(reexport?.calleeName).toBe("utils");
+      expect(reexport?.localAlias).toBe("utils");
+      expect(reexport?.sourceModule).toBe("./utils");
+    });
+
+    it("does not emit self-referential value_reference for locally exported declaration lines", () => {
+      const src = `
+export function computeTotal(a: number, b: number): number {
+  return a + b;
+}
+export { computeTotal };
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/math.ts");
+      const valueRefs = out.rawCalls.filter((c) => c.kind === "value_reference" && c.calleeName === "computeTotal");
+      expect(valueRefs).toHaveLength(0);
+    });
   });
 });

@@ -241,10 +241,17 @@ export async function updateChangedFilesSymbolGraph(
     preparedChanges.push({ relPath, newPayload, oldPayload });
   }
 
-  // ── Process removed files ─────────────────────────────────────────────
+  // ── Pre-process removed files (load prior payloads before mutating) ───
+  const preparedRemovals: Array<{ relPath: string; oldPayload: SymbolGraphFilePayload }> = [];
   for (const relPath of removedRelPaths) {
     const oldPayload = await loadFilePayload(projectId, relPath);
-    if (!oldPayload) continue;
+    if (oldPayload) {
+      preparedRemovals.push({ relPath, oldPayload });
+    }
+  }
+
+  // ── Process removed files ─────────────────────────────────────────────
+  for (const { relPath, oldPayload } of preparedRemovals) {
     await applyRemoval(projectId, oldPayload, getNameShard, getReverseShard);
     await deleteFilePayload(projectId, relPath);
     symbolsDelta -= countNamedSymbols(oldPayload.symbols);
@@ -294,7 +301,6 @@ export async function updateChangedFilesSymbolGraph(
       0,
       meta.fileCount + filesChangedNew(changedRelPaths, removedRelPaths),
     ),
-    builtAt: Date.now(),
     // Note: unresolvedEdgePct is NOT recomputed incrementally — it's an
     // approximation from the last full rebuild plus rough delta. Acceptable
     // until the next full rebuild.

@@ -1093,13 +1093,15 @@ function extractFromTsLike(
     const sourceModule = sourceNode ? sourceNode.text().replace(/^['"`]|['"`]$/g, "") : undefined;
 
     const expText = exp.text();
-    if (sourceModule && /export\s+\*\s+from/.test(expText)) {
+    const starReexport = expText.match(/export\s+\*(?:\s+as\s+([\w$]+))?\s+from/);
+    if (sourceModule && starReexport) {
       rawCalls.push({
         callerId: moduleSym.id,
-        calleeName: "*",
+        calleeName: starReexport[1] ?? "*",
         kind: "reexport",
         sourceModule,
         importedName: "*",
+        localAlias: starReexport[1],
         callSite: { file, line },
       });
     }
@@ -1219,6 +1221,7 @@ function extractFromTsLike(
       if (!originalName) continue;
       const r = idNode.range();
       const line = r.start.line + 1;
+      if (declaredNamesAndLines.has(`${localName}#${line}`)) continue;
       const parentKind = idNode.parent()?.kind?.();
       // Skip import_specifier / import_clause / export_specifier definition sites themselves
       if (parentKind === "import_specifier" || parentKind === "import_clause" || parentKind === "export_specifier") {
