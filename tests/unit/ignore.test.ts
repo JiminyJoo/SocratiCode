@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createIgnoreFilter, shouldIgnore } from "../../src/services/ignore.js";
+import { createIgnoreFilter, isEnvironmentMarker, shouldIgnore } from "../../src/services/ignore.js";
 import { createFixtureProject, type FixtureProject } from "../helpers/fixtures.js";
 
 describe("ignore", () => {
@@ -496,6 +496,23 @@ describe("ignore", () => {
       const ig = createIgnoreFilter(fixture.root);
       // The fixture .gitignore includes "coverage/"
       expect(shouldIgnore(ig, "coverage/lcov.info")).toBe(true);
+    });
+  });
+
+  describe("isEnvironmentMarker", () => {
+    it("names the two markers, at any depth and in either separator", () => {
+      // What the watcher lets through ahead of its filter: a change here can
+      // change what the filter should answer, and nothing else can.
+      expect(isEnvironmentMarker("env/pyvenv.cfg")).toBe(true);
+      expect(isEnvironmentMarker("crates/venv/backend/env/pyvenv.cfg")).toBe(true);
+      expect(isEnvironmentMarker("tools/env/conda-meta")).toBe(true);
+      expect(isEnvironmentMarker("tools/env/conda-meta/history")).toBe(true);
+      expect(isEnvironmentMarker(["tools", "env", "conda-meta"].join(path.sep))).toBe(true);
+      // A file merely named after one, or a source file inside an environment,
+      // is an ordinary event.
+      expect(isEnvironmentMarker("docs/pyvenv.cfg.md")).toBe(false);
+      expect(isEnvironmentMarker("env/lib/dep.py")).toBe(false);
+      expect(isEnvironmentMarker("src/main.py")).toBe(false);
     });
   });
 });

@@ -13,7 +13,7 @@ import {
 } from "../constants.js";
 import { invalidateGraphCache } from "./code-graph.js";
 import { detectExtensionFromSource, readFileHead } from "./extensionless.js";
-import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
+import { createIgnoreFilter, isEnvironmentMarker, shouldIgnore } from "./ignore.js";
 import {
   profileExtensionLanguageMap,
   resolveEffectiveIndexProfile,
@@ -165,7 +165,13 @@ export async function startWatching(
     return false;
   }
 
-  const ig = createIgnoreFilter(resolvedPath);
+  // Replaceable, not built once: the filter's rules are read off the tree —
+  // nested .gitignore files, and the markers a Python or conda environment is
+  // recognised by — and the tree changes under a watcher. It is rebuilt after
+  // each successful update, so the events that follow are judged by what the
+  // tree holds now; a marker appearing or vanishing is let through to schedule
+  // that update in the first place (see the event filter below).
+  let ig = createIgnoreFilter(resolvedPath);
   const ignoreGlobs = buildIgnoreGlobs();
 
   // Reset error count
@@ -192,6 +198,11 @@ export async function startWatching(
             onProgress?.(
               `Auto-update: ${result.added} added, ${result.updated} updated, ${result.removed} removed`,
             );
+
+            // The update read the tree as it is now; the filter should too. An
+            // environment created since the last build is excluded from here
+            // on, and one removed stops hiding the source files in its place.
+            ig = createIgnoreFilter(resolvedPath);
 
             // Note: code graph rebuild is now handled inside updateProjectIndex itself
           } catch (err) {
@@ -288,6 +299,14 @@ export async function startWatching(
                 // never triggers the async head-read (matches getIndexableFiles).
                 const relative = path.relative(resolvedPath, event.path);
                 if (!relative || relative.startsWith("..")) return null;
+                // An environment marker is neither indexable nor, once the
+                // environment exists, outside the filter — so it has to be
+                // recognised before either check. Its creation, change or
+                // removal changes what the filter should answer, and the
+                // reconciliation it schedules is what removes the files of a
+                // new environment from the index, or brings back the source
+                // files of a directory that has stopped being one.
+                if (isEnvironmentMarker(relative)) return event;
                 if (shouldIgnore(ig, relative)) return null;
                 if (await isIndexableFile(event.path, effectiveExtensionLanguageMap)) return event;
                 // A previously-indexed extensionless file edited into readable

@@ -31,7 +31,10 @@ vi.mock("../../src/services/logger.js", () => ({
   },
 }));
 
-vi.mock("../../src/services/ignore.js", () => ({
+vi.mock("../../src/services/ignore.js", async (importOriginal) => ({
+  // The marker test is the real one: it is what the watcher relies on to see
+  // an environment appear or vanish, and a stub would prove nothing about it.
+  ...(await importOriginal<typeof import("../../src/services/ignore.js")>()),
   createIgnoreFilter: vi.fn(() => ({ ignores: () => false })),
   shouldIgnore: vi.fn(() => false),
 }));
@@ -75,7 +78,7 @@ vi.mock("../../src/services/lock.js", () => ({
 }));
 
 import { DETECT_HEAD_BYTES } from "../../src/constants.js";
-import { shouldIgnore } from "../../src/services/ignore.js";
+import { createIgnoreFilter, shouldIgnore } from "../../src/services/ignore.js";
 import { logger } from "../../src/services/logger.js";
 // Import after mocks
 import {
@@ -414,6 +417,88 @@ describe("watcher (unit)", () => {
 
       // All events were filtered by shouldIgnore, so no update
       expect(mockUpdateProjectIndex).not.toHaveBeenCalled();
+      vi.useRealTimers();
+    });
+
+    it("schedules a reconcile when an environment marker appears, though nothing about it is indexable", async () => {
+      // Review finding. A `pyvenv.cfg` is not a source file, and once the
+      // environment exists its directory is excluded by the filter — so an
+      // event on the marker used to fail both checks and schedule nothing,
+      // leaving the environment's installed libraries in the index until some
+      // unrelated change came along. The marker is recognised before either
+      // check. Here the filter excludes everything, which is the harder case.
+      vi.useFakeTimers();
+      vi.mocked(shouldIgnore).mockReturnValue(true);
+
+      await startWatching(TEST_PROJECT);
+
+      mockSubscribeCallback?.(null, [
+        { path: path.join(RESOLVED_PROJECT, "crates", "venv", "backend", "env", "pyvenv.cfg"), type: "create" },
+      ]);
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+
+      // Conda's marker is a directory, and its creation arrives as the files
+      // inside it.
+      mockSubscribeCallback?.(null, [
+        { path: path.join(RESOLVED_PROJECT, "tools", "env", "conda-meta", "history"), type: "create" },
+      ]);
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(2);
+
+      vi.useRealTimers();
+    });
+
+    it("rebuilds its filter after each update, in both directions", async () => {
+      // Review finding. The filter was built once, at start, and the tree
+      // changes under a watcher: a virtualenv created afterwards kept
+      // scheduling updates for every file installed into it, and one removed
+      // kept hiding the source files that took its place. After each
+      // successful update the filter is read off the tree again.
+      vi.useFakeTimers();
+      vi.mocked(shouldIgnore).mockImplementation((ig, relative) => ig.ignores(relative));
+      const nothing = { ignores: () => false };
+      const envExcluded = { ignores: (relative: string) => relative.startsWith("env/") };
+      vi.mocked(createIgnoreFilter)
+        .mockReturnValueOnce(nothing)       // at start: no environment yet
+        .mockReturnValueOnce(envExcluded)   // after the update that saw it appear
+        .mockReturnValueOnce(nothing);      // after the update that saw it go
+
+      await startWatching(TEST_PROJECT);
+      expect(createIgnoreFilter).toHaveBeenCalledTimes(1);
+
+      // The environment appears: its marker schedules the update, and the
+      // filter rebuilt after it now excludes the directory.
+      mockSubscribeCallback?.(null, [
+        { path: path.join(RESOLVED_PROJECT, "env", "pyvenv.cfg"), type: "create" },
+      ]);
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+      expect(createIgnoreFilter).toHaveBeenCalledTimes(2);
+
+      // A library installed into it no longer schedules anything.
+      mockSubscribeCallback?.(null, [
+        { path: path.join(RESOLVED_PROJECT, "env", "lib", "dep.py"), type: "create" },
+      ]);
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+
+      // The environment goes: the marker's deletion is seen through the
+      // exclusion, the update runs, and the filter rebuilt after it lets the
+      // source files written in its place through again.
+      mockSubscribeCallback?.(null, [
+        { path: path.join(RESOLVED_PROJECT, "env", "pyvenv.cfg"), type: "delete" },
+      ]);
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(2);
+      expect(createIgnoreFilter).toHaveBeenCalledTimes(3);
+
+      mockSubscribeCallback?.(null, [
+        { path: path.join(RESOLVED_PROJECT, "env", "main.py"), type: "create" },
+      ]);
+      await vi.advanceTimersByTimeAsync(2100);
+      expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(3);
+
       vi.useRealTimers();
     });
 

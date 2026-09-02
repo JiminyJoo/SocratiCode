@@ -145,6 +145,25 @@ export function createIgnoreFilter(projectPath: string): IgnoreFilter {
 }
 
 /**
+ * Whether a change at this path can change what the filter answers: it is one
+ * of the environment markers the walk looks for, or lies inside one.
+ *
+ * The rules a filter carries are read off the tree once, when it is built, and
+ * an environment is recognised by a file or directory that may appear or
+ * vanish while the tree is being watched. A watcher that ran every event
+ * through its filter first never saw either: a new `pyvenv.cfg` is not an
+ * indexable file, and the one being deleted sits under a directory the stale
+ * filter still excludes (review finding). The name is enough here — the event
+ * only schedules a reconciliation, and the rebuilt filter reads the shape.
+ * `conda-meta` is matched as any segment, since the directory's creation
+ * arrives with the files inside it.
+ */
+export function isEnvironmentMarker(relativePath: string): boolean {
+  const segments = relativePath.split(path.sep).join("/").split("/");
+  return segments[segments.length - 1] === "pyvenv.cfg" || segments.includes("conda-meta");
+}
+
+/**
  * Whether the path is one of the discovered environment directories or lies
  * beneath one. `environments` holds each as `dir/` relative to the root, so
  * `env?/lib/dep.py` and the directory itself, asked as `env?/` or `env?`, all
