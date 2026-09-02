@@ -162,7 +162,10 @@ export interface SymbolEdge {
   sourceModule?: string;
   /** Original imported or exported name in the source module */
   importedName?: string;
-  /** Local binding alias in the caller file (or exported alias `Y` in `export { X as Y }` for re-exports) */
+  /**
+   * Local binding alias in the caller file for import edges (e.g. `localFoo` in `import { foo as localFoo }`),
+   * or the exported alias for re-export edges (e.g. `Y` in `export { X as Y }` or `export * as Y from './mod'`).
+   */
   localAlias?: string;
   callSite: { file: string; line: number };
 }
