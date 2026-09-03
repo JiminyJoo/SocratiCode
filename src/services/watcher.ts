@@ -241,14 +241,14 @@ export async function startWatching(
   const ignoreGlobs = buildIgnoreGlobs();
 
   // While an update runs, `ig` is the state the tree had when it started, and
-  // an environment event arriving in that window cannot be judged against it:
-  // a marker created and then deleted mid-update looks like agreement — the
-  // stale filter excludes nothing, the disk holds nothing — while the update
-  // itself scanned with the marker in place and dropped the environment's
-  // files. So any environment event in that window is remembered, and exactly
-  // one reconciliation follows the update that was running (review finding).
+  // an environment event arriving in that window cannot be judged against it.
+  // Remember every update request instead of starting a competing update: the
+  // index lock makes that competing call a no-op, and it could otherwise clear
+  // the environment event that requires reconciliation. Exactly one update is
+  // scheduled after the active one finishes (review finding).
+  let watcherActive = true;
   let updateRunning = false;
-  let environmentMovedUnderUpdate = false;
+  let updateRequestedWhileRunning = false;
 
   // Reset error count
   watcherErrorCounts.set(resolvedPath, 0);
@@ -257,6 +257,12 @@ export async function startWatching(
 
   try {
     const scheduleUpdate = () => {
+      if (!watcherActive) return;
+      if (updateRunning) {
+        updateRequestedWhileRunning = true;
+        return;
+      }
+
       const existing = debounceTimers.get(resolvedPath);
       if (existing) clearTimeout(existing);
 
@@ -265,7 +271,6 @@ export async function startWatching(
         setTimeout(async () => {
           debounceTimers.delete(resolvedPath);
           updateRunning = true;
-          environmentMovedUnderUpdate = false;
           try {
             onProgress?.(`Detected changes, updating index for ${resolvedPath}...`);
 
@@ -296,13 +301,11 @@ export async function startWatching(
             }
           } finally {
             updateRunning = false;
-            // One follow-up for everything that moved under the update, and
-            // only when something did: the filter it will be judged against is
-            // the one just rebuilt, so this second pass sees the tree as it
-            // stands. It runs after a failed update too — the reversal is
-            // still unreconciled there.
-            if (environmentMovedUnderUpdate) {
-              environmentMovedUnderUpdate = false;
+            // One follow-up for all requests received during this update. It
+            // runs after a failed update too, where the changes are likewise
+            // unreconciled.
+            if (updateRequestedWhileRunning) {
+              updateRequestedWhileRunning = false;
               scheduleUpdate();
             }
           }
@@ -310,7 +313,7 @@ export async function startWatching(
       );
     };
 
-    const subscription = await watcher.subscribe(
+    const nativeSubscription = await watcher.subscribe(
       resolvedPath,
       async (err: Error | null, events: Event[]) => {
         if (err) {
@@ -401,7 +404,7 @@ export async function startWatching(
                   // neither answer can be trusted here — including "nothing
                   // changed". Remembered, and reconciled once when that update
                   // ends.
-                  environmentMovedUnderUpdate = true;
+                  updateRequestedWhileRunning = true;
                   return null;
                 }
                 if (environment === "changed") return event;
@@ -444,6 +447,16 @@ export async function startWatching(
         ignore: ignoreGlobs,
       },
     );
+
+    const subscription: AsyncSubscription = {
+      unsubscribe: async () => {
+        // Invalidate this closure before awaiting the native unsubscribe. An
+        // active update may finish during that await and must not schedule a
+        // deferred reconciliation after the watcher has stopped.
+        watcherActive = false;
+        await nativeSubscription.unsubscribe();
+      },
+    };
 
     subscriptions.set(resolvedPath, subscription);
     externalWatchCache.delete(resolvedPath);

@@ -658,6 +658,14 @@ describe("watcher (unit)", () => {
           // like nothing happened.
           fs.rmSync(marker());
           mockSubscribeCallback?.(null, [{ path: marker(), type: "delete" }]);
+
+          // An ordinary source event in the same window must join the pending
+          // reconciliation rather than start a competing update and clear the
+          // remembered environment reversal.
+          const source = path.join(root, "backend", "app.ts");
+          fs.writeFileSync(source, "export const value = 1;\n");
+          mockSubscribeCallback?.(null, [{ path: source, type: "update" }]);
+
           await vi.advanceTimersByTimeAsync(2100);
           // No second update while the first still holds the lock: that one
           // would return zeros and reconcile nothing.
@@ -679,6 +687,42 @@ describe("watcher (unit)", () => {
 
         // The filter was rebuilt after each of the two updates.
         expect(createIgnoreFilter).toHaveBeenCalledTimes(3);
+      });
+
+      it("drops a deferred reconciliation when the watcher stops", async () => {
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(() => false));
+        await startWatching(root);
+
+        let releaseUpdate: () => void = () => {};
+        const updateStarted = new Promise<void>((updateIsRunning) => {
+          mockUpdateProjectIndex.mockImplementationOnce(async () => {
+            updateIsRunning();
+            await new Promise<void>((resolve) => {
+              releaseUpdate = resolve;
+            });
+            return { added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false };
+          });
+        });
+
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+
+        vi.useFakeTimers();
+        try {
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "create" }]);
+          await vi.advanceTimersByTimeAsync(2100);
+          await updateStarted;
+
+          fs.rmSync(marker());
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "delete" }]);
+          await stopWatching(root);
+
+          releaseUpdate();
+          await vi.advanceTimersByTimeAsync(10_000);
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.useRealTimers();
+        }
       });
     });
 
