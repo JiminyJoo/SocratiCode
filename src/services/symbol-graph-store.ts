@@ -280,10 +280,18 @@ async function saveShardPoints<V>(
   record: Record<string, V>,
   what: string,
   payloadFor: (entries: Record<string, V>, part: number, parts: number) => Record<string, unknown>,
+  generation?: string,
 ): Promise<void> {
   const qdrant = getClient();
 
-  const single: SymgraphPoint = { id: primaryId, vector: [0], payload: payloadFor(record, 0, 1) };
+  const single: SymgraphPoint = {
+    id: primaryId,
+    vector: [0],
+    payload: {
+      ...payloadFor(record, 0, 1),
+      ...(generation !== undefined ? { generation } : {}),
+    },
+  };
   const parts =
     pointBytes(single) <= QDRANT_UPSERT_BUDGET_BYTES
       ? [record]
@@ -302,7 +310,11 @@ async function saveShardPoints<V>(
       : parts.map((entries, i) => ({
           id: i === 0 ? primaryId : shardPartPointId(primaryKey, i),
           vector: [0],
-          payload: { ...payloadFor(entries, i, parts.length), write: writeId },
+          payload: {
+            ...payloadFor(entries, i, parts.length),
+            write: writeId,
+            ...(generation !== undefined ? { generation } : {}),
+          },
         }));
 
   // How many continuation parts did the previous write leave? Read the old
@@ -542,7 +554,10 @@ export async function saveFilePayload(
   const point: SymgraphPoint = {
     id: filePointId(projectId, payload.file, generation),
     vector: [0],
-    payload: { filePayload: payload },
+    payload: {
+      filePayload: payload,
+      ...(generation !== undefined ? { generation } : {}),
+    },
   };
   assertPointFits(point, `symbol payload for ${payload.file}`);
   await qdrant.upsert(collName, { points: [point] });
@@ -565,7 +580,10 @@ export async function saveFilePayloads(
   const points: SymgraphPoint[] = payloads.map((p) => ({
     id: filePointId(projectId, p.file, generation),
     vector: [0],
-    payload: { filePayload: p },
+    payload: {
+      filePayload: p,
+      ...(generation !== undefined ? { generation } : {}),
+    },
   }));
   await upsertWithinBudget(collName, points, (i) => `symbol payload for ${payloads[i].file}`);
 }
@@ -655,6 +673,7 @@ export async function saveNameShard(
       parts === 1
         ? { kind: "name", shard: shardKey, nameToSymbols: entries }
         : { kind: "name", shard: shardKey, part, parts, nameToSymbols: entries },
+    generation,
   );
 }
 
@@ -708,6 +727,7 @@ export async function saveReverseShard(
       parts === 1
         ? { kind: "reverse", bucket, reverseEdges: entries }
         : { kind: "reverse", bucket, part, parts, reverseEdges: entries },
+    generation,
   );
 }
 
@@ -738,6 +758,105 @@ export async function loadReverseShard(
       `loadReverseShard failed for bucket ${bucket}: ${err instanceof Error ? err.message : String(err)}`,
       { projectId, bucket },
     );
+  }
+}
+
+// ── Generation lifecycle and cleanup ────────────────────────────────────
+
+/** Delete all points belonging to a specific generation from file and index collections. */
+export async function deleteGeneration(projectId: string, generation: string): Promise<void> {
+  if (!generation) return;
+  const qdrant = getClient();
+  const collNames = [
+    symgraphFileCollectionName(projectId),
+    symgraphIndexCollectionName(projectId),
+  ];
+  for (const collName of collNames) {
+    try {
+      await qdrant.delete(collName, {
+        wait: true,
+        filter: {
+          must: [{ key: "generation", match: { value: generation } }],
+        },
+      });
+    } catch (err) {
+      logger.warn("deleteGeneration: failed to delete points for generation", {
+        projectId,
+        generation,
+        collName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+}
+
+/** Find all distinct generation IDs present in storage for a project. */
+export async function listStoredGenerations(projectId: string): Promise<string[]> {
+  const qdrant = getClient();
+  const generations = new Set<string>();
+  const collNames = [
+    symgraphFileCollectionName(projectId),
+    symgraphIndexCollectionName(projectId),
+  ];
+
+  for (const collName of collNames) {
+    try {
+      let offset: string | number | Record<string, unknown> | undefined;
+      while (true) {
+        const res = await qdrant.scroll(collName, {
+          limit: 100,
+          with_payload: ["generation"],
+          with_vector: false,
+          offset: offset as string | number | undefined,
+        });
+        for (const pt of res.points) {
+          const gen = pt.payload?.generation;
+          if (typeof gen === "string" && gen.length > 0) {
+            generations.add(gen);
+          }
+        }
+        if (!res.next_page_offset) break;
+        offset = res.next_page_offset;
+      }
+    } catch {
+      // Collection may not exist yet
+    }
+  }
+  return Array.from(generations);
+}
+
+/**
+ * Remove points belonging to superseded or abandoned generations, keeping only activeGeneration.
+ */
+export async function cleanStaleGenerations(
+  projectId: string,
+  activeGeneration: string,
+): Promise<void> {
+  if (!activeGeneration) return;
+  const qdrant = getClient();
+  const collNames = [
+    symgraphFileCollectionName(projectId),
+    symgraphIndexCollectionName(projectId),
+  ];
+
+  for (const collName of collNames) {
+    try {
+      await qdrant.delete(collName, {
+        wait: true,
+        filter: {
+          must: [{ key: "generation", match: { except: [activeGeneration] } }],
+        },
+      });
+    } catch {
+      // Best-effort
+    }
+  }
+
+  const stored = await listStoredGenerations(projectId);
+  for (const gen of stored) {
+    if (gen !== activeGeneration) {
+      await deleteGeneration(projectId, gen);
+    }
   }
 }
 

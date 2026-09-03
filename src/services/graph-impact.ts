@@ -60,18 +60,6 @@ export async function getImpactRadius(
       ? "file"
       : "symbol";
 
-  if (cache.meta.schemaVersion < 2) {
-    return {
-      target,
-      targetKind,
-      depth: safeDepth,
-      filesByDepth: new Map(),
-      totalFiles: 0,
-      truncated: false,
-      status: "graph_upgrade_required",
-      message: `The symbol graph is schema v${cache.meta.schemaVersion ?? 1} (legacy / incomplete). Rebuild with codebase_graph_build before querying impact analysis.`,
-    };
-  }
 
   try {
     if (targetKind === "file") {
@@ -233,6 +221,101 @@ export async function getImpactRadius(
         };
       }
       selectedRefs = refs;
+    }
+
+    if (cache.meta.schemaVersion < 2) {
+      const reverseIndex = await cache.getReverseFileIndex();
+      const targetSymbolIds = new Set(selectedRefs.map((r) => r.id));
+      const distinctFiles = Array.from(new Set(selectedRefs.map((r) => r.file)));
+      const visitedFiles = new Set<string>(distinctFiles);
+      const filesByDepth = new Map<number, string[]>();
+
+      let frontierSymbolIds = new Set(targetSymbolIds);
+      let frontierFiles = new Set<string>(distinctFiles);
+      let truncated = false;
+
+      for (let hop = 1; hop <= safeDepth; hop++) {
+        const nextHopFiles = new Set<string>();
+        const nextSymbolIds = new Set<string>();
+        const nextFiles = new Set<string>();
+
+        for (const calleeFile of frontierFiles) {
+          const potentialCallerFiles = reverseIndex.get(calleeFile);
+          if (!potentialCallerFiles) continue;
+
+          for (const callerFile of potentialCallerFiles) {
+            const callerPayload = await cache.getFilePayload(callerFile);
+            if (!callerPayload) continue;
+
+            let matched = false;
+            for (const edge of callerPayload.outgoingCalls) {
+              const callsTarget = edge.calleeCandidates.some((candId) =>
+                frontierSymbolIds.has(candId),
+              );
+              if (callsTarget) {
+                matched = true;
+                nextSymbolIds.add(edge.callerId);
+              }
+            }
+
+            if (matched) {
+              if (!visitedFiles.has(callerFile)) {
+                nextHopFiles.add(callerFile);
+                visitedFiles.add(callerFile);
+              }
+              nextFiles.add(callerFile);
+            }
+          }
+        }
+
+        if (nextHopFiles.size === 0) break;
+        filesByDepth.set(hop, Array.from(nextHopFiles).sort());
+        frontierSymbolIds = nextSymbolIds;
+        frontierFiles = nextFiles;
+
+        if (hop === safeDepth) {
+          for (const calleeFile of frontierFiles) {
+            const potentialCallerFiles = reverseIndex.get(calleeFile);
+            if (!potentialCallerFiles) continue;
+            for (const callerFile of potentialCallerFiles) {
+              if (!visitedFiles.has(callerFile)) {
+                const cp = await cache.getFilePayload(callerFile);
+                if (cp?.outgoingCalls.some((e) => e.calleeCandidates.some((c) => frontierSymbolIds.has(c)))) {
+                  truncated = true;
+                  break;
+                }
+              }
+            }
+            if (truncated) break;
+          }
+        }
+      }
+
+      let totalFiles = 0;
+      for (const arr of filesByDepth.values()) totalFiles += arr.length;
+
+      if (totalFiles === 0 && isIncomplete) {
+        return {
+          target,
+          targetKind,
+          depth: safeDepth,
+          filesByDepth,
+          totalFiles: 0,
+          truncated: false,
+          status: "unsupported_or_incomplete",
+          message: `The symbol graph is incomplete (schema v${cache.meta.schemaVersion ?? 1} or incomplete language parser support). Rebuild with codebase_graph_build before relying on zero-dependent verification.`,
+        };
+      }
+
+      return {
+        target,
+        targetKind,
+        depth: safeDepth,
+        filesByDepth,
+        totalFiles,
+        truncated,
+        status: "ok",
+      };
     }
 
     const reverseSymbolIndex = await cache.getReverseSymbolIndex();
@@ -457,31 +540,52 @@ export async function getSymbolContext(
         kind: e.kind,
       }));
 
-    // Callers: query reverse symbol index for callers of this symbol
-    const callerIds = reverseSymbolIndex.get(sym.id) ?? new Set();
+    // Callers: query reverse symbol index for callers of this symbol (schema v2)
+    // or scan callerFiles from reverse file index (schema v1)
     const callers: SymbolContextCaller[] = [];
 
-    // Group callerIds by file so we fetch each payload at most once
-    const callerIdsByFile = new Map<string, string[]>();
-    for (const cId of callerIds) {
-      const cFile = symbolIdToFile(cId);
-      if (!cFile) continue;
-      const list = callerIdsByFile.get(cFile);
-      if (list) list.push(cId);
-      else callerIdsByFile.set(cFile, [cId]);
-    }
+    if (cache.meta.schemaVersion >= 2) {
+      const callerIds = reverseSymbolIndex.get(sym.id) ?? new Set();
 
-    for (const [cFile, cIds] of callerIdsByFile.entries()) {
-      const cp = await cache.getFilePayload(cFile);
-      if (!cp) continue;
-      for (const e of cp.outgoingCalls) {
-        if (e.calleeCandidates.includes(sym.id) && cIds.includes(e.callerId)) {
-          callers.push({
-            file: e.callSite.file,
-            line: e.callSite.line,
-            symbolId: e.callerId,
-            kind: e.kind,
-          });
+      // Group callerIds by file so we fetch each payload at most once
+      const callerIdsByFile = new Map<string, string[]>();
+      for (const cId of callerIds) {
+        const cFile = symbolIdToFile(cId);
+        if (!cFile) continue;
+        const list = callerIdsByFile.get(cFile);
+        if (list) list.push(cId);
+        else callerIdsByFile.set(cFile, [cId]);
+      }
+
+      for (const [cFile, cIds] of callerIdsByFile.entries()) {
+        const cp = await cache.getFilePayload(cFile);
+        if (!cp) continue;
+        for (const e of cp.outgoingCalls) {
+          if (e.calleeCandidates.includes(sym.id) && cIds.includes(e.callerId)) {
+            callers.push({
+              file: e.callSite.file,
+              line: e.callSite.line,
+              symbolId: e.callerId,
+              kind: e.kind,
+            });
+          }
+        }
+      }
+    } else {
+      const reverseIndex = await cache.getReverseFileIndex();
+      const callerFiles = reverseIndex.get(ref.file) ?? new Set();
+      for (const cf of callerFiles) {
+        const cp = await cache.getFilePayload(cf);
+        if (!cp) continue;
+        for (const e of cp.outgoingCalls) {
+          if (e.calleeCandidates.includes(sym.id)) {
+            callers.push({
+              file: e.callSite.file,
+              line: e.callSite.line,
+              symbolId: e.callerId,
+              kind: e.kind,
+            });
+          }
         }
       }
     }

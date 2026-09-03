@@ -29,7 +29,9 @@ import {
 } from "./symbol-graph-cache.js";
 import {
   allNameShardKeys,
+  cleanStaleGenerations,
   contentHashOf,
+  deleteGeneration,
   deleteSymbolGraphData,
   ensureSymbolGraphCollections,
   nameShardKey,
@@ -373,41 +375,55 @@ async function persistSymbolGraph(
     }
   }
 
-  // Persist all payloads and shards into the staged generation first
-  await saveFilePayloads(projectId, payloads, newGeneration);
-  for (const [shardKey, shard] of nameShards.entries()) {
-    if (Object.keys(shard).length === 0) continue;
-    await saveNameShard(projectId, shardKey, shard, newGeneration);
+  try {
+    // Persist all payloads and shards into the staged generation first
+    await saveFilePayloads(projectId, payloads, newGeneration);
+    for (const [shardKey, shard] of nameShards.entries()) {
+      if (Object.keys(shard).length === 0) continue;
+      await saveNameShard(projectId, shardKey, shard, newGeneration);
+    }
+    for (const [bucket, shard] of reverseShards.entries()) {
+      if (Object.keys(shard).length === 0) continue;
+      await saveReverseShard(projectId, bucket, shard, newGeneration);
+    }
+
+    // Activate that generation with one metadata-pointer write only after every staged write succeeds
+    const meta: SymbolGraphMeta = {
+      projectId,
+      symbolCount: totalSymbols,
+      edgeCount: totalEdges,
+      fileCount: symbolsByFile.size,
+      unresolvedEdgePct: computeUnresolvedPct(outgoingCallsByFile),
+      builtAt: Date.now(),
+      schemaVersion: 2,
+      generation: newGeneration,
+    };
+    await saveSymbolGraphMeta(projectId, meta);
+
+    // Replace cache entry
+    const cache = new SymbolGraphCache(projectId, meta);
+    setSymbolGraphCache(cache);
+
+    // Safely retire superseded generations and clean abandoned staged generations
+    await cleanStaleGenerations(projectId, newGeneration).catch((err) => {
+      logger.warn("Failed to clean stale symbol-graph generations", {
+        projectId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+
+    logger.info("Symbol graph persisted", {
+      projectId,
+      files: meta.fileCount,
+      symbols: meta.symbolCount,
+      edges: meta.edgeCount,
+      unresolvedPct: meta.unresolvedEdgePct.toFixed(1),
+    });
+  } catch (err) {
+    // Staging failed: clean up the incomplete staged generation immediately
+    await deleteGeneration(projectId, newGeneration).catch(() => {});
+    throw err;
   }
-  for (const [bucket, shard] of reverseShards.entries()) {
-    if (Object.keys(shard).length === 0) continue;
-    await saveReverseShard(projectId, bucket, shard, newGeneration);
-  }
-
-  // Activate that generation with one metadata-pointer write only after every staged write succeeds
-  const meta: SymbolGraphMeta = {
-    projectId,
-    symbolCount: totalSymbols,
-    edgeCount: totalEdges,
-    fileCount: symbolsByFile.size,
-    unresolvedEdgePct: computeUnresolvedPct(outgoingCallsByFile),
-    builtAt: Date.now(),
-    schemaVersion: 2,
-    generation: newGeneration,
-  };
-  await saveSymbolGraphMeta(projectId, meta);
-
-  // Replace cache entry
-  const cache = new SymbolGraphCache(projectId, meta);
-  setSymbolGraphCache(cache);
-
-  logger.info("Symbol graph persisted", {
-    projectId,
-    files: meta.fileCount,
-    symbols: meta.symbolCount,
-    edges: meta.edgeCount,
-    unresolvedPct: meta.unresolvedEdgePct.toFixed(1),
-  });
 }
 
 /**

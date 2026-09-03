@@ -17,6 +17,7 @@ import { getIndexingInProgressProjects, getPersistedIndexingStatus, indexProject
 import { getLockHolderPid, releaseAllLocks } from "./lock.js";
 import { logger } from "./logger.js";
 import { getProjectMetadata, listCodebaseCollections } from "./qdrant.js";
+import { cleanStaleGenerations, loadSymbolGraphMeta } from "./symbol-graph-store.js";
 import { isWatching, startWatching, stopAllWatchers } from "./watcher.js";
 
 /**
@@ -308,6 +309,16 @@ async function resumeProject(
       projectPath: resolvedPath,
       error: err instanceof Error ? err.message : String(err),
     });
+  }
+
+  // Retire any abandoned or superseded symbol graph generations left from previous sessions
+  try {
+    const meta = await loadSymbolGraphMeta(projectId);
+    if (meta?.generation) {
+      await cleanStaleGenerations(projectId, meta.generation);
+    }
+  } catch {
+    // Non-fatal
   }
 }
 

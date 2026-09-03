@@ -49,18 +49,9 @@ import {
   saveProjectMetadata,
   upsertPreEmbeddedChunks,
 } from "./qdrant.js";
-import { updateChangedFilesSymbolGraph } from "./symbol-graph-incremental.js";
-import { loadSymbolGraphMeta } from "./symbol-graph-store.js";
 
 export const FILE_SCAN_BATCH = 50; // Number of files to scan/chunk in parallel (I/O only, no network)
 
-/**
- * Phase F: maximum number of changed/removed files for which the watcher path
- * patches the symbol graph in-place rather than rebuilding it from scratch.
- * Above this threshold a full rebuild is faster than re-running per-file
- * extraction + shard merging, since most shards would be touched anyway.
- */
-const INCREMENTAL_SYMBOL_THRESHOLD = 50;
 
 /** State for tracking indexed files per project (loaded from Qdrant on first use) */
 const projectHashes = new Map<string, Map<string, string>>();
@@ -1455,58 +1446,20 @@ export async function updateProjectIndex(
 
   // Auto-rebuild code graph if any files changed (Phase F).
   //
-  // Strategy:
-  //   - If a symbol-graph already exists AND the change set is small
-  //     (≤ INCREMENTAL_SYMBOL_THRESHOLD files), do a fast file-import-graph
-  //     rebuild then patch the symbol graph per-file via
-  //     `updateChangedFilesSymbolGraph`.
-  //   - Otherwise fall back to a full `rebuildGraph()` that also rebuilds
-  //     the symbol graph end-to-end.
+  // While every changed or removed file requires a complete symbol-graph rebuild,
+  // bypass the incremental branch and perform one complete graph rebuild.
   if (added > 0 || updated > 0 || removed > 0) {
     progress.phase = "building code graph";
-    const projectId = projectIdFromPath(resolvedPath);
     const totalChanged = changedFiles.length + removedRelPaths.length;
-    const meta = await loadSymbolGraphMeta(projectId).catch(() => null);
-    const useIncremental = meta !== null && totalChanged <= INCREMENTAL_SYMBOL_THRESHOLD;
 
     try {
       onProgress?.(
-        useIncremental
-          ? `Building file graph + incrementally updating ${totalChanged} symbol payload(s)...`
+        totalChanged > 0
+          ? `Building code dependency graph (${totalChanged} file(s) changed, full rebuild)...`
           : "Building code dependency graph (full rebuild)...",
       );
-      const graph = await rebuildGraph(resolvedPath, { skipSymbolGraph: useIncremental });
+      const graph = await rebuildGraph(resolvedPath, { skipSymbolGraph: false });
       onProgress?.(`Code graph built: ${graph.nodes.length} files, ${graph.edges.length} edges`);
-
-      if (useIncremental) {
-        try {
-          const result = await updateChangedFilesSymbolGraph(
-            projectId,
-            resolvedPath,
-            graph,
-            changedFiles.map((f) => f.relativePath),
-            removedRelPaths,
-          );
-          if (result.fullRebuildRequired) {
-            // Meta vanished between checks — fall back to a full symbol rebuild.
-            onProgress?.("Symbol graph meta missing — falling back to full rebuild");
-            await rebuildGraph(resolvedPath, { skipSymbolGraph: false });
-          } else {
-            onProgress?.(
-              `Symbol graph patched: +${result.symbolsDelta} symbols, ` +
-                `+${result.edgesDelta} edges (${result.filesChanged} changed, ${result.filesRemoved} removed)`,
-            );
-          }
-        } catch (incErr) {
-          // Last-resort fallback: full rebuild. Never let watcher fail.
-          const incMsg = incErr instanceof Error ? incErr.message : String(incErr);
-          logger.warn("Incremental symbol-graph update failed; falling back to full rebuild", {
-            projectPath: resolvedPath,
-            error: incMsg,
-          });
-          await rebuildGraph(resolvedPath, { skipSymbolGraph: false });
-        }
-      }
     } catch (graphErr) {
       const graphMsg = graphErr instanceof Error ? graphErr.message : String(graphErr);
       logger.warn("Code graph build failed during incremental update (non-fatal)", { projectPath: resolvedPath, error: graphMsg });

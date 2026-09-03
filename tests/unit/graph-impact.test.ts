@@ -489,16 +489,57 @@ describe("graph-impact exact symbol traversal and fail-closed", () => {
     expect(result.targetKind).toBe("symbol");
   });
 
-  it("fails immediately with graph_upgrade_required when schemaVersion is 1", async () => {
+  it("supports legacy schema v1 graphs without mandatory rebuild", async () => {
+    const symCallee: SymbolNode = {
+      id: "src/serviceB.ts::callee#1",
+      name: "callee",
+      qualifiedName: "callee",
+      kind: "function",
+      file: "src/serviceB.ts",
+      line: 1,
+      endLine: 3,
+      language: "typescript",
+    };
     const cache = createMockCache({
-      symbols: [],
-      reverseFileIndex: new Map(),
-      filePayloads: new Map(),
+      symbols: [symCallee],
+      reverseFileIndex: new Map([["src/serviceB.ts", new Set(["src/serviceA.ts"])]]),
+      filePayloads: new Map([
+        [
+          "src/serviceB.ts",
+          { file: "src/serviceB.ts", language: "typescript", contentHash: "hb", symbols: [symCallee], outgoingCalls: [] },
+        ],
+        [
+          "src/serviceA.ts",
+          {
+            file: "src/serviceA.ts",
+            language: "typescript",
+            contentHash: "ha",
+            symbols: [],
+            outgoingCalls: [
+              {
+                callerId: "src/serviceA.ts::init#1",
+                calleeName: "callee",
+                calleeCandidates: ["src/serviceB.ts::callee#1"],
+                confidence: "unique",
+                callSite: { file: "src/serviceA.ts", line: 2 },
+              },
+            ],
+          },
+        ],
+      ]),
     });
     cache.meta.schemaVersion = 1;
 
-    const result = await getImpactRadius(cache, "someSymbol");
-    expect(result.status).toBe("graph_upgrade_required");
-    expect(result.totalFiles).toBe(0);
+    // Symbol query on schema v1: resolves caller file via legacy path
+    const symResult = await getImpactRadius(cache, "callee");
+    expect(symResult.status).toBe("ok");
+    expect(symResult.totalFiles).toBe(1);
+    expect(symResult.filesByDepth.get(1)).toEqual(["src/serviceA.ts"]);
+
+    // File query on schema v1: resolves caller file via reverseFileIndex
+    const fileResult = await getImpactRadius(cache, "src/serviceB.ts");
+    expect(fileResult.status).toBe("ok");
+    expect(fileResult.totalFiles).toBe(1);
+    expect(fileResult.filesByDepth.get(1)).toEqual(["src/serviceA.ts"]);
   });
 });

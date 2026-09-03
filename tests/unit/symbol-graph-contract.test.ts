@@ -30,9 +30,36 @@ const clientInstance = {
     const coll = store.get(name) ?? new Map<string, StoredPoint>();
     return opts.ids.map((id) => coll.get(String(id))).filter((p): p is StoredPoint => p !== undefined);
   },
-  delete: async (name: string, opts: { points: Array<string | number> }) => {
+  delete: async (name: string, opts: { points?: Array<string | number>; filter?: { must?: Array<{ key?: string; match?: { value?: string; except?: string[] } }> } }) => {
     const coll = store.get(name);
-    if (coll) for (const id of opts.points) coll.delete(String(id));
+    if (!coll) return;
+    if (opts.points) {
+      for (const id of opts.points) coll.delete(String(id));
+    }
+    if (opts.filter?.must) {
+      for (const cond of opts.filter.must) {
+        if (cond.key === "generation" && cond.match) {
+          if (cond.match.value !== undefined) {
+            for (const [id, pt] of Array.from(coll.entries())) {
+              if (pt.payload?.generation === cond.match.value) coll.delete(id);
+            }
+          } else if (cond.match.except !== undefined) {
+            for (const [id, pt] of Array.from(coll.entries())) {
+              if (pt.payload?.generation && !cond.match.except.includes(pt.payload.generation as string)) {
+                coll.delete(id);
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  scroll: async (name: string) => {
+    const coll = store.get(name) ?? new Map<string, StoredPoint>();
+    return {
+      points: Array.from(coll.values()),
+      next_page_offset: null,
+    };
   },
 };
 
@@ -56,6 +83,7 @@ import { getSymbolGraphCache, resetSymbolGraphCacheRegistry } from "../../src/se
 import { applyRemoval, updateChangedFilesSymbolGraph } from "../../src/services/symbol-graph-incremental.js";
 import {
   deleteFilePayload,
+  listStoredGenerations,
   loadFilePayload,
   loadNameShard,
   loadReverseShard,
@@ -270,22 +298,25 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     expect(toolOutput).toContain("← src/target.ts:4 (call)");
   });
 
-  it("handles schema v1 graphs safely with graph_upgrade_required", async () => {
+  it("supports schema v1 graphs safely without requiring rebuild before impact queries are usable", async () => {
     fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
     fs.writeFileSync(path.join(tmpDir, "src", "dummy.ts"), `export function dummy() {}`);
+    fs.writeFileSync(path.join(tmpDir, "src", "caller.ts"), `import { dummy } from "./dummy.js";\nexport function run() { dummy(); }`);
 
     const { cache } = await runPipeline();
     cache.meta.schemaVersion = 1;
     await saveSymbolGraphMeta(projId, cache.meta);
 
     const impact = await getImpactRadius(cache, "dummy");
-    expect(impact.status).toBe("graph_upgrade_required");
-    expect(impact.totalFiles).toBe(0);
+    expect(impact.status).toBe("ok");
+    expect(impact.totalFiles).toBe(1);
+    expect(impact.filesByDepth.get(1)).toEqual(["src/caller.ts"]);
   });
 
-  it("normalizes metadata without schemaVersion to 1 and triggers graph_upgrade_required", async () => {
+  it("normalizes metadata without schemaVersion to 1 and keeps impact queries usable", async () => {
     fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
     fs.writeFileSync(path.join(tmpDir, "src", "dummy.ts"), `export function dummy() {}`);
+    fs.writeFileSync(path.join(tmpDir, "src", "caller.ts"), `import { dummy } from "./dummy.js";\nexport function run() { dummy(); }`);
 
     const { cache } = await runPipeline();
     const { schemaVersion: _, ...legacyMeta } = cache.meta;
@@ -298,7 +329,9 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
 
     cache.meta = loaded;
     const impact = await getImpactRadius(cache, "dummy");
-    expect(impact.status).toBe("graph_upgrade_required");
+    expect(impact.status).toBe("ok");
+    expect(impact.totalFiles).toBe(1);
+    expect(impact.filesByDepth.get(1)).toEqual(["src/caller.ts"]);
   });
 
   it("propagates storage read failures as storage_error (fail-closed)", async () => {
@@ -508,5 +541,40 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     expect(readPayload?.symbols.some((s) => s.name === "alpha")).toBe(true);
     // Should NOT have beta from failed generation
     expect(readPayload?.symbols.some((s) => s.name === "beta")).toBe(false);
+
+    // Points from the failed staged build are cleaned up immediately
+    const storedGens = await listStoredGenerations(projId);
+    expect(storedGens).toEqual([meta1.generation]);
+  });
+
+  it("bounds storage across repeated successful rebuilds by retiring superseded generations", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "sample.ts"), `export function one() { return 1; }`);
+
+    // Build 1
+    const { cache: cache1 } = await runPipeline();
+    const gen1 = cache1.meta.generation;
+    expect(gen1).toBeDefined();
+    expect(await listStoredGenerations(projId)).toEqual([gen1]);
+
+    // Build 2
+    fs.writeFileSync(path.join(tmpDir, "src", "sample.ts"), `export function two() { return 2; }`);
+    await rebuildGraph(tmpDir);
+    const meta2 = await loadSymbolGraphMeta(projId);
+    const gen2 = meta2?.generation;
+    expect(gen2).toBeDefined();
+    expect(gen2).not.toBe(gen1);
+    // Superseded gen1 has been safely retired
+    expect(await listStoredGenerations(projId)).toEqual([gen2]);
+
+    // Build 3
+    fs.writeFileSync(path.join(tmpDir, "src", "sample.ts"), `export function three() { return 3; }`);
+    await rebuildGraph(tmpDir);
+    const meta3 = await loadSymbolGraphMeta(projId);
+    const gen3 = meta3?.generation;
+    expect(gen3).toBeDefined();
+    expect(gen3).not.toBe(gen2);
+    // Superseded gen2 has been safely retired
+    expect(await listStoredGenerations(projId)).toEqual([gen3]);
   });
 });
