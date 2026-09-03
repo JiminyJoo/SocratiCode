@@ -440,21 +440,31 @@ describe("watcher (unit)", () => {
 
       beforeEach(() => {
         root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-watch-env-"));
-        vi.useFakeTimers();
         vi.mocked(shouldIgnore).mockImplementation((ig, relative) => ig.ignores(relative));
       });
 
       afterEach(async () => {
-        vi.useRealTimers();
         await stopAllWatchers();
         vi.mocked(shouldIgnore).mockReturnValue(false);
         vi.mocked(createIgnoreFilter).mockReset().mockImplementation(() => filterOf(() => false));
         fs.rmSync(root, { recursive: true, force: true });
       });
 
+      // Fake timers live inside this call alone: the debounce is created and
+      // fired here, and nothing else in these tests needs a clock. Installed
+      // in `beforeEach` and restored in `afterEach`, they left vitest's own
+      // hook clock counting on the fake one, and on Node 18 every hook of the
+      // block was reported as timed out after it had already returned (CI
+      // finding); the rest of this file switches them inside the test body
+      // for the same reason.
       const updatesAfter = async (events: Array<{ path: string; type: "create" | "update" | "delete" }>) => {
-        mockSubscribeCallback?.(null, events);
-        await vi.advanceTimersByTimeAsync(2100);
+        vi.useFakeTimers();
+        try {
+          mockSubscribeCallback?.(null, events);
+          await vi.advanceTimersByTimeAsync(2100);
+        } finally {
+          vi.useRealTimers();
+        }
         return mockUpdateProjectIndex.mock.calls.length;
       };
 
