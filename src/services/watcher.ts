@@ -112,8 +112,10 @@ export async function isIndexableFile(
 }
 
 /**
- * Whether this event means an environment has appeared or vanished — which is
- * to say, whether the ignore filter's answer for the tree has changed.
+ * What this event says about an environment: that one has appeared or vanished
+ * (`"changed"` — the ignore filter's answer for the tree is now wrong), that it
+ * is about an environment but agrees with what the filter already says
+ * (`"touches"`), or that it is an ordinary event (`null`).
  *
  * Three shapes reach here, because the native watcher reports them
  * differently. A marker written or deleted in place (`env/pyvenv.cfg`,
@@ -124,11 +126,13 @@ export async function isIndexableFile(
  * root counts too. And one moved into place is one `create` on a directory the
  * filter has never heard of, which is asked for its marker on disk.
  *
- * An event is let through only where the filter and the disk disagree: a
- * marker present in a directory already excluded, or gone from one never
- * excluded, changes nothing, and dropping it is what keeps `conda install` —
- * which rewrites `conda-meta/` on every run — from reconciling the whole tree
- * (review finding).
+ * Agreement between the filter and the disk is `"touches"`, and on its own it
+ * schedules nothing: a marker present in a directory already excluded, or gone
+ * from one never excluded, changes nothing, and dropping it is what keeps
+ * `conda install` — which rewrites `conda-meta/` on every run — from
+ * reconciling the whole tree (review finding). It is told apart from an
+ * ordinary event all the same, because agreement is only trustworthy while the
+ * filter describes the tree: see the caller, where an update is running.
  *
  * Every created path is asked whether it is a directory, before anything is
  * read off its name: a directory may carry a dot — `backend/venv.3.12` moved
@@ -137,17 +141,20 @@ export async function isIndexableFile(
  * (review finding). One `lstat` per created path is the price, in a callback
  * that already stats every extensionless one.
  */
-export function environmentChanged(event: Event, relative: string, ig: IgnoreFilter): boolean {
+export function environmentEvent(
+  event: Event,
+  relative: string,
+  ig: IgnoreFilter,
+): "changed" | "touches" | null {
   if (isEnvironmentMarker(relative) || ig.isEnvironmentRoot(relative)) {
     const excluded = shouldIgnore(ig, relative);
-    return excluded !== (lstatOrNull(event.path) !== null);
+    return excluded !== (lstatOrNull(event.path) !== null) ? "changed" : "touches";
   }
-  if (event.type !== "create") return false;
-  return (
-    lstatOrNull(event.path)?.isDirectory() === true &&
-    isEnvironmentDirectory(event.path) &&
-    !shouldIgnore(ig, `${relative}/`)
-  );
+  if (event.type !== "create") return null;
+  if (lstatOrNull(event.path)?.isDirectory() !== true || !isEnvironmentDirectory(event.path)) {
+    return null;
+  }
+  return shouldIgnore(ig, `${relative}/`) ? "touches" : "changed";
 }
 
 /**
@@ -233,6 +240,16 @@ export async function startWatching(
   let ig = createIgnoreFilter(resolvedPath);
   const ignoreGlobs = buildIgnoreGlobs();
 
+  // While an update runs, `ig` is the state the tree had when it started, and
+  // an environment event arriving in that window cannot be judged against it:
+  // a marker created and then deleted mid-update looks like agreement — the
+  // stale filter excludes nothing, the disk holds nothing — while the update
+  // itself scanned with the marker in place and dropped the environment's
+  // files. So any environment event in that window is remembered, and exactly
+  // one reconciliation follows the update that was running (review finding).
+  let updateRunning = false;
+  let environmentMovedUnderUpdate = false;
+
   // Reset error count
   watcherErrorCounts.set(resolvedPath, 0);
 
@@ -247,6 +264,8 @@ export async function startWatching(
         resolvedPath,
         setTimeout(async () => {
           debounceTimers.delete(resolvedPath);
+          updateRunning = true;
+          environmentMovedUnderUpdate = false;
           try {
             onProgress?.(`Detected changes, updating index for ${resolvedPath}...`);
 
@@ -274,6 +293,17 @@ export async function startWatching(
             if (message.includes("ECONNREFUSED") || message.includes("fetch failed") || message.includes("Request Timeout")) {
               logger.warn("Infrastructure appears down, pausing watcher updates for 30s", { projectPath: resolvedPath });
               await new Promise((resolve) => setTimeout(resolve, 30_000));
+            }
+          } finally {
+            updateRunning = false;
+            // One follow-up for everything that moved under the update, and
+            // only when something did: the filter it will be judged against is
+            // the one just rebuilt, so this second pass sees the tree as it
+            // stands. It runs after a failed update too — the reversal is
+            // still unreconciled there.
+            if (environmentMovedUnderUpdate) {
+              environmentMovedUnderUpdate = false;
+              scheduleUpdate();
             }
           }
         }, DEBOUNCE_MS),
@@ -365,7 +395,16 @@ export async function startWatching(
                 // being one. Neither event passes the checks below on its own
                 // — a marker is not indexable, and once the environment exists
                 // its directory is excluded — so they are recognised first.
-                if (environmentChanged(event, relative, ig)) return event;
+                const environment = environmentEvent(event, relative, ig);
+                if (environment !== null && updateRunning) {
+                  // `ig` describes the tree the running update started from, so
+                  // neither answer can be trusted here — including "nothing
+                  // changed". Remembered, and reconciled once when that update
+                  // ends.
+                  environmentMovedUnderUpdate = true;
+                  return null;
+                }
+                if (environment === "changed") return event;
                 if (shouldIgnore(ig, relative)) return null;
                 if (await isIndexableFile(event.path, effectiveExtensionLanguageMap)) return event;
                 // A previously-indexed extensionless file edited into readable

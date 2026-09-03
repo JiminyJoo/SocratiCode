@@ -606,6 +606,80 @@ describe("watcher (unit)", () => {
           { path: installed, type: "create" },
         ])).toBe(0);
       });
+
+      it("reconciles once more when an environment reverses while the update runs", async () => {
+        // Review finding. While `updateProjectIndex` runs, the filter is the
+        // one that update started from, so an environment reversing in that
+        // window cannot be judged against it: here the marker is created and
+        // deleted while the first update scans, and to the stale filter the
+        // deletion reads as agreement — it excludes nothing, and the disk now
+        // holds nothing. What the old code did with it depended on the marker:
+        // dropped where it is not an indexable file, and where it is —
+        // `pyvenv.cfg` is — passed on to the debounce, which fired *while the
+        // first update was still running*. That second update takes the index
+        // lock's "already indexing" path, returns zeros and reconciles
+        // nothing, so the intermediate state stood until some later event.
+        // Either way the reversal was lost. Now such an event is remembered
+        // and one reconciliation follows the update it arrived under, with the
+        // rebuilt filter to judge it by.
+        const nothing = filterOf(() => false);
+        const envExcluded = filterOf(underEnv, ["backend/env"]);
+        vi.mocked(createIgnoreFilter)
+          .mockReturnValueOnce(nothing)        // at start
+          .mockReturnValueOnce(envExcluded)    // after the update that saw the marker
+          .mockReturnValueOnce(nothing);       // after the follow-up, marker gone again
+        await startWatching(root);
+
+        // The update is held open, so the reversal below lands squarely inside
+        // it rather than before or after.
+        let releaseUpdate: () => void = () => {};
+        const updateStarted = new Promise<void>((updateIsRunning) => {
+          mockUpdateProjectIndex.mockImplementationOnce(async () => {
+            updateIsRunning();
+            await new Promise<void>((resolve) => {
+              releaseUpdate = resolve;
+            });
+            return { added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false };
+          });
+        });
+
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+
+        vi.useFakeTimers();
+        try {
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "create" }]);
+          await vi.advanceTimersByTimeAsync(2100);
+          await updateStarted;
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+
+          // The environment goes away again while that update is still
+          // scanning. Judged against the filter it started from, this looks
+          // like nothing happened.
+          fs.rmSync(marker());
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "delete" }]);
+          await vi.advanceTimersByTimeAsync(2100);
+          // No second update while the first still holds the lock: that one
+          // would return zeros and reconcile nothing.
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+
+          releaseUpdate();
+          await vi.advanceTimersByTimeAsync(2100);
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(2);
+
+          // Exactly one: nothing moved under the second update, so it starts
+          // no third. This has to be asked on the same clock — a timer left
+          // pending when the fake one is put away never fires, and an
+          // unconditional follow-up would go unnoticed.
+          await vi.advanceTimersByTimeAsync(10_000);
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(2);
+        } finally {
+          vi.useRealTimers();
+        }
+
+        // The filter was rebuilt after each of the two updates.
+        expect(createIgnoreFilter).toHaveBeenCalledTimes(3);
+      });
     });
 
     it("ignores files outside the project tree", async () => {
