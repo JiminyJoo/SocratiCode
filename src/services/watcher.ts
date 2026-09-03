@@ -130,18 +130,19 @@ export async function isIndexableFile(
  * which rewrites `conda-meta/` on every run — from reconciling the whole tree
  * (review finding).
  *
- * The disk is consulted only where the name alone cannot answer: a marker or
- * a known root, and a created path without an extension, which is the same
- * rule `isIndexableFile` applies — a `.png` never costs a stat here either. An
- * environment directory carrying a dot in its name and moved into place is
- * the case this leaves to the next unrelated change.
+ * Every created path is asked whether it is a directory, before anything is
+ * read off its name: a directory may carry a dot — `backend/venv.3.12` moved
+ * into place is one `create` on it and nothing else — and a first cut that
+ * skipped the stat for a path with an extension dropped exactly that event
+ * (review finding). One `lstat` per created path is the price, in a callback
+ * that already stats every extensionless one.
  */
 export function environmentChanged(event: Event, relative: string, ig: IgnoreFilter): boolean {
   if (isEnvironmentMarker(relative) || ig.isEnvironmentRoot(relative)) {
     const excluded = shouldIgnore(ig, relative);
     return excluded !== (lstatOrNull(event.path) !== null);
   }
-  if (event.type !== "create" || path.extname(event.path) !== "") return false;
+  if (event.type !== "create") return false;
   return (
     lstatOrNull(event.path)?.isDirectory() === true &&
     isEnvironmentDirectory(event.path) &&

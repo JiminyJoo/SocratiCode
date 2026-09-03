@@ -552,6 +552,27 @@ describe("watcher (unit)", () => {
         expect(await updatesAfter([{ path: plain, type: "create" }])).toBe(1);
       });
 
+      it("sees a dot-named environment moved into place", async () => {
+        // Review finding. `backend/venv.3.12` moved in is one `create` on the
+        // directory; a first cut read the dot as a file extension and skipped
+        // the stat, so the event was dropped and the environment's files
+        // stayed indexed until something unrelated changed. Every created
+        // path is asked whether it is a directory first.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(() => false));
+        await startWatching(root);
+
+        const dotted = path.join(root, "backend", "venv.3.12");
+        fs.mkdirSync(dotted, { recursive: true });
+        fs.writeFileSync(path.join(dotted, "pyvenv.cfg"), "home = /usr\n");
+        expect(await updatesAfter([{ path: dotted, type: "create" }])).toBe(1);
+
+        // A created *file* with an extension still costs one stat and no more:
+        // it is not a directory, and nothing else is asked of it here.
+        const image = path.join(root, "backend", "logo.png");
+        fs.writeFileSync(image, "");
+        expect(await updatesAfter([{ path: image, type: "create" }])).toBe(1);
+      });
+
       it("drops a marker event that changes nothing the filter answers", async () => {
         // Review finding. `conda install` rewrites `conda-meta/` on every run,
         // and `uv venv` rewrites `pyvenv.cfg`; in an environment the filter
