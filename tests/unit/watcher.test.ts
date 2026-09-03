@@ -689,6 +689,56 @@ describe("watcher (unit)", () => {
         expect(createIgnoreFilter).toHaveBeenCalledTimes(3);
       });
 
+      it("remembers an environment reversal that arrives with nothing else", async () => {
+        // The twin of the test above, with the ordinary source event left out.
+        // An environment event never reaches `scheduleUpdate` — the filter
+        // answers it and returns null — so the remembering it does for itself
+        // is the only thing that carries the reversal to the follow-up. With
+        // the source event beside it, `scheduleUpdate` sets the same flag and
+        // hides whether that path works at all: found by mutating it away and
+        // watching the suite stay green.
+        const nothing = filterOf(() => false);
+        const envExcluded = filterOf(underEnv, ["backend/env"]);
+        vi.mocked(createIgnoreFilter)
+          .mockReturnValueOnce(nothing)
+          .mockReturnValueOnce(envExcluded)
+          .mockReturnValueOnce(nothing);
+        await startWatching(root);
+
+        let releaseUpdate: () => void = () => {};
+        const updateStarted = new Promise<void>((updateIsRunning) => {
+          mockUpdateProjectIndex.mockImplementationOnce(async () => {
+            updateIsRunning();
+            await new Promise<void>((resolve) => {
+              releaseUpdate = resolve;
+            });
+            return { added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false };
+          });
+        });
+
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+
+        vi.useFakeTimers();
+        try {
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "create" }]);
+          await vi.advanceTimersByTimeAsync(2100);
+          await updateStarted;
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+
+          fs.rmSync(marker());
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "delete" }]);
+          await vi.advanceTimersByTimeAsync(2100);
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+
+          releaseUpdate();
+          await vi.advanceTimersByTimeAsync(2100);
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(2);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
       it("drops a deferred reconciliation when the watcher stops", async () => {
         vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(() => false));
         await startWatching(root);
