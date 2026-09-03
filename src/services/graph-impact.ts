@@ -240,8 +240,8 @@ export async function getImpactRadius(
         const nextFiles = new Set<string>();
 
         for (const calleeFile of frontierFiles) {
-          const potentialCallerFiles = reverseIndex.get(calleeFile);
-          if (!potentialCallerFiles) continue;
+          const potentialCallerFiles = new Set(reverseIndex.get(calleeFile) ?? []);
+          potentialCallerFiles.add(calleeFile);
 
           for (const callerFile of potentialCallerFiles) {
             const callerPayload = await cache.getFilePayload(callerFile);
@@ -275,8 +275,8 @@ export async function getImpactRadius(
 
         if (hop === safeDepth) {
           for (const calleeFile of frontierFiles) {
-            const potentialCallerFiles = reverseIndex.get(calleeFile);
-            if (!potentialCallerFiles) continue;
+            const potentialCallerFiles = new Set(reverseIndex.get(calleeFile) ?? []);
+            potentialCallerFiles.add(calleeFile);
             for (const callerFile of potentialCallerFiles) {
               if (!visitedFiles.has(callerFile)) {
                 const cp = await cache.getFilePayload(callerFile);
@@ -573,7 +573,8 @@ export async function getSymbolContext(
       }
     } else {
       const reverseIndex = await cache.getReverseFileIndex();
-      const callerFiles = reverseIndex.get(ref.file) ?? new Set();
+      const callerFiles = new Set(reverseIndex.get(ref.file) ?? []);
+      callerFiles.add(ref.file);
       for (const cf of callerFiles) {
         const cp = await cache.getFilePayload(cf);
         if (!cp) continue;

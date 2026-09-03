@@ -638,4 +638,57 @@ describe("graph-symbol-resolution", () => {
     ]);
     expect(computeUnresolvedPct(map)).toBe(50);
   });
+
+  it("does not resolve an internal helper through an aliased namespace re-export barrel", () => {
+    const graph: CodeGraph = {
+      nodes: [
+        { relativePath: "src/index.ts", imports: ["./helpers"], exports: ["utils"], dependencies: ["src/helpers.ts"], dependents: ["src/app.ts"] },
+        { relativePath: "src/helpers.ts", imports: [], exports: ["secret"], dependencies: [], dependents: ["src/index.ts"] },
+        { relativePath: "src/app.ts", imports: ["./index"], exports: [], dependencies: ["src/index.ts"], dependents: [] },
+      ],
+      edges: [],
+    };
+    const symbolsByFile = new Map<string, SymbolNode[]>([
+      ["src/index.ts", [{ id: "src/index.ts::<module>#1", name: "<module>", qualifiedName: "<module>", kind: "function", file: "src/index.ts", line: 1, endLine: 1, language: "typescript" }]],
+      ["src/helpers.ts", [{ id: "src/helpers.ts::secret#1", name: "secret", qualifiedName: "secret", kind: "function", file: "src/helpers.ts", line: 1, endLine: 3, language: "typescript" }]],
+      ["src/app.ts", [{ id: "src/app.ts::main#1", name: "main", qualifiedName: "main", kind: "function", file: "src/app.ts", line: 1, endLine: 5, language: "typescript" }]],
+    ]);
+    const outgoing = new Map<string, SymbolEdge[]>([
+      [
+        "src/index.ts",
+        [
+          {
+            callerId: "src/index.ts::<module>#1",
+            calleeName: "utils",
+            kind: "reexport",
+            sourceModule: "./helpers",
+            localAlias: "utils",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/index.ts", line: 1 },
+          },
+        ],
+      ],
+      [
+        "src/app.ts",
+        [
+          {
+            callerId: "src/app.ts::main#1",
+            calleeName: "secret",
+            kind: "call",
+            sourceModule: "./index",
+            importedName: "secret",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/app.ts", line: 2 },
+          },
+        ],
+      ],
+    ]);
+
+    resolveCallSites(graph, symbolsByFile, outgoing);
+    const appEdge = outgoing.get("src/app.ts")?.[0];
+    expect(appEdge?.confidence).toBe("unresolved");
+    expect(appEdge?.calleeCandidates).toHaveLength(0);
+  });
 });

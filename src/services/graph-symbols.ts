@@ -48,6 +48,10 @@ function extractBindingIdentifiers(node: any): Array<{ name: string; node: any }
     const left = node.field?.("left") ?? node.children?.()[0];
     return extractBindingIdentifiers(left);
   }
+  if (kind === "required_parameter" || kind === "optional_parameter") {
+    const pat = node.field?.("pattern") ?? node.children?.()[0];
+    return extractBindingIdentifiers(pat);
+  }
   if (kind === "rest_pattern") {
     const kids = node.children?.() ?? [];
     for (const k of kids) {
@@ -791,6 +795,23 @@ function extractFromTsLike(
   const root = parse(lang, source).root();
   const symbols: SymbolNode[] = [moduleSym];
   const scopes: ScopeFrame[] = [];
+  const scopeLocalNames = new Map<string, Set<string>>();
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  function recordScopeParams(node: any, symbolId: string) {
+    const params = node.field?.("parameters") ?? safeFind(node, "formal_parameters");
+    if (!params) return;
+    let set = scopeLocalNames.get(symbolId);
+    if (!set) {
+      set = new Set<string>();
+      scopeLocalNames.set(symbolId, set);
+    }
+    for (const child of params.children?.() ?? []) {
+      for (const b of extractBindingIdentifiers(child)) {
+        set.add(b.name);
+      }
+    }
+  }
 
   // Class declarations
   for (const node of safeFindAll(root, "class_declaration")) {
@@ -838,6 +859,7 @@ function extractFromTsLike(
       };
       symbols.push(msym);
       scopes.push({ name: qname, startLine: mStart, endLine: mEnd, symbolId: msym.id });
+      recordScopeParams(m, msym.id);
     }
   }
 
@@ -859,6 +881,7 @@ function extractFromTsLike(
     };
     symbols.push(sym);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
+    recordScopeParams(node, sym.id);
   }
 
   // Generator function declarations
@@ -875,6 +898,7 @@ function extractFromTsLike(
     };
     symbols.push(sym);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
+    recordScopeParams(node, sym.id);
   }
 
   // Interface declarations (TS / TSX)
@@ -999,6 +1023,18 @@ function extractFromTsLike(
   for (const s of symbols) {
     if (s.name !== "<module>") {
       declaredNamesAndLines.add(`${s.name}#${s.line}`);
+      if (s.kind === "variable") {
+        for (const sc of scopes) {
+          if (sc.symbolId !== s.id && s.line >= sc.startLine && s.endLine <= sc.endLine) {
+            let set = scopeLocalNames.get(sc.symbolId);
+            if (!set) {
+              set = new Set<string>();
+              scopeLocalNames.set(sc.symbolId, set);
+            }
+            set.add(s.name);
+          }
+        }
+      }
     }
   }
 
@@ -1095,12 +1131,13 @@ function extractFromTsLike(
     const expText = exp.text();
     const starReexport = expText.match(/export\s+\*(?:\s+as\s+([\w$]+))?\s+from/);
     if (sourceModule && starReexport) {
+      const isNamespace = Boolean(starReexport[1]);
       rawCalls.push({
         callerId: moduleSym.id,
         calleeName: starReexport[1] ?? "*",
         kind: "reexport",
         sourceModule,
-        importedName: "*",
+        importedName: isNamespace ? undefined : "*",
         localAlias: starReexport[1],
         callSite: { file, line },
       });
@@ -1222,13 +1259,49 @@ function extractFromTsLike(
       const r = idNode.range();
       const line = r.start.line + 1;
       if (declaredNamesAndLines.has(`${localName}#${line}`)) continue;
-      const parentKind = idNode.parent()?.kind?.();
+      const parent = idNode.parent();
+      const parentKind = parent?.kind?.();
       // Skip import_specifier / import_clause / export_specifier definition sites themselves
       if (parentKind === "import_specifier" || parentKind === "import_clause" || parentKind === "export_specifier") {
         continue;
       }
-      const impInfo = localToImportInfo.get(localName);
+      // Skip non-computed member property access (e.g. obj.foo)
+      if (parentKind === "member_expression") {
+        const prop = parent?.field?.("property");
+        if (prop && prop.range().start.index === r.start.index) {
+          continue;
+        }
+      }
+      // Skip object literal keys (e.g. { foo: 1 })
+      if (parentKind === "pair") {
+        const key = parent?.field?.("key");
+        if (key && key.range().start.index === r.start.index) {
+          continue;
+        }
+      }
+      // Skip property or method definitions
+      if (parentKind === "property_signature" || parentKind === "method_definition" || parentKind === "field_definition") {
+        continue;
+      }
+      // Skip direct invocation sites already recorded as calls
+      if (parentKind === "call_expression") {
+        const fn = parent?.field?.("function");
+        if (fn && fn.range().start.index === r.start.index) {
+          continue;
+        }
+      }
+      if (parentKind === "new_expression") {
+        const ctor = parent?.field?.("constructor");
+        if (ctor && ctor.range().start.index === r.start.index) {
+          continue;
+        }
+      }
       const callerId = findCallerId(scopes, line, moduleSym.id);
+      // Skip if shadowed by local parameter or variable in this scope
+      if (callerId !== moduleSym.id && scopeLocalNames.get(callerId)?.has(localName)) {
+        continue;
+      }
+      const impInfo = localToImportInfo.get(localName);
       rawCalls.push({
         callerId,
         calleeName: originalName,

@@ -763,6 +763,16 @@ export async function loadReverseShard(
 
 // ── Generation lifecycle and cleanup ────────────────────────────────────
 
+const activeStagingGenerations = new Set<string>();
+
+export function registerStagingGeneration(gen: string): void {
+  activeStagingGenerations.add(gen);
+}
+
+export function unregisterStagingGeneration(gen: string): void {
+  activeStagingGenerations.delete(gen);
+}
+
 /** Delete all points belonging to a specific generation from file and index collections. */
 export async function deleteGeneration(projectId: string, generation: string): Promise<void> {
   if (!generation) return;
@@ -804,7 +814,7 @@ export async function listStoredGenerations(projectId: string): Promise<string[]
       let offset: string | number | Record<string, unknown> | undefined;
       while (true) {
         const res = await qdrant.scroll(collName, {
-          limit: 100,
+          limit: 500,
           with_payload: ["generation"],
           with_vector: false,
           offset: offset as string | number | undefined,
@@ -839,23 +849,29 @@ export async function cleanStaleGenerations(
     symgraphIndexCollectionName(projectId),
   ];
 
+  const excludedGenerations = Array.from(new Set([activeGeneration, ...activeStagingGenerations]));
+  let allDeletesSucceeded = true;
+
   for (const collName of collNames) {
     try {
       await qdrant.delete(collName, {
         wait: true,
         filter: {
-          must: [{ key: "generation", match: { except: [activeGeneration] } }],
+          must: [{ key: "generation", match: { except: excludedGenerations } }],
         },
       });
     } catch {
-      // Best-effort
+      allDeletesSucceeded = false;
     }
   }
 
-  const stored = await listStoredGenerations(projectId);
-  for (const gen of stored) {
-    if (gen !== activeGeneration) {
-      await deleteGeneration(projectId, gen);
+  // If filtered deletes did not both succeed cleanly, fall back to generation scan
+  if (!allDeletesSucceeded) {
+    const stored = await listStoredGenerations(projectId);
+    for (const gen of stored) {
+      if (!excludedGenerations.includes(gen)) {
+        await deleteGeneration(projectId, gen);
+      }
     }
   }
 }

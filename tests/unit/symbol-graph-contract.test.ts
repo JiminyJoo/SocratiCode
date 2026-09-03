@@ -110,6 +110,7 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     } catch {
@@ -519,7 +520,7 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     const qdrant = getClient();
     const originalUpsert = qdrant.upsert.bind(qdrant);
     let injectedFail = true;
-    vi.spyOn(qdrant, "upsert").mockImplementation(async (collName, body) => {
+    const spy = vi.spyOn(qdrant, "upsert").mockImplementation(async (collName, body) => {
       // If writing to index collection on new generation, inject failure
       if (injectedFail && collName.includes("symgraph_index")) {
         throw new Error("Mid-build disk crash on shard write");
@@ -527,7 +528,11 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
       return originalUpsert(collName, body);
     });
 
-    await rebuildGraph(tmpDir);
+    try {
+      await rebuildGraph(tmpDir);
+    } finally {
+      spy.mockRestore();
+    }
     injectedFail = false;
 
     // 3. Readers check: meta must still point to generation 1

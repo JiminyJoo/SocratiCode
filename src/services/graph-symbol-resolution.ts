@@ -176,8 +176,8 @@ export function resolveCallSites(
         }
       }
 
-      // Wildcard re-export: `export * from './mod'`
-      if ((edge.calleeName === "*" || edge.importedName === "*") && edgeSourceDep) {
+      // Wildcard re-export: `export * from './mod'` (only when unaliased)
+      if (!edge.localAlias && (edge.calleeName === "*" || edge.importedName === "*") && edgeSourceDep) {
         const sub = findSymbolsInTarget(edgeSourceDep, symbolName, visited);
         candidates.push(...sub);
       }

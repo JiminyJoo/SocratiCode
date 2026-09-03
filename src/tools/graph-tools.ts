@@ -17,6 +17,7 @@ import { openInBrowser, writeInteractiveGraphFile } from "../services/graph-visu
 import { buildInteractiveGraphHtml } from "../services/graph-visualize-html.js";
 import { logger } from "../services/logger.js";
 import { getSymbolGraphCache } from "../services/symbol-graph-cache.js";
+import { StorageReadError } from "../services/symbol-graph-store.js";
 import { ensureWatcherStarted } from "../services/watcher.js";
 
 /**
@@ -36,17 +37,24 @@ export async function handleGraphTool(
   name: string,
   args: Record<string, unknown>,
 ): Promise<string> {
-  const result = await dispatchGraphTool(name, args);
-  if (!SYMBOL_GRAPH_TOOLS.has(name)) return result;
-  const resolved = path.resolve((args.projectPath as string) || process.cwd());
-  const symbolGraphError = getLastGraphBuildCompleted(resolved)?.symbolGraphError;
-  if (!symbolGraphError) return result;
-  return [
-    `WARNING: the last graph build could not persist the symbol graph: ${symbolGraphError}`,
-    "Results below may be stale or incomplete until a rebuild succeeds.",
-    "",
-    result,
-  ].join("\n");
+  try {
+    const result = await dispatchGraphTool(name, args);
+    if (!SYMBOL_GRAPH_TOOLS.has(name)) return result;
+    const resolved = path.resolve((args.projectPath as string) || process.cwd());
+    const symbolGraphError = getLastGraphBuildCompleted(resolved)?.symbolGraphError;
+    if (!symbolGraphError) return result;
+    return [
+      `WARNING: the last graph build could not persist the symbol graph: ${symbolGraphError}`,
+      "Results below may be stale or incomplete until a rebuild succeeds.",
+      "",
+      result,
+    ].join("\n");
+  } catch (err) {
+    if (err instanceof StorageReadError) {
+      return `Storage error: ${err.message}`;
+    }
+    throw err;
+  }
 }
 
 async function dispatchGraphTool(

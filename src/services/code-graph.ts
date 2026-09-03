@@ -35,11 +35,13 @@ import {
   deleteSymbolGraphData,
   ensureSymbolGraphCollections,
   nameShardKey,
+  registerStagingGeneration,
   reverseShardKeyForCallee,
   saveFilePayloads,
   saveNameShard,
   saveReverseShard,
   saveSymbolGraphMeta,
+  unregisterStagingGeneration,
 } from "./symbol-graph-store.js";
 
 // Re-export analysis functions for external consumers
@@ -354,6 +356,7 @@ async function persistSymbolGraph(
   }
 
   const newGeneration = randomUUID();
+  registerStagingGeneration(newGeneration);
 
   const reverseShards = new Map<number, Record<string, string[]>>();
   for (const edges of outgoingCallsByFile.values()) {
@@ -423,6 +426,8 @@ async function persistSymbolGraph(
     // Staging failed: clean up the incomplete staged generation immediately
     await deleteGeneration(projectId, newGeneration).catch(() => {});
     throw err;
+  } finally {
+    unregisterStagingGeneration(newGeneration);
   }
 }
 

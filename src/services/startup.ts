@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { collectionName, projectIdFromPath } from "../config.js";
 import { QDRANT_COLLECTION_PREFIX, QDRANT_MODE } from "../constants.js";
+import { isGraphBuildInProgress } from "./code-graph.js";
 import { isDockerAvailable, isQdrantRunning } from "./docker.js";
 import { getIndexingInProgressProjects, getPersistedIndexingStatus, indexProject, requestCancellation, updateProjectIndex } from "./indexer.js";
 import { getLockHolderPid, releaseAllLocks } from "./lock.js";
@@ -311,14 +312,17 @@ async function resumeProject(
     });
   }
 
-  // Retire any abandoned or superseded symbol graph generations left from previous sessions
-  try {
-    const meta = await loadSymbolGraphMeta(projectId);
-    if (meta?.generation) {
-      await cleanStaleGenerations(projectId, meta.generation);
+  // Retire any abandoned or superseded symbol graph generations left from previous sessions,
+  // excluding any project currently undergoing a graph rebuild
+  if (!isGraphBuildInProgress(resolvedPath)) {
+    try {
+      const meta = await loadSymbolGraphMeta(projectId);
+      if (meta?.generation) {
+        await cleanStaleGenerations(projectId, meta.generation);
+      }
+    } catch {
+      // Non-fatal
     }
-  } catch {
-    // Non-fatal
   }
 }
 

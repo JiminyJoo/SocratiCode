@@ -846,6 +846,7 @@ export * as utils from "./utils";
       expect(reexport?.calleeName).toBe("utils");
       expect(reexport?.localAlias).toBe("utils");
       expect(reexport?.sourceModule).toBe("./utils");
+      expect(reexport?.importedName).toBeUndefined();
     });
 
     it("does not emit self-referential value_reference for locally exported declaration lines", () => {
@@ -858,6 +859,29 @@ export { computeTotal };
       const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/math.ts");
       const valueRefs = out.rawCalls.filter((c) => c.kind === "value_reference" && c.calleeName === "computeTotal");
       expect(valueRefs).toHaveLength(0);
+    });
+
+    it("skips non-computed member properties and shadowed parameters", () => {
+      const src = `
+import { config, run } from "./lib";
+
+function execute(config: string) {
+  const result = obj.run;
+  console.log(config);
+}
+
+const direct = run();
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/caller.ts");
+      // obj.run is a member property, not a value reference to imported run
+      const runRefs = out.rawCalls.filter((c) => c.calleeName === "run" && c.kind === "value_reference");
+      expect(runRefs).toHaveLength(0);
+      // config inside execute is shadowed by parameter `config: string`
+      const configRefs = out.rawCalls.filter((c) => c.calleeName === "config" && c.kind === "value_reference");
+      expect(configRefs).toHaveLength(0);
+      // direct call to run() is preserved as call
+      const runCalls = out.rawCalls.filter((c) => c.calleeName === "run" && c.kind === "call");
+      expect(runCalls).toHaveLength(1);
     });
   });
 });
