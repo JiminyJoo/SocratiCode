@@ -270,6 +270,10 @@ export async function startWatching(
         resolvedPath,
         setTimeout(async () => {
           debounceTimers.delete(resolvedPath);
+          // stopWatching invalidates this closure before awaiting the native
+          // unsubscribe, so a timer already queued cannot start work while
+          // that asynchronous shutdown is still pending.
+          if (!watcherActive) return;
           updateRunning = true;
           try {
             onProgress?.(`Detected changes, updating index for ${resolvedPath}...`);

@@ -294,6 +294,33 @@ describe("watcher (unit)", () => {
       await expect(stopWatching("/nonexistent")).resolves.not.toThrow();
       expect(mockUnsubscribe).not.toHaveBeenCalled();
     });
+
+    it("does not start a queued update while native unsubscribe is pending", async () => {
+      vi.useFakeTimers();
+      let releaseUnsubscribe: () => void = () => {};
+      const unsubscribePending = new Promise<void>((resolve) => {
+        releaseUnsubscribe = resolve;
+      });
+      mockUnsubscribe.mockReturnValueOnce(unsubscribePending);
+
+      try {
+        await startWatching(TEST_PROJECT);
+        mockSubscribeCallback?.(null, [
+          { path: path.join(RESOLVED_PROJECT, "src/app.ts"), type: "update" },
+        ]);
+        await vi.advanceTimersByTimeAsync(0);
+
+        const stopping = stopWatching(TEST_PROJECT);
+        await vi.advanceTimersByTimeAsync(2100);
+        expect(mockUpdateProjectIndex).not.toHaveBeenCalled();
+
+        releaseUnsubscribe();
+        await stopping;
+      } finally {
+        releaseUnsubscribe();
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe("stopAllWatchers", () => {
