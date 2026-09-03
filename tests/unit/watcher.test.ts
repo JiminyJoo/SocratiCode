@@ -632,6 +632,13 @@ describe("watcher (unit)", () => {
           { path: history, type: "update" },
           { path: installed, type: "create" },
         ])).toBe(0);
+
+        // Removing one file or marker does not change the filter while another
+        // valid environment marker remains at the same root.
+        fs.rmSync(history);
+        expect(await updatesAfter([{ path: history, type: "delete" }])).toBe(0);
+        fs.rmSync(marker());
+        expect(await updatesAfter([{ path: marker(), type: "delete" }])).toBe(0);
       });
 
       it("reconciles once more when an environment reverses while the update runs", async () => {

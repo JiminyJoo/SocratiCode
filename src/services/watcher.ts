@@ -148,13 +148,27 @@ export function environmentEvent(
 ): "changed" | "touches" | null {
   if (isEnvironmentMarker(relative) || ig.isEnvironmentRoot(relative)) {
     const excluded = shouldIgnore(ig, relative);
-    return excluded !== (lstatOrNull(event.path) !== null) ? "changed" : "touches";
+    return excluded !== isEnvironmentDirectory(environmentRootOf(event.path, relative))
+      ? "changed"
+      : "touches";
   }
   if (event.type !== "create") return null;
   if (lstatOrNull(event.path)?.isDirectory() !== true || !isEnvironmentDirectory(event.path)) {
     return null;
   }
   return shouldIgnore(ig, `${relative}/`) ? "touches" : "changed";
+}
+
+/** Resolve a marker event back to the environment directory it describes. */
+function environmentRootOf(eventPath: string, relative: string): string {
+  const segments = relative.split(path.sep).join("/").split("/");
+  const condaMetaIndex = segments.indexOf("conda-meta");
+  if (condaMetaIndex !== -1) {
+    let root = eventPath;
+    for (let i = condaMetaIndex; i < segments.length; i++) root = path.dirname(root);
+    return root;
+  }
+  return segments[segments.length - 1] === "pyvenv.cfg" ? path.dirname(eventPath) : eventPath;
 }
 
 /**
