@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -32,7 +33,7 @@ import {
   deleteSymbolGraphData,
   ensureSymbolGraphCollections,
   nameShardKey,
-  reverseShardKey,
+  reverseShardKeyForCallee,
   saveFilePayloads,
   saveNameShard,
   saveReverseShard,
@@ -350,13 +351,13 @@ async function persistSymbolGraph(
     }
   }
 
+  const newGeneration = randomUUID();
+
   const reverseShards = new Map<number, Record<string, string[]>>();
   for (const edges of outgoingCallsByFile.values()) {
     for (const e of edges) {
       for (const calleeId of e.calleeCandidates) {
-        const calleeFile = calleeId.split("::")[0];
-        if (!calleeFile) continue;
-        const bucket = reverseShardKey(calleeFile);
+        const bucket = reverseShardKeyForCallee(calleeId);
         let shard = reverseShards.get(bucket);
         if (!shard) {
           shard = {};
@@ -372,17 +373,18 @@ async function persistSymbolGraph(
     }
   }
 
-  // Persist
-  await saveFilePayloads(projectId, payloads);
+  // Persist all payloads and shards into the staged generation first
+  await saveFilePayloads(projectId, payloads, newGeneration);
   for (const [shardKey, shard] of nameShards.entries()) {
     if (Object.keys(shard).length === 0) continue;
-    await saveNameShard(projectId, shardKey, shard);
+    await saveNameShard(projectId, shardKey, shard, newGeneration);
   }
   for (const [bucket, shard] of reverseShards.entries()) {
     if (Object.keys(shard).length === 0) continue;
-    await saveReverseShard(projectId, bucket, shard);
+    await saveReverseShard(projectId, bucket, shard, newGeneration);
   }
 
+  // Activate that generation with one metadata-pointer write only after every staged write succeeds
   const meta: SymbolGraphMeta = {
     projectId,
     symbolCount: totalSymbols,
@@ -391,6 +393,7 @@ async function persistSymbolGraph(
     unresolvedEdgePct: computeUnresolvedPct(outgoingCallsByFile),
     builtAt: Date.now(),
     schemaVersion: 2,
+    generation: newGeneration,
   };
   await saveSymbolGraphMeta(projectId, meta);
 

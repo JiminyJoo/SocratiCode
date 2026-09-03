@@ -117,7 +117,7 @@ export class SymbolGraphCache {
     const merged = new Map<string, SymbolRef[]>();
     const shardKeys = allNameShardKeys();
     const shards = await Promise.all(
-      shardKeys.map((k) => loadNameShard(this.projectId, k)),
+      shardKeys.map((k) => loadNameShard(this.projectId, k, this.meta.generation)),
     );
     for (const shard of shards) {
       if (!shard) continue;
@@ -142,7 +142,7 @@ export class SymbolGraphCache {
     const buckets: number[] = [];
     for (let i = 0; i < SYMBOL_REVERSE_SHARDS; i++) buckets.push(i);
     const shards = await Promise.all(
-      buckets.map((b) => loadReverseShard(this.projectId, b)),
+      buckets.map((b) => loadReverseShard(this.projectId, b, this.meta.generation)),
     );
     for (const shard of shards) {
       if (!shard) continue;
@@ -195,7 +195,7 @@ export class SymbolGraphCache {
       return cached;
     }
     this.stats.fileLruMisses++;
-    const payload = await loadFilePayload(this.projectId, relativePath);
+    const payload = await loadFilePayload(this.projectId, relativePath, this.meta.generation);
     if (payload) this.fileDataLru.set(relativePath, payload);
     this.stats.fileLruSize = this.fileDataLru.size;
     return payload;

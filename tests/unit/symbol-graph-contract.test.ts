@@ -53,17 +53,21 @@ import { rebuildGraph } from "../../src/services/code-graph.js";
 import { getImpactRadius, getSymbolContext } from "../../src/services/graph-impact.js";
 import { getClient } from "../../src/services/qdrant.js";
 import { getSymbolGraphCache, resetSymbolGraphCacheRegistry } from "../../src/services/symbol-graph-cache.js";
-import { updateChangedFilesSymbolGraph } from "../../src/services/symbol-graph-incremental.js";
+import { applyRemoval, updateChangedFilesSymbolGraph } from "../../src/services/symbol-graph-incremental.js";
 import {
   deleteFilePayload,
   loadFilePayload,
+  loadNameShard,
+  loadReverseShard,
   loadSymbolGraphMeta,
   resetSymbolGraphCollectionCache,
+  reverseShardKeyForCallee,
   StorageReadError,
+  saveReverseShard,
   saveSymbolGraphMeta,
 } from "../../src/services/symbol-graph-store.js";
 import { handleGraphTool } from "../../src/tools/graph-tools.js";
-import type { SymbolGraphMeta } from "../../src/types.js";
+import type { SymbolGraphMeta, SymbolRef } from "../../src/types.js";
 
 describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
   let tmpDir: string;
@@ -316,25 +320,193 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
   it("throws StorageReadError from loadFilePayload and deleteFilePayload on retrieval/deletion errors", async () => {
     fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
     fs.writeFileSync(path.join(tmpDir, "src", "dummy.ts"), `export function dummy() {}`);
-    const { fileGraph } = await runPipeline();
+    const { cache } = await runPipeline();
 
     const qdrant = getClient();
     vi.spyOn(qdrant, "retrieve").mockRejectedValueOnce(new Error("Network timeout"));
-    await expect(loadFilePayload(projId, "src/dummy.ts")).rejects.toThrow(StorageReadError);
+    await expect(loadFilePayload(projId, "src/dummy.ts", cache.meta.generation)).rejects.toThrow(StorageReadError);
 
     vi.spyOn(qdrant, "delete").mockRejectedValueOnce(new Error("Disk IO error"));
-    await expect(deleteFilePayload(projId, "src/dummy.ts")).rejects.toThrow(StorageReadError);
+    await expect(deleteFilePayload(projId, "src/dummy.ts", cache.meta.generation)).rejects.toThrow(StorageReadError);
+  });
 
-    // Incremental update propagates storage failures on file payload retrieval
-    const meta = await loadSymbolGraphMeta(projId);
-    expect(meta).toBeDefined();
-    if (!meta) throw new Error("Expected meta to be defined");
-    vi.spyOn(qdrant, "retrieve")
-      .mockResolvedValueOnce([{ id: "meta", vector: [0], payload: { meta } }])
-      .mockRejectedValueOnce(new Error("Qdrant payload load error"));
+  it("rejects schema-v1 incremental updates before any mutation and returns fullRebuildRequired", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "dummy.ts"), `export function dummy() {}`);
+    const { fileGraph, cache } = await runPipeline();
+    cache.meta.schemaVersion = 1;
+    await saveSymbolGraphMeta(projId, cache.meta);
 
-    await expect(
-      updateChangedFilesSymbolGraph(projId, tmpDir, fileGraph, ["src/dummy.ts"], []),
-    ).rejects.toThrow(StorageReadError);
+    // Snapshot current store points
+    const storeMap = new Map<string, string>();
+    for (const [collName, coll] of store.entries()) {
+      for (const [ptId, pt] of coll.entries()) {
+        storeMap.set(`${collName}::${ptId}`, JSON.stringify(pt));
+      }
+    }
+
+    const result = await updateChangedFilesSymbolGraph(
+      projId,
+      tmpDir,
+      fileGraph,
+      ["src/dummy.ts"],
+      [],
+    );
+
+    expect(result.fullRebuildRequired).toBe(true);
+    expect(result.filesChanged).toBe(0);
+    expect(result.filesRemoved).toBe(0);
+
+    // Verify no points were mutated or partially converted
+    for (const [collName, coll] of store.entries()) {
+      for (const [ptId, pt] of coll.entries()) {
+        expect(storeMap.get(`${collName}::${ptId}`)).toBe(JSON.stringify(pt));
+      }
+    }
+  });
+
+  it("returns fullRebuildRequired for changed or removed files before mutating storage", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "a.ts"), `export function foo() {}`);
+    fs.writeFileSync(path.join(tmpDir, "src", "b.ts"), `import { foo } from "./a"; export function bar() { foo(); }`);
+    const { fileGraph } = await runPipeline();
+
+    const changeResult = await updateChangedFilesSymbolGraph(projId, tmpDir, fileGraph, ["src/a.ts"], []);
+    expect(changeResult.fullRebuildRequired).toBe(true);
+
+    const removeResult = await updateChangedFilesSymbolGraph(projId, tmpDir, fileGraph, [], ["src/b.ts"]);
+    expect(removeResult.fullRebuildRequired).toBe(true);
+  });
+
+  it("produces identical impact results on adding, changing, and removing cross-file references as a clean build", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "callee.ts"), `export function target() { return 1; }`);
+    fs.writeFileSync(path.join(tmpDir, "src", "caller.ts"), `import { target } from "./callee"; export function use() { target(); }`);
+
+    // 1. Initial build: caller -> callee
+    const { cache: cache1 } = await runPipeline();
+    const impact1 = await getImpactRadius(cache1, "target", 2, { file: "src/callee.ts" });
+    expect(impact1.status).toBe("ok");
+    expect(impact1.totalFiles).toBe(1);
+    expect(impact1.filesByDepth.get(1)).toEqual(["src/caller.ts"]);
+
+    // 2. Add another caller: caller2 -> callee
+    fs.writeFileSync(path.join(tmpDir, "src", "caller2.ts"), `import { target } from "./callee"; export function use2() { target(); }`);
+    const { cache: cache2 } = await runPipeline();
+    const impact2 = await getImpactRadius(cache2, "target", 2, { file: "src/callee.ts" });
+    expect(impact2.status).toBe("ok");
+    expect(impact2.totalFiles).toBe(2);
+    expect(impact2.filesByDepth.get(1)).toEqual(expect.arrayContaining(["src/caller.ts", "src/caller2.ts"]));
+
+    // 3. Change caller2 to call something else
+    fs.writeFileSync(path.join(tmpDir, "src", "caller2.ts"), `export function use2() { return 2; }`);
+    const { cache: cache3 } = await runPipeline();
+    const impact3 = await getImpactRadius(cache3, "target", 2, { file: "src/callee.ts" });
+    expect(impact3.status).toBe("ok");
+    expect(impact3.totalFiles).toBe(1);
+    expect(impact3.filesByDepth.get(1)).toEqual(["src/caller.ts"]);
+
+    // 4. Remove caller.ts
+    fs.unlinkSync(path.join(tmpDir, "src", "caller.ts"));
+    const { cache: cache4 } = await runPipeline();
+    const impact4 = await getImpactRadius(cache4, "target", 2, { file: "src/callee.ts" });
+    expect(impact4.status).toBe("ok");
+    expect(impact4.totalFiles).toBe(0);
+    expect(impact4.filesByDepth.get(1)).toBeUndefined();
+  });
+
+  it("uses canonical reverse-shard keys so incremental edge removal completely clears reverse entries", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "callee.ts"), `export function target() {}`);
+    fs.writeFileSync(path.join(tmpDir, "src", "caller.ts"), `import { target } from "./callee"; export function run() { target(); }`);
+
+    const { cache } = await runPipeline();
+    const calleePayload = await loadFilePayload(projId, "src/callee.ts", cache.meta.generation);
+    const callerPayload = await loadFilePayload(projId, "src/caller.ts", cache.meta.generation);
+    const targetSym = calleePayload?.symbols.find((s) => s.name === "target");
+    const runSym = callerPayload?.symbols.find((s) => s.name === "run");
+    expect(targetSym).toBeDefined();
+    expect(runSym).toBeDefined();
+    if (!targetSym || !runSym || !callerPayload) throw new Error("Expected symbols and payload");
+
+    const calleeId = targetSym.id;
+    const bucket = reverseShardKeyForCallee(calleeId);
+
+    // Verify reverse shard after full build
+    const shardBefore = await loadReverseShard(projId, bucket, cache.meta.generation);
+    expect(shardBefore).toBeDefined();
+    expect(shardBefore?.[calleeId]).toEqual(expect.arrayContaining([runSym.id]));
+
+    // Use applyRemoval on caller payload with same canonical reverseShardKeyForCallee
+    const dirtyReverseShards = new Map<number, Record<string, string[]>>();
+    const dirtyNameShards = new Map<string, Record<string, SymbolRef[]>>();
+    async function getNameShard(key: string) {
+      let shard = dirtyNameShards.get(key);
+      if (!shard) {
+        shard = (await loadNameShard(projId, key, cache.meta.generation)) ?? {};
+        dirtyNameShards.set(key, shard);
+      }
+      return shard;
+    }
+    async function getReverseShard(b: number) {
+      let shard = dirtyReverseShards.get(b);
+      if (!shard) {
+        shard = (await loadReverseShard(projId, b, cache.meta.generation)) ?? {};
+        dirtyReverseShards.set(b, shard);
+      }
+      return shard;
+    }
+
+    await applyRemoval(projId, callerPayload, getNameShard, getReverseShard);
+    for (const [b, shard] of dirtyReverseShards) {
+      await saveReverseShard(projId, b, shard, cache.meta.generation);
+    }
+
+    // Verify reverse shard has exact entry removed
+    const shardAfter = await loadReverseShard(projId, bucket, cache.meta.generation);
+    expect(shardAfter?.[calleeId]).toBeUndefined();
+  });
+
+  it("keeps old generation completely readable if staged build fails mid-way (atomic activation)", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "initial.ts"), `export function alpha() { return 1; }`);
+
+    // 1. Full build succeeds -> Generation 1
+    const { cache: cache1 } = await runPipeline();
+    const meta1 = cache1.meta;
+    expect(meta1.generation).toBeDefined();
+
+    const payload1 = await loadFilePayload(projId, "src/initial.ts", meta1.generation);
+    expect(payload1).not.toBeNull();
+    expect(payload1?.symbols.some((s) => s.name === "alpha")).toBe(true);
+
+    // 2. Introduce new file for build 2, but inject failure during saveReverseShard
+    fs.writeFileSync(path.join(tmpDir, "src", "initial.ts"), `export function alpha() { return 2; }\nexport function beta() { return alpha(); }`);
+
+    const qdrant = getClient();
+    const originalUpsert = qdrant.upsert.bind(qdrant);
+    let injectedFail = true;
+    vi.spyOn(qdrant, "upsert").mockImplementation(async (collName, body) => {
+      // If writing to index collection on new generation, inject failure
+      if (injectedFail && collName.includes("symgraph_index")) {
+        throw new Error("Mid-build disk crash on shard write");
+      }
+      return originalUpsert(collName, body);
+    });
+
+    await rebuildGraph(tmpDir);
+    injectedFail = false;
+
+    // 3. Readers check: meta must still point to generation 1
+    const currentMeta = await loadSymbolGraphMeta(projId);
+    expect(currentMeta?.generation).toBe(meta1.generation);
+    expect(currentMeta?.symbolCount).toBe(meta1.symbolCount);
+
+    // Reading payloads or shards through store or cache resolves to Generation 1 (complete old generation)
+    const readPayload = await loadFilePayload(projId, "src/initial.ts");
+    expect(readPayload).not.toBeNull();
+    expect(readPayload?.symbols.some((s) => s.name === "alpha")).toBe(true);
+    // Should NOT have beta from failed generation
+    expect(readPayload?.symbols.some((s) => s.name === "beta")).toBe(false);
   });
 });

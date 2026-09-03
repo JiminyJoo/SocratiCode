@@ -187,6 +187,7 @@ export interface SymbolGraphMeta {
   unresolvedEdgePct: number;
   builtAt: number;
   schemaVersion: 1 | 2;
+  generation?: string;
 }
 
 /** Per-file payload stored in `_symgraph_file` */

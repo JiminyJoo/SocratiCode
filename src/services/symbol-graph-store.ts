@@ -58,6 +58,12 @@ export function reverseShardKey(filePath: string): number {
   return digest[0] % SYMBOL_REVERSE_SHARDS;
 }
 
+/** Map a callee symbol ID (e.g. `path/to/file.ts::symbolName`) to its reverse-call shard bucket. */
+export function reverseShardKeyForCallee(calleeId: string): number {
+  const calleeFile = calleeId.split("::")[0] ?? calleeId;
+  return reverseShardKey(calleeFile);
+}
+
 /** Format a reverse-shard bucket as a 2-char zero-padded hex string. */
 export function reverseShardHex(bucket: number): string {
   return bucket.toString(16).padStart(2, "0");
@@ -73,8 +79,9 @@ function uuidFromString(input: string): string {
 function metaPointId(projectId: string): string {
   return uuidFromString(`${projectId}::meta`);
 }
-function filePointId(projectId: string, relativePath: string): string {
-  return uuidFromString(`${projectId}::file::${relativePath}`);
+function filePointId(projectId: string, relativePath: string, generation?: string): string {
+  const genSuffix = generation ? `::gen::${generation}` : "";
+  return uuidFromString(`${projectId}::file::${relativePath}${genSuffix}`);
 }
 /**
  * Seed strings for shard point ids. Single-sourced on purpose: part 0's id and
@@ -82,17 +89,19 @@ function filePointId(projectId: string, relativePath: string): string {
  * place but not the other would strand every split shard's continuation parts
  * at unreachable ids without any type error.
  */
-function nameShardSeed(projectId: string, shardKey: string): string {
-  return `${projectId}::nameidx::${shardKey}`;
+function nameShardSeed(projectId: string, shardKey: string, generation?: string): string {
+  const genSuffix = generation ? `::gen::${generation}` : "";
+  return `${projectId}::nameidx::${shardKey}${genSuffix}`;
 }
-function revShardSeed(projectId: string, bucketHex: string): string {
-  return `${projectId}::revidx::${bucketHex}`;
+function revShardSeed(projectId: string, bucketHex: string, generation?: string): string {
+  const genSuffix = generation ? `::gen::${generation}` : "";
+  return `${projectId}::revidx::${bucketHex}${genSuffix}`;
 }
-function nameShardPointId(projectId: string, shardKey: string): string {
-  return uuidFromString(nameShardSeed(projectId, shardKey));
+function nameShardPointId(projectId: string, shardKey: string, generation?: string): string {
+  return uuidFromString(nameShardSeed(projectId, shardKey, generation));
 }
-function revShardPointId(projectId: string, bucketHex: string): string {
-  return uuidFromString(revShardSeed(projectId, bucketHex));
+function revShardPointId(projectId: string, bucketHex: string, generation?: string): string {
+  return uuidFromString(revShardSeed(projectId, bucketHex, generation));
 }
 /**
  * Id of continuation part `i` (i >= 1) of a shard whose part 0 lives at the
@@ -525,12 +534,13 @@ export async function loadSymbolGraphMeta(
 export async function saveFilePayload(
   projectId: string,
   payload: SymbolGraphFilePayload,
+  generation?: string,
 ): Promise<void> {
   const collName = symgraphFileCollectionName(projectId);
   await ensureCollection(collName);
   const qdrant = getClient();
   const point: SymgraphPoint = {
-    id: filePointId(projectId, payload.file),
+    id: filePointId(projectId, payload.file, generation),
     vector: [0],
     payload: { filePayload: payload },
   };
@@ -547,12 +557,13 @@ export async function saveFilePayload(
 export async function saveFilePayloads(
   projectId: string,
   payloads: SymbolGraphFilePayload[],
+  generation?: string,
 ): Promise<void> {
   if (payloads.length === 0) return;
   const collName = symgraphFileCollectionName(projectId);
   await ensureCollection(collName);
   const points: SymgraphPoint[] = payloads.map((p) => ({
-    id: filePointId(projectId, p.file),
+    id: filePointId(projectId, p.file, generation),
     vector: [0],
     payload: { filePayload: p },
   }));
@@ -562,13 +573,19 @@ export async function saveFilePayloads(
 export async function loadFilePayload(
   projectId: string,
   relativePath: string,
+  generation?: string,
 ): Promise<SymbolGraphFilePayload | null> {
   try {
+    let gen = generation;
+    if (gen === undefined) {
+      const meta = await loadSymbolGraphMeta(projectId);
+      gen = meta?.generation;
+    }
     const collName = symgraphFileCollectionName(projectId);
     await ensureCollection(collName);
     const qdrant = getClient();
     const points = await qdrant.retrieve(collName, {
-      ids: [filePointId(projectId, relativePath)],
+      ids: [filePointId(projectId, relativePath, gen)],
       with_payload: true,
     });
     if (points.length === 0) return null;
@@ -590,13 +607,19 @@ export async function loadFilePayload(
 export async function deleteFilePayload(
   projectId: string,
   relativePath: string,
+  generation?: string,
 ): Promise<void> {
   try {
+    let gen = generation;
+    if (gen === undefined) {
+      const meta = await loadSymbolGraphMeta(projectId);
+      gen = meta?.generation;
+    }
     const collName = symgraphFileCollectionName(projectId);
     await ensureCollection(collName);
     const qdrant = getClient();
     await qdrant.delete(collName, {
-      points: [filePointId(projectId, relativePath)],
+      points: [filePointId(projectId, relativePath, gen)],
     });
   } catch (err) {
     logger.warn("deleteFilePayload failed", {
@@ -618,13 +641,14 @@ export async function saveNameShard(
   projectId: string,
   shardKey: string,
   nameToSymbols: Record<string, SymbolRef[]>,
+  generation?: string,
 ): Promise<void> {
   const collName = symgraphIndexCollectionName(projectId);
   await ensureCollection(collName);
   await saveShardPoints(
     collName,
-    nameShardSeed(projectId, shardKey),
-    nameShardPointId(projectId, shardKey),
+    nameShardSeed(projectId, shardKey, generation),
+    nameShardPointId(projectId, shardKey, generation),
     nameToSymbols,
     `name index shard '${shardKey}'`,
     (entries, part, parts) =>
@@ -637,14 +661,20 @@ export async function saveNameShard(
 export async function loadNameShard(
   projectId: string,
   shardKey: string,
+  generation?: string,
 ): Promise<Record<string, SymbolRef[]> | null> {
   try {
+    let gen = generation;
+    if (gen === undefined) {
+      const meta = await loadSymbolGraphMeta(projectId);
+      gen = meta?.generation;
+    }
     const collName = symgraphIndexCollectionName(projectId);
     await ensureCollection(collName);
     return await loadShardPoints<SymbolRef[]>(
       collName,
-      nameShardSeed(projectId, shardKey),
-      nameShardPointId(projectId, shardKey),
+      nameShardSeed(projectId, shardKey, gen),
+      nameShardPointId(projectId, shardKey, gen),
       (payload) => (payload?.nameToSymbols as Record<string, SymbolRef[]>) ?? null,
       { projectId, shardKey },
     );
@@ -663,14 +693,15 @@ export async function saveReverseShard(
   projectId: string,
   bucket: number,
   reverseEdges: Record<string, string[]>,
+  generation?: string,
 ): Promise<void> {
   const collName = symgraphIndexCollectionName(projectId);
   await ensureCollection(collName);
   const bucketHex = reverseShardHex(bucket);
   await saveShardPoints(
     collName,
-    revShardSeed(projectId, bucketHex),
-    revShardPointId(projectId, bucketHex),
+    revShardSeed(projectId, bucketHex, generation),
+    revShardPointId(projectId, bucketHex, generation),
     reverseEdges,
     `reverse-call index shard ${bucketHex}`,
     (entries, part, parts) =>
@@ -683,15 +714,21 @@ export async function saveReverseShard(
 export async function loadReverseShard(
   projectId: string,
   bucket: number,
+  generation?: string,
 ): Promise<Record<string, string[]> | null> {
   try {
+    let gen = generation;
+    if (gen === undefined) {
+      const meta = await loadSymbolGraphMeta(projectId);
+      gen = meta?.generation;
+    }
     const collName = symgraphIndexCollectionName(projectId);
     await ensureCollection(collName);
     const bucketHex = reverseShardHex(bucket);
     return await loadShardPoints<string[]>(
       collName,
-      revShardSeed(projectId, bucketHex),
-      revShardPointId(projectId, bucketHex),
+      revShardSeed(projectId, bucketHex, gen),
+      revShardPointId(projectId, bucketHex, gen),
       (payload) => (payload?.reverseEdges as Record<string, string[]>) ?? null,
       { projectId, bucket },
     );
