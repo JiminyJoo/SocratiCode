@@ -123,6 +123,14 @@ export function resolveCallSites(
     depsByFile.set(node.relativePath, node.dependencies.slice());
   }
 
+  // Re-export traversal is on the hot path for every unresolved edge. Build
+  // this once rather than rescanning every edge in a barrel on every lookup.
+  const reexportsByFile = new Map<string, SymbolEdge[]>();
+  for (const [file, edges] of outgoingCallsByFile.entries()) {
+    const reexports = edges.filter((edge) => edge.kind === "reexport");
+    if (reexports.length > 0) reexportsByFile.set(file, reexports);
+  }
+
   /** Recursively find symbols matching `symbolName` in `targetFile` or its re-export chains */
   function findSymbolsInTarget(
     targetFile: string,
@@ -165,12 +173,10 @@ export function resolveCallSites(
     }
 
     // 2. Follow re-export chains in targetFile
-    const targetEdges = outgoingCallsByFile.get(targetFile) ?? [];
+    const targetEdges = reexportsByFile.get(targetFile) ?? [];
     const targetDeps = depsByFile.get(targetFile) ?? [];
 
     for (const edge of targetEdges) {
-      if (edge.kind !== "reexport") continue;
-
       const edgeSourceDep = edge.sourceModule
         ? resolveDepFile(targetFile, edge.sourceModule, targetDeps)
         : null;

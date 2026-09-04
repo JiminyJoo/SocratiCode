@@ -795,9 +795,61 @@ function extractFromTsLike(
   const root = parse(lang, source).root();
   const symbols: SymbolNode[] = [moduleSym];
   const scopes: ScopeFrame[] = [];
-  const scopeLocalNames = new Map<string, Set<string>>();
+  const moduleScopeSymbolIds = new Set<string>();
 
   const declaredBindingsCache = new Map<string, Set<string>>();
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  function isModuleScopeDeclaration(node: any): boolean {
+    let parent = node.parent?.();
+    if (parent?.kind?.() === "export_statement") {
+      parent = parent.parent?.();
+    }
+    return parent?.kind?.() === "program";
+  }
+
+  const functionScopeBoundaries = new Set([
+    "function_declaration",
+    "generator_function_declaration",
+    "function_expression",
+    "generator_function",
+    "arrow_function",
+    "method_definition",
+    "class_declaration",
+    "class_expression",
+  ]);
+
+  // `var` is function-scoped, including through nested blocks, but a nested
+  // function or class starts a different scope. A recursive findAll() crosses
+  // those boundaries and can incorrectly shadow an import in the outer function.
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  function collectFunctionScopedVars(functionNode: any, bound: Set<string>): void {
+    const body = functionNode.field?.("body");
+    if (!body) return;
+
+    // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+    function visit(node: any, isRoot = false): void {
+      const nodeKind = node.kind?.();
+      if (!isRoot && functionScopeBoundaries.has(nodeKind)) return;
+
+      if (nodeKind === "variable_declaration") {
+        for (const decl of node.children?.() ?? []) {
+          if (decl.kind?.() !== "variable_declarator") continue;
+          const nameNode = decl.field?.("name") ?? decl.children?.()[0];
+          if (!nameNode) continue;
+          for (const binding of extractBindingIdentifiers(nameNode)) {
+            bound.add(binding.name);
+          }
+        }
+      }
+
+      for (const child of node.children?.() ?? []) {
+        visit(child);
+      }
+    }
+
+    visit(body, true);
+  }
 
   // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
   function getDeclaredBindingsInNode(node: any): Set<string> {
@@ -827,18 +879,7 @@ function extractFromTsLike(
           }
         }
       }
-      for (const varDecl of safeFindAll(node, "variable_declaration")) {
-        for (const decl of varDecl.children?.() ?? []) {
-          if (decl.kind?.() === "variable_declarator") {
-            const nameNode = decl.field?.("name") ?? decl.children?.()[0];
-            if (nameNode) {
-              for (const b of extractBindingIdentifiers(nameNode)) {
-                bound.add(b.name);
-              }
-            }
-          }
-        }
-      }
+      collectFunctionScopedVars(node, bound);
     }
 
     // 2. Catch clause parameter
@@ -909,22 +950,6 @@ function extractFromTsLike(
     return false;
   }
 
-  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
-  function recordScopeParams(node: any, symbolId: string) {
-    const params = node.field?.("parameters") ?? safeFind(node, "formal_parameters");
-    if (!params) return;
-    let set = scopeLocalNames.get(symbolId);
-    if (!set) {
-      set = new Set<string>();
-      scopeLocalNames.set(symbolId, set);
-    }
-    for (const child of params.children?.() ?? []) {
-      for (const b of extractBindingIdentifiers(child)) {
-        set.add(b.name);
-      }
-    }
-  }
-
   // Class declarations
   for (const node of safeFindAll(root, "class_declaration")) {
     const nameNode = node.field("name")
@@ -946,6 +971,7 @@ function extractFromTsLike(
       file, line: startLine, endLine, language,
     };
     symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
 
     const body = node.field("body");
@@ -973,7 +999,6 @@ function extractFromTsLike(
       };
       symbols.push(msym);
       scopes.push({ name: qname, startLine: mStart, endLine: mEnd, symbolId: msym.id });
-      recordScopeParams(m, msym.id);
     }
   }
 
@@ -996,8 +1021,8 @@ function extractFromTsLike(
       file, line: startLine, endLine, language,
     };
     symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
-    recordScopeParams(node, sym.id);
   }
 
   // Generator function declarations
@@ -1019,8 +1044,8 @@ function extractFromTsLike(
       file, line: startLine, endLine, language,
     };
     symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
-    recordScopeParams(node, sym.id);
   }
 
   // Interface declarations (TS / TSX)
@@ -1040,6 +1065,7 @@ function extractFromTsLike(
       name, qualifiedName: name, kind: "interface", isExported, file, line: startLine, endLine, language,
     };
     symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
 
@@ -1060,6 +1086,7 @@ function extractFromTsLike(
       name, qualifiedName: name, kind: "type", isExported, file, line: startLine, endLine, language,
     };
     symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
 
@@ -1079,6 +1106,7 @@ function extractFromTsLike(
       name, qualifiedName: name, kind: "enum", isExported, file, line: startLine, endLine, language,
     };
     symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
 
@@ -1116,9 +1144,11 @@ function extractFromTsLike(
       const nameNode = decl.field("name") ?? (decl.children?.().find((c: any) => c.kind() === "identifier" || c.kind() === "object_pattern" || c.kind() === "array_pattern"));
       if (!nameNode) continue;
       const bindings = extractBindingIdentifiers(nameNode);
-      const arrow = safeFind(decl, "arrow_function");
-      const fnExpr = safeFind(decl, "function_expression");
-      const fn = arrow ?? fnExpr;
+      const value = decl.field?.("value");
+      const valueKind = value?.kind?.();
+      const fn = valueKind === "arrow_function" || valueKind === "function_expression"
+        ? value
+        : null;
       if (fn && bindings.length === 1) {
         const name = bindings[0].name;
         const r = (fn ?? decl).range();
@@ -1129,6 +1159,7 @@ function extractFromTsLike(
           name, qualifiedName: name, kind: "function", isExported, file, line: startLine, endLine, language,
         };
         symbols.push(sym);
+        moduleScopeSymbolIds.add(sym.id);
         scopes.push({ name, startLine, endLine, symbolId: sym.id });
       } else {
         for (const b of bindings) {
@@ -1141,6 +1172,7 @@ function extractFromTsLike(
             name, qualifiedName: name, kind: "variable", isExported, file, line: startLine, endLine, language,
           };
           symbols.push(sym);
+          moduleScopeSymbolIds.add(sym.id);
         }
       }
     }
@@ -1151,18 +1183,6 @@ function extractFromTsLike(
   for (const s of symbols) {
     if (s.name !== "<module>") {
       declaredNamesAndLines.add(`${s.name}#${s.line}`);
-      if (s.kind === "variable") {
-        for (const sc of scopes) {
-          if (sc.symbolId !== s.id && s.line >= sc.startLine && s.endLine <= sc.endLine) {
-            let set = scopeLocalNames.get(sc.symbolId);
-            if (!set) {
-              set = new Set<string>();
-              scopeLocalNames.set(sc.symbolId, set);
-            }
-            set.add(s.name);
-          }
-        }
-      }
     }
   }
 
@@ -1276,7 +1296,7 @@ function extractFromTsLike(
       if (defMatch) {
         const defName = defMatch[1];
         for (const s of symbols) {
-          if (s.name === defName && s.file === file) {
+          if (s.name === defName && moduleScopeSymbolIds.has(s.id)) {
             s.isExported = true;
             s.exportedAs = "default";
           }
@@ -1293,7 +1313,7 @@ function extractFromTsLike(
       localToExportedName.set(localName, expName);
       if (!sourceModule) {
         for (const s of symbols) {
-          if (s.name === expName && s.file === file) {
+          if (s.name === expName && moduleScopeSymbolIds.has(s.id)) {
             s.isExported = true;
             if (aliasNode) {
               s.exportedAs = aliasNode.text();

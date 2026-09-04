@@ -23,6 +23,7 @@ import type {
 import { logger } from "./logger.js";
 import {
   allNameShardKeys,
+  LEGACY_SYMBOL_GRAPH_GENERATION,
   loadFilePayload,
   loadNameShard,
   loadReverseShard,
@@ -30,6 +31,7 @@ import {
   releaseReader,
   resetGenerationLifecycleState,
   retainReader,
+  setActiveSymbolGraphGeneration,
 } from "./symbol-graph-store.js";
 
 // ── Tiny LRU (handwritten, ~20 lines) ────────────────────────────────────
@@ -121,14 +123,18 @@ export class SymbolGraphCache {
    * While any reader lease is held, the generation backing this cache cannot be cleaned up.
    */
   acquireReader(): () => void {
+    const generation = this.meta.generation ?? LEGACY_SYMBOL_GRAPH_GENERATION;
+    // Once another generation is active, a new query may not start on this
+    // cache. Nested reads belonging to a lease already held by this cache are
+    // allowed so an in-flight query can finish against one stable generation.
+    retainReader(this.projectId, generation, this.activeReaders > 0);
     this.activeReaders++;
-    retainReader(this.projectId, this.meta.generation);
     let released = false;
     return () => {
       if (released) return;
       released = true;
       this.activeReaders--;
-      releaseReader(this.projectId, this.meta.generation);
+      releaseReader(this.projectId, generation);
     };
   }
 
@@ -144,7 +150,11 @@ export class SymbolGraphCache {
       const merged = new Map<string, SymbolRef[]>();
       const shardKeys = allNameShardKeys();
       const shards = await Promise.all(
-        shardKeys.map((k) => loadNameShard(this.projectId, k, this.meta.generation)),
+        shardKeys.map((k) => loadNameShard(
+          this.projectId,
+          k,
+          this.meta.generation ?? LEGACY_SYMBOL_GRAPH_GENERATION,
+        )),
       );
       for (const shard of shards) {
         if (!shard) continue;
@@ -174,7 +184,11 @@ export class SymbolGraphCache {
       const buckets: number[] = [];
       for (let i = 0; i < SYMBOL_REVERSE_SHARDS; i++) buckets.push(i);
       const shards = await Promise.all(
-        buckets.map((b) => loadReverseShard(this.projectId, b, this.meta.generation)),
+        buckets.map((b) => loadReverseShard(
+          this.projectId,
+          b,
+          this.meta.generation ?? LEGACY_SYMBOL_GRAPH_GENERATION,
+        )),
       );
       for (const shard of shards) {
         if (!shard) continue;
@@ -232,7 +246,11 @@ export class SymbolGraphCache {
     this.stats.fileLruMisses++;
     const release = this.acquireReader();
     try {
-      const payload = await loadFilePayload(this.projectId, relativePath, this.meta.generation);
+      const payload = await loadFilePayload(
+        this.projectId,
+        relativePath,
+        this.meta.generation ?? LEGACY_SYMBOL_GRAPH_GENERATION,
+      );
       if (payload) this.fileDataLru.set(relativePath, payload);
       this.stats.fileLruSize = this.fileDataLru.size;
       return payload;
@@ -332,6 +350,7 @@ export async function getSymbolGraphCache(
     const meta = await loadSymbolGraphMeta(projectId);
     if (!meta) return null;
     const cache = new SymbolGraphCache(projectId, meta);
+    setActiveSymbolGraphGeneration(projectId, meta.generation);
     cacheRegistry.set(projectId, cache);
     return cache;
   })();
@@ -346,7 +365,22 @@ export async function getSymbolGraphCache(
 
 /** Replace (or insert) the cache for a project — used after a fresh rebuild. */
 export function setSymbolGraphCache(cache: SymbolGraphCache): void {
+  setActiveSymbolGraphGeneration(cache.projectId, cache.meta.generation);
   cacheRegistry.set(cache.projectId, cache);
+}
+
+/** Remove a cached generation only if it is still the registry entry. */
+export function dropSymbolGraphCacheGeneration(
+  projectId: string,
+  generation?: string,
+): void {
+  const cached = cacheRegistry.get(projectId);
+  if (
+    cached
+    && (cached.meta.generation ?? LEGACY_SYMBOL_GRAPH_GENERATION) === generation
+  ) {
+    cacheRegistry.delete(projectId);
+  }
 }
 
 /** Remove a project's cache from the registry. */

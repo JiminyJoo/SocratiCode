@@ -392,9 +392,10 @@ describe("graph-impact exact symbol traversal and fail-closed", () => {
 
     const result = await getImpactRadius(cache, "computeCore", 3);
     expect(result.status).toBe("ok");
-    expect(result.totalFiles).toBe(2);
-    // Hop 1: same file utils.ts (via publicHelper)
-    expect(result.filesByDepth.get(1)).toEqual(["src/utils.ts"]);
+    expect(result.totalFiles).toBe(1);
+    // Hop 1 has only the same-file helper, so the defining file is not
+    // counted again as an impacted file.
+    expect(result.filesByDepth.get(1)).toBeUndefined();
     // Hop 2: app.ts (via main calling publicHelper)
     expect(result.filesByDepth.get(2)).toEqual(["src/app.ts"]);
   });

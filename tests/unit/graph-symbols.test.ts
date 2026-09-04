@@ -813,6 +813,16 @@ export const { port = getDefaultPort(), host: serverHost = "localhost" } = confi
       expect(names).not.toContain("config");
     });
 
+    it("does not classify an object binding as a function because its initializer contains one", () => {
+      const src = `
+export const config = { handler: () => "ok" };
+export const direct = () => "ok";
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/config.ts");
+      expect(out.symbols.find((symbol) => symbol.name === "config")?.kind).toBe("variable");
+      expect(out.symbols.find((symbol) => symbol.name === "direct")?.kind).toBe("function");
+    });
+
     it("does not attach bare import provenance to member method calls", () => {
       const src = `
 import { run } from "./runner";
@@ -859,6 +869,24 @@ export { computeTotal };
       const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/math.ts");
       const valueRefs = out.rawCalls.filter((c) => c.kind === "value_reference" && c.calleeName === "computeTotal");
       expect(valueRefs).toHaveLength(0);
+    });
+
+    it("marks only the module-scope binding named by a local export specifier", () => {
+      const src = `
+function outer() {
+  function Thing() {}
+}
+function Thing() {}
+export { Thing as PublicThing };
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/things.ts");
+      const things = out.symbols.filter((symbol) => symbol.name === "Thing");
+      expect(things).toHaveLength(2);
+
+      const exported = things.filter((symbol) => symbol.isExported);
+      expect(exported).toHaveLength(1);
+      expect(exported[0]).toMatchObject({ line: 5, exportedAs: "PublicThing" });
+      expect(things.find((symbol) => symbol.line === 3)?.isExported).toBe(false);
     });
 
     it("skips non-computed member properties and shadowed parameters", () => {
@@ -925,6 +953,25 @@ function process(condition: boolean) {
       expect(dataRefs).toHaveLength(1);
       expect(dataRefs[0].callSite.line).toBe(9);
       expect(dataRefs[0].sourceModule).toBe("./data");
+    });
+
+    it("does not let a nested function's var shadow an outer imported reference", () => {
+      const src = `
+import { dep } from "./dep";
+
+function outer() {
+  function inner() { var dep = 1; return dep; }
+  return dep;
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/nested-var.ts");
+      const depRefs = out.rawCalls.filter(
+        (call) => call.calleeName === "dep" && call.kind === "value_reference",
+      );
+      expect(depRefs).toHaveLength(1);
+      expect(depRefs[0].callSite.line).toBe(6);
+      expect(depRefs[0].sourceModule).toBe("./dep");
+      expect(depRefs[0].callerId).toContain("::outer#");
     });
   });
 });

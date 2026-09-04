@@ -30,7 +30,7 @@ const clientInstance = {
     const coll = store.get(name) ?? new Map<string, StoredPoint>();
     return opts.ids.map((id) => coll.get(String(id))).filter((p): p is StoredPoint => p !== undefined);
   },
-  delete: async (name: string, opts: { points?: Array<string | number>; filter?: { must?: Array<{ key?: string; match?: { value?: string; except?: string[] } }> } }) => {
+  delete: async (name: string, opts: { points?: Array<string | number>; filter?: { must?: Array<{ key?: string; match?: { value?: string; except?: string[] }; is_empty?: { key: string } }> } }) => {
     const coll = store.get(name);
     if (!coll) return;
     if (opts.points) {
@@ -38,6 +38,13 @@ const clientInstance = {
     }
     if (opts.filter?.must) {
       for (const cond of opts.filter.must) {
+        if (cond.is_empty?.key === "generation") {
+          for (const [id, pt] of Array.from(coll.entries())) {
+            if (pt.payload?.generation === undefined || pt.payload.generation === null) {
+              coll.delete(id);
+            }
+          }
+        }
         if (cond.key === "generation" && cond.match) {
           if (cond.match.value !== undefined) {
             for (const [id, pt] of Array.from(coll.entries())) {
@@ -85,6 +92,7 @@ import {
   cleanStaleGenerations,
   coordinateProject,
   deleteFilePayload,
+  LEGACY_SYMBOL_GRAPH_GENERATION,
   listStoredGenerations,
   loadFilePayload,
   loadNameShard,
@@ -94,12 +102,14 @@ import {
   resetSymbolGraphCollectionCache,
   reverseShardKeyForCallee,
   StorageReadError,
+  SymbolGraphGenerationChangedError,
+  saveFilePayload,
   saveReverseShard,
   saveSymbolGraphMeta,
   unregisterStagingGeneration,
 } from "../../src/services/symbol-graph-store.js";
 import { handleGraphTool } from "../../src/tools/graph-tools.js";
-import type { SymbolGraphMeta, SymbolRef } from "../../src/types.js";
+import type { SymbolGraphFilePayload, SymbolGraphMeta, SymbolRef } from "../../src/types.js";
 
 describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
   let tmpDir: string;
@@ -272,9 +282,10 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     const { cache } = await runPipeline();
     const impact = await getImpactRadius(cache, "internalAdd", 3);
     expect(impact.status).toBe("ok");
-    expect(impact.totalFiles).toBe(2);
-    // Hop 1: same file math.ts (via publicSum)
-    expect(impact.filesByDepth.get(1)).toEqual(["src/math.ts"]);
+    expect(impact.totalFiles).toBe(1);
+    // Hop 1 has only the same-file helper, so the defining file is not
+    // counted again as an impacted file.
+    expect(impact.filesByDepth.get(1)).toBeUndefined();
     // Hop 2: calculator.ts (via calculate calling publicSum)
     expect(impact.filesByDepth.get(2)).toEqual(["src/calculator.ts"]);
   });
@@ -701,5 +712,110 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     // After release, deferred cleanup removes gen1 from storage
     storedGens = await listStoredGenerations(projId);
     expect(storedGens).toEqual([gen2]);
+  });
+
+  it("keeps a generation-less legacy graph readable through first v2 activation", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "sample.ts"), `export function legacy() { return 1; }`);
+
+    const legacyPayload: SymbolGraphFilePayload = {
+      file: "src/sample.ts",
+      language: "typescript",
+      contentHash: "legacy-hash",
+      symbols: [{
+        id: "src/sample.ts::legacy#1",
+        name: "legacy",
+        qualifiedName: "legacy",
+        kind: "function",
+        isExported: true,
+        file: "src/sample.ts",
+        line: 1,
+        endLine: 1,
+        language: "typescript",
+      }],
+      outgoingCalls: [],
+    };
+    const legacyMeta: SymbolGraphMeta = {
+      projectId: projId,
+      symbolCount: 1,
+      edgeCount: 0,
+      fileCount: 1,
+      unresolvedEdgePct: 0,
+      builtAt: Date.now(),
+      schemaVersion: 1,
+    };
+    await saveFilePayload(projId, legacyPayload);
+    await saveSymbolGraphMeta(projId, legacyMeta);
+
+    const legacyCache = await getSymbolGraphCache(projId);
+    if (!legacyCache) throw new Error("Expected legacy cache");
+    const releaseLegacyReader = legacyCache.acquireReader();
+
+    fs.writeFileSync(path.join(tmpDir, "src", "sample.ts"), `export function current() { return 2; }`);
+    await rebuildGraph(tmpDir);
+
+    // The committed pointer now names v2, but a query already holding the
+    // legacy lease still reads generation-less payloads until it releases.
+    const legacyRead = await legacyCache.getFilePayload("src/sample.ts");
+    expect(legacyRead?.symbols.some((symbol) => symbol.name === "legacy")).toBe(true);
+    expect(legacyRead?.symbols.some((symbol) => symbol.name === "current")).toBe(false);
+
+    const currentCache = await getSymbolGraphCache(projId);
+    const currentGeneration = currentCache?.meta.generation;
+    expect(currentGeneration).toBeDefined();
+    const currentRead = await currentCache?.getFilePayload("src/sample.ts");
+    expect(currentRead?.symbols.some((symbol) => symbol.name === "current")).toBe(true);
+    expect(await listStoredGenerations(projId)).toEqual(
+      expect.arrayContaining([LEGACY_SYMBOL_GRAPH_GENERATION, currentGeneration]),
+    );
+
+    releaseLegacyReader();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(await listStoredGenerations(projId)).toEqual([currentGeneration]);
+  });
+
+  it("rejects a stale cache lease while its generation is being deleted", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "sample.ts"), `export function first() { return 1; }`);
+
+    const { cache: oldCache } = await runPipeline();
+    const oldGeneration = oldCache.meta.generation;
+    if (!oldGeneration) throw new Error("Expected the initial generation");
+
+    let signalDeletionStarted: () => void = () => {};
+    const deletionStarted = new Promise<void>((resolve) => {
+      signalDeletionStarted = resolve;
+    });
+    let allowDeletion: () => void = () => {};
+    const deletionGate = new Promise<void>((resolve) => {
+      allowDeletion = resolve;
+    });
+    let blocked = false;
+    const originalDelete = clientInstance.delete.bind(clientInstance);
+    const deleteSpy = vi.spyOn(clientInstance, "delete").mockImplementation(async (name, opts) => {
+      const generation = opts.filter?.must?.find((condition) => condition.key === "generation")?.match?.value;
+      if (!blocked && generation === oldGeneration) {
+        blocked = true;
+        signalDeletionStarted();
+        await deletionGate;
+      }
+      return originalDelete(name, opts);
+    });
+
+    fs.writeFileSync(path.join(tmpDir, "src", "sample.ts"), `export function second() { return 2; }`);
+    const rebuild = rebuildGraph(tmpDir);
+    try {
+      await deletionStarted;
+      expect(() => oldCache.acquireReader()).toThrow(SymbolGraphGenerationChangedError);
+    } finally {
+      allowDeletion();
+      await rebuild;
+      deleteSpy.mockRestore();
+    }
+
+    const currentCache = await getSymbolGraphCache(projId);
+    expect(currentCache?.meta.generation).not.toBe(oldGeneration);
+    const payload = await currentCache?.getFilePayload("src/sample.ts");
+    expect(payload?.symbols.some((symbol) => symbol.name === "second")).toBe(true);
   });
 });

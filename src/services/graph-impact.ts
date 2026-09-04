@@ -331,7 +331,7 @@ export async function getImpactRadius(
     const reverseSymbolIndex = await cache.getReverseSymbolIndex();
     const targetSymbolIds = new Set(selectedRefs.map((r) => r.id));
     const visitedSymbols = new Set<string>(targetSymbolIds);
-    const visitedFiles = new Set<string>();
+    const visitedFiles = new Set<string>(selectedRefs.map((r) => r.file));
     const filesByDepth = new Map<number, string[]>();
 
     let frontierSymbolIds = new Set(targetSymbolIds);

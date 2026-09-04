@@ -349,6 +349,25 @@ export class StorageReadError extends Error {
   }
 }
 
+/** Raised when a query tries to start against a superseded graph generation. */
+export class SymbolGraphGenerationChangedError extends StorageReadError {
+  constructor(
+    public readonly projectId: string,
+    public readonly generation: string,
+    public readonly activeGeneration?: string,
+  ) {
+    super("Symbol graph generation changed while the query was starting", {
+      projectId,
+      generation,
+      activeGeneration,
+    });
+    this.name = "SymbolGraphGenerationChangedError";
+  }
+}
+
+/** Internal lease/storage key for graphs written before generations existed. */
+export const LEGACY_SYMBOL_GRAPH_GENERATION = "__legacy_symbol_graph__";
+
 /**
  * Read a shard written by {@link saveShardPoints}: the point at the shard's
  * original id, plus continuation parts when it declares any. Returns the
@@ -512,6 +531,7 @@ export async function saveSymbolGraphMeta(
   // this file has no unguarded upsert path (#99).
   assertPointFits(point, "symbol graph metadata");
   await qdrant.upsert(collName, { points: [point] });
+  setActiveSymbolGraphGeneration(projectId, meta.generation);
 }
 
 export async function loadSymbolGraphMeta(
@@ -531,6 +551,9 @@ export async function loadSymbolGraphMeta(
     if (meta && meta.schemaVersion === undefined) {
       meta.schemaVersion = 1;
     }
+    if (meta) {
+      setActiveSymbolGraphGeneration(projectId, meta.generation);
+    }
     return meta;
   } catch (err) {
     logger.warn("loadSymbolGraphMeta failed (returning null)", {
@@ -539,6 +562,16 @@ export async function loadSymbolGraphMeta(
     });
     return null;
   }
+}
+
+async function resolveReadGeneration(
+  projectId: string,
+  generation?: string,
+): Promise<string | undefined> {
+  if (generation === LEGACY_SYMBOL_GRAPH_GENERATION) return undefined;
+  if (generation !== undefined) return generation;
+  const meta = await loadSymbolGraphMeta(projectId);
+  return meta?.generation;
 }
 
 // ── Per-file payloads ────────────────────────────────────────────────────
@@ -594,11 +627,7 @@ export async function loadFilePayload(
   generation?: string,
 ): Promise<SymbolGraphFilePayload | null> {
   try {
-    let gen = generation;
-    if (gen === undefined) {
-      const meta = await loadSymbolGraphMeta(projectId);
-      gen = meta?.generation;
-    }
+    const gen = await resolveReadGeneration(projectId, generation);
     const collName = symgraphFileCollectionName(projectId);
     await ensureCollection(collName);
     const qdrant = getClient();
@@ -628,11 +657,7 @@ export async function deleteFilePayload(
   generation?: string,
 ): Promise<void> {
   try {
-    let gen = generation;
-    if (gen === undefined) {
-      const meta = await loadSymbolGraphMeta(projectId);
-      gen = meta?.generation;
-    }
+    const gen = await resolveReadGeneration(projectId, generation);
     const collName = symgraphFileCollectionName(projectId);
     await ensureCollection(collName);
     const qdrant = getClient();
@@ -683,11 +708,7 @@ export async function loadNameShard(
   generation?: string,
 ): Promise<Record<string, SymbolRef[]> | null> {
   try {
-    let gen = generation;
-    if (gen === undefined) {
-      const meta = await loadSymbolGraphMeta(projectId);
-      gen = meta?.generation;
-    }
+    const gen = await resolveReadGeneration(projectId, generation);
     const collName = symgraphIndexCollectionName(projectId);
     await ensureCollection(collName);
     return await loadShardPoints<SymbolRef[]>(
@@ -737,11 +758,7 @@ export async function loadReverseShard(
   generation?: string,
 ): Promise<Record<string, string[]> | null> {
   try {
-    let gen = generation;
-    if (gen === undefined) {
-      const meta = await loadSymbolGraphMeta(projectId);
-      gen = meta?.generation;
-    }
+    const gen = await resolveReadGeneration(projectId, generation);
     const collName = symgraphIndexCollectionName(projectId);
     await ensureCollection(collName);
     const bucketHex = reverseShardHex(bucket);
@@ -767,6 +784,36 @@ const projectLocks = new Map<string, Promise<void>>();
 const stagingGenerationsByProject = new Map<string, Set<string>>();
 const activeReadersByProject = new Map<string, Map<string, number>>();
 const deferredDeletionsByProject = new Map<string, Set<string>>();
+const activeGenerationByProject = new Map<string, string>();
+const deletingGenerationsByProject = new Map<string, Set<string>>();
+
+/** Record the generation named by the project's committed metadata pointer. */
+export function setActiveSymbolGraphGeneration(
+  projectId: string,
+  generation?: string,
+): void {
+  if (generation) {
+    activeGenerationByProject.set(projectId, generation);
+  } else {
+    activeGenerationByProject.delete(projectId);
+  }
+}
+
+function markGenerationDeleting(projectId: string, generation: string): void {
+  let set = deletingGenerationsByProject.get(projectId);
+  if (!set) {
+    set = new Set();
+    deletingGenerationsByProject.set(projectId, set);
+  }
+  set.add(generation);
+}
+
+function unmarkGenerationDeleting(projectId: string, generation: string): void {
+  const set = deletingGenerationsByProject.get(projectId);
+  if (!set) return;
+  set.delete(generation);
+  if (set.size === 0) deletingGenerationsByProject.delete(projectId);
+}
 
 /**
  * Coordinate staging, activation, and cleanup operations per project.
@@ -830,38 +877,61 @@ export function getStagingGenerations(projectId: string): string[] {
   return Array.from(all);
 }
 
-export function retainReader(projectId: string, generation?: string): void {
-  if (!generation) return;
+export function retainReader(
+  projectId: string,
+  generation?: string,
+  allowSupersededGeneration = false,
+): void {
+  const readerGeneration = generation ?? LEGACY_SYMBOL_GRAPH_GENERATION;
+  const activeGeneration = activeGenerationByProject.get(projectId);
+  const isDeleting = deletingGenerationsByProject.get(projectId)?.has(readerGeneration) ?? false;
+  if (
+    isDeleting
+    || (!allowSupersededGeneration && activeGeneration !== undefined && readerGeneration !== activeGeneration)
+  ) {
+    throw new SymbolGraphGenerationChangedError(
+      projectId,
+      readerGeneration,
+      activeGeneration,
+    );
+  }
   let map = activeReadersByProject.get(projectId);
   if (!map) {
     map = new Map();
     activeReadersByProject.set(projectId, map);
   }
-  map.set(generation, (map.get(generation) ?? 0) + 1);
+  map.set(readerGeneration, (map.get(readerGeneration) ?? 0) + 1);
 }
 
 export function releaseReader(projectId: string, generation?: string): void {
-  if (!generation) return;
+  const readerGeneration = generation ?? LEGACY_SYMBOL_GRAPH_GENERATION;
   const map = activeReadersByProject.get(projectId);
   if (!map) return;
-  const count = (map.get(generation) ?? 1) - 1;
+  const count = (map.get(readerGeneration) ?? 1) - 1;
   if (count <= 0) {
-    map.delete(generation);
+    map.delete(readerGeneration);
     if (map.size === 0) activeReadersByProject.delete(projectId);
     const deferred = deferredDeletionsByProject.get(projectId);
-    if (deferred?.has(generation)) {
-      deferred.delete(generation);
+    if (deferred?.has(readerGeneration)) {
+      deferred.delete(readerGeneration);
       if (deferred.size === 0) deferredDeletionsByProject.delete(projectId);
-      deleteGeneration(projectId, generation).catch((err) => {
-        logger.warn("Deferred generation deletion failed", {
-          projectId,
-          generation,
-          error: err instanceof Error ? err.message : String(err),
+      // Mark synchronously before the asynchronous delete starts. A stale
+      // cache cannot acquire a new lease in the gap between release and I/O.
+      markGenerationDeleting(projectId, readerGeneration);
+      deleteGeneration(projectId, readerGeneration)
+        .catch((err) => {
+          logger.warn("Deferred generation deletion failed", {
+            projectId,
+            generation: readerGeneration,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        })
+        .finally(() => {
+          unmarkGenerationDeleting(projectId, readerGeneration);
         });
-      });
     }
   } else {
-    map.set(generation, count);
+    map.set(readerGeneration, count);
   }
 }
 
@@ -879,6 +949,8 @@ export function resetGenerationLifecycleState(): void {
   stagingGenerationsByProject.clear();
   activeReadersByProject.clear();
   deferredDeletionsByProject.clear();
+  activeGenerationByProject.clear();
+  deletingGenerationsByProject.clear();
 }
 
 /** Delete all points belonging to a specific generation from file and index collections. */
@@ -893,9 +965,9 @@ export async function deleteGeneration(projectId: string, generation: string): P
     try {
       await qdrant.delete(collName, {
         wait: true,
-        filter: {
-          must: [{ key: "generation", match: { value: generation } }],
-        },
+        filter: generation === LEGACY_SYMBOL_GRAPH_GENERATION
+          ? { must: [{ is_empty: { key: "generation" } }] }
+          : { must: [{ key: "generation", match: { value: generation } }] },
       });
     } catch (err) {
       logger.warn("deleteGeneration: failed to delete points for generation", {
@@ -931,6 +1003,8 @@ export async function listStoredGenerations(projectId: string): Promise<string[]
           const gen = pt.payload?.generation;
           if (typeof gen === "string" && gen.length > 0) {
             generations.add(gen);
+          } else {
+            generations.add(LEGACY_SYMBOL_GRAPH_GENERATION);
           }
         }
         if (!res.next_page_offset) break;
@@ -952,51 +1026,32 @@ export async function cleanStaleGenerations(
   activeGeneration: string,
 ): Promise<void> {
   if (!activeGeneration) return;
-  const qdrant = getClient();
-  const collNames = [
-    symgraphFileCollectionName(projectId),
-    symgraphIndexCollectionName(projectId),
-  ];
+  setActiveSymbolGraphGeneration(projectId, activeGeneration);
+  const stagingGens = new Set(getStagingGenerations(projectId));
+  const storedGens = await listStoredGenerations(projectId);
 
-  const stagingGens = getStagingGenerations(projectId);
-  const readerGens = getActiveReaderGenerations(projectId);
-  const excludedGenerations = Array.from(
-    new Set([activeGeneration, ...stagingGens, ...readerGens]),
-  );
-  let allDeletesSucceeded = true;
+  // Retire each known stale generation explicitly. Lease acquisition and the
+  // deletion decision are synchronous within one event-loop turn: a reader
+  // acquired while storage was being listed is observed here, while a reader
+  // arriving after markGenerationDeleting is rejected before any I/O begins.
+  for (const gen of storedGens) {
+    if (gen === activeGeneration || stagingGens.has(gen)) continue;
 
-  for (const collName of collNames) {
-    try {
-      await qdrant.delete(collName, {
-        wait: true,
-        filter: {
-          must: [{ key: "generation", match: { except: excludedGenerations } }],
-        },
-      });
-    } catch {
-      allDeletesSucceeded = false;
-    }
-  }
-
-  // Register deferred deletion for any stale generations currently held by active readers
-  for (const gen of readerGens) {
-    if (gen !== activeGeneration && !stagingGens.includes(gen)) {
+    if (hasActiveReaders(projectId, gen)) {
       let deferred = deferredDeletionsByProject.get(projectId);
       if (!deferred) {
         deferred = new Set();
         deferredDeletionsByProject.set(projectId, deferred);
       }
       deferred.add(gen);
+      continue;
     }
-  }
 
-  // If filtered delete did not succeed on all collections, fall back to explicit per-generation delete
-  if (!allDeletesSucceeded) {
-    const stored = await listStoredGenerations(projectId);
-    for (const gen of stored) {
-      if (!excludedGenerations.includes(gen)) {
-        await deleteGeneration(projectId, gen);
-      }
+    markGenerationDeleting(projectId, gen);
+    try {
+      await deleteGeneration(projectId, gen);
+    } finally {
+      unmarkGenerationDeleting(projectId, gen);
     }
   }
 }

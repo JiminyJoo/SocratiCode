@@ -8,11 +8,21 @@ import {
   invalidateGraphCache,
   rebuildGraph,
 } from "../../src/services/code-graph.js";
+import {
+  dropSymbolGraphCache,
+  getSymbolGraphCache,
+} from "../../src/services/symbol-graph-cache.js";
 import { updateChangedFilesSymbolGraph } from "../../src/services/symbol-graph-incremental.js";
 import {
+  deleteSymbolGraphData,
+  LEGACY_SYMBOL_GRAPH_GENERATION,
+  listStoredGenerations,
   loadFilePayload,
   loadSymbolGraphMeta,
+  saveFilePayload,
+  saveSymbolGraphMeta,
 } from "../../src/services/symbol-graph-store.js";
+import type { SymbolGraphFilePayload, SymbolGraphMeta } from "../../src/types.js";
 import {
   createFixtureProject,
   type FixtureProject,
@@ -186,6 +196,103 @@ describe.skipIf(!dockerAvailable)(
         } catch {
           /* ignore */
         }
+      }
+    });
+  },
+);
+
+describe.skipIf(!dockerAvailable)(
+  "symbol-graph legacy generation compatibility",
+  { timeout: 120_000 },
+  () => {
+    it("keeps a schema-v1 reader stable until the replacement generation is committed", async () => {
+      await waitForQdrant();
+      const legacyFixture = createFixtureProject("symbol-graph-legacy-generation-test");
+      const legacyProjectId = projectIdFromPath(legacyFixture.root);
+      const relativePath = "src/index.ts";
+      const absolutePath = path.join(legacyFixture.root, relativePath);
+      let releaseLegacyReader: (() => void) | undefined;
+
+      const legacyPayload: SymbolGraphFilePayload = {
+        file: relativePath,
+        language: "typescript",
+        contentHash: "legacy-content-hash",
+        symbols: [{
+          id: `${relativePath}::legacyEntry#1`,
+          name: "legacyEntry",
+          qualifiedName: "legacyEntry",
+          kind: "function",
+          isExported: true,
+          file: relativePath,
+          line: 1,
+          endLine: 1,
+          language: "typescript",
+        }],
+        outgoingCalls: [],
+      };
+      const legacyMeta: SymbolGraphMeta = {
+        projectId: legacyProjectId,
+        symbolCount: 1,
+        edgeCount: 0,
+        fileCount: 1,
+        unresolvedEdgePct: 0,
+        builtAt: Date.now(),
+        schemaVersion: 1,
+      };
+
+      try {
+        await deleteSymbolGraphData(legacyProjectId);
+        dropSymbolGraphCache(legacyProjectId);
+        await saveFilePayload(legacyProjectId, legacyPayload);
+        await saveSymbolGraphMeta(legacyProjectId, legacyMeta);
+
+        const legacyCache = await getSymbolGraphCache(legacyProjectId);
+        expect(legacyCache).not.toBeNull();
+        if (!legacyCache) return;
+        releaseLegacyReader = legacyCache.acquireReader();
+
+        fs.writeFileSync(
+          absolutePath,
+          "export function currentEntry(): number { return 2; }\n",
+          "utf-8",
+        );
+        await rebuildGraph(legacyFixture.root);
+
+        const legacyRead = await legacyCache.getFilePayload(relativePath);
+        expect(legacyRead?.symbols.map((symbol) => symbol.name)).toContain("legacyEntry");
+        expect(legacyRead?.symbols.map((symbol) => symbol.name)).not.toContain("currentEntry");
+
+        const currentCache = await getSymbolGraphCache(legacyProjectId);
+        expect(currentCache?.meta.generation).toBeDefined();
+        const currentGeneration = currentCache?.meta.generation;
+        const currentRead = await currentCache?.getFilePayload(relativePath);
+        expect(currentRead?.symbols.map((symbol) => symbol.name)).toContain("currentEntry");
+        expect(await listStoredGenerations(legacyProjectId)).toEqual(
+          expect.arrayContaining([
+            LEGACY_SYMBOL_GRAPH_GENERATION,
+            currentGeneration,
+          ]),
+        );
+
+        releaseLegacyReader();
+        releaseLegacyReader = undefined;
+
+        const deadline = Date.now() + 5_000;
+        let generations = await listStoredGenerations(legacyProjectId);
+        while (
+          generations.includes(LEGACY_SYMBOL_GRAPH_GENERATION)
+          && Date.now() < deadline
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          generations = await listStoredGenerations(legacyProjectId);
+        }
+        expect(generations).toEqual([currentGeneration]);
+      } finally {
+        releaseLegacyReader?.();
+        dropSymbolGraphCache(legacyProjectId);
+        invalidateGraphCache(legacyFixture.root);
+        try { await deleteSymbolGraphData(legacyProjectId); } catch { /* ignore */ }
+        legacyFixture.cleanup();
       }
     });
   },

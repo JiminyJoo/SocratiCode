@@ -3,7 +3,7 @@
 import path from "node:path";
 import { projectIdFromPath } from "../config.js";
 import { mergeExtraExtensions, SOCRATICODE_VERSION } from "../constants.js";
-import { awaitGraphBuild, describeGraphBuilder, ensureDynamicLanguages, findCircularDependencies, generateMermaidDiagram, getDynamicLanguageStatus, getFileDependencies, getGraphBuildProgress, getGraphStats, getGraphStatus, getLastGraphBuildCompleted, getOrBuildGraph, isGraphBuildInProgress, isImportResolutionLow, rebuildGraph, removeGraph } from "../services/code-graph.js";
+import { awaitGraphBuild, describeGraphBuilder, ensureDynamicLanguages, findCircularDependencies, generateMermaidDiagram, getAstGrepLang, getDynamicLanguageStatus, getFileDependencies, getGraphBuildProgress, getGraphStats, getGraphStatus, getLastGraphBuildCompleted, getOrBuildGraph, isGraphBuildInProgress, isImportResolutionLow, rebuildGraph, removeGraph } from "../services/code-graph.js";
 import { detectEntryPoints } from "../services/graph-entrypoints.js";
 import {
   type FlowNode,
@@ -16,8 +16,14 @@ import {
 import { openInBrowser, writeInteractiveGraphFile } from "../services/graph-visualize-browser.js";
 import { buildInteractiveGraphHtml } from "../services/graph-visualize-html.js";
 import { logger } from "../services/logger.js";
-import { getSymbolGraphCache } from "../services/symbol-graph-cache.js";
-import { StorageReadError } from "../services/symbol-graph-store.js";
+import {
+  dropSymbolGraphCacheGeneration,
+  getSymbolGraphCache,
+} from "../services/symbol-graph-cache.js";
+import {
+  StorageReadError,
+  SymbolGraphGenerationChangedError,
+} from "../services/symbol-graph-store.js";
 import { ensureWatcherStarted } from "../services/watcher.js";
 
 /**
@@ -33,28 +39,56 @@ const SYMBOL_GRAPH_TOOLS = new Set([
   "codebase_symbols",
 ]);
 
+function hasRelevantGrammarFailure(
+  failed: Array<{ name: string }>,
+  target: string,
+  file?: string,
+  symbolId?: string,
+): boolean {
+  if (failed.length === 0) return false;
+  const hintedFile = symbolId?.split("::")[0]
+    ?? file
+    ?? (looksLikeFilePath(target) ? target : undefined);
+  if (!hintedFile) return true;
+
+  const grammar = getAstGrepLang(path.extname(hintedFile).toLowerCase());
+  if (!grammar) return true;
+  return failed.some(({ name }) => name.toLowerCase() === String(grammar).toLowerCase());
+}
+
 export async function handleGraphTool(
   name: string,
   args: Record<string, unknown>,
 ): Promise<string> {
-  try {
-    const result = await dispatchGraphTool(name, args);
-    if (!SYMBOL_GRAPH_TOOLS.has(name)) return result;
-    const resolved = path.resolve((args.projectPath as string) || process.cwd());
-    const symbolGraphError = getLastGraphBuildCompleted(resolved)?.symbolGraphError;
-    if (!symbolGraphError) return result;
-    return [
-      `WARNING: the last graph build could not persist the symbol graph: ${symbolGraphError}`,
-      "Results below may be stale or incomplete until a rebuild succeeds.",
-      "",
-      result,
-    ].join("\n");
-  } catch (err) {
-    if (err instanceof StorageReadError) {
-      return `Storage error: ${err.message}`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = await dispatchGraphTool(name, args);
+      if (!SYMBOL_GRAPH_TOOLS.has(name)) return result;
+      const resolved = path.resolve((args.projectPath as string) || process.cwd());
+      const symbolGraphError = getLastGraphBuildCompleted(resolved)?.symbolGraphError;
+      if (!symbolGraphError) return result;
+      return [
+        `WARNING: the last graph build could not persist the symbol graph: ${symbolGraphError}`,
+        "Results below may be stale or incomplete until a rebuild succeeds.",
+        "",
+        result,
+      ].join("\n");
+    } catch (err) {
+      if (
+        err instanceof SymbolGraphGenerationChangedError
+        && SYMBOL_GRAPH_TOOLS.has(name)
+        && attempt === 0
+      ) {
+        dropSymbolGraphCacheGeneration(err.projectId, err.generation);
+        continue;
+      }
+      if (err instanceof StorageReadError) {
+        return `Storage error: ${err.message}`;
+      }
+      throw err;
     }
-    throw err;
   }
+  return "Storage error: symbol graph generation changed repeatedly while the query was starting";
 }
 
 async function dispatchGraphTool(
@@ -425,7 +459,12 @@ async function dispatchGraphTool(
       }
       ensureDynamicLanguages();
       const grammarStatus = getDynamicLanguageStatus();
-      const isIncomplete = grammarStatus.failed.length > 0 || (cache.meta.schemaVersion ? cache.meta.schemaVersion < 2 : true);
+      const isIncomplete = hasRelevantGrammarFailure(
+        grammarStatus.failed,
+        target,
+        file,
+        symbolId,
+      ) || (cache.meta.schemaVersion ? cache.meta.schemaVersion < 2 : true);
       const result = await getImpactRadius(cache, target || (symbolId as string), depth, { file, symbolId, isIncomplete });
 
       if (result.status === "graph_upgrade_required") {
@@ -514,26 +553,31 @@ async function dispatchGraphTool(
         }
       }
 
-      // Resolve symbol name → id via name index (file hint disambiguates)
-      const nameIndex = await cache.getNameIndex();
-      let refs = nameIndex.get(entrypoint) ?? [];
-      const fileHint = (args.file as string | undefined)?.trim();
-      if (fileHint) refs = refs.filter((r) => r.file === fileHint);
-      if (refs.length === 0) {
-        return `No symbol named "${entrypoint}" found${fileHint ? ` in ${fileHint}` : ""}.`;
-      }
-      if (refs.length > 1) {
-        const lines = [`Symbol "${entrypoint}" is ambiguous (${refs.length} matches). Pass \`file\` to disambiguate:`, ""];
-        for (const r of refs) lines.push(`  - ${r.file}`);
-        return lines.join("\n");
-      }
-      const depth = typeof args.depth === "number" ? args.depth : 5;
-      const tree = await getCallFlow(cache, refs[0].id, depth);
-      if (!tree) return `Could not load symbol "${entrypoint}".`;
+      // Hold one generation across name resolution and the complete traversal.
+      const release = cache.acquireReader();
+      try {
+        const nameIndex = await cache.getNameIndex();
+        let refs = nameIndex.get(entrypoint) ?? [];
+        const fileHint = (args.file as string | undefined)?.trim();
+        if (fileHint) refs = refs.filter((r) => r.file === fileHint);
+        if (refs.length === 0) {
+          return `No symbol named "${entrypoint}" found${fileHint ? ` in ${fileHint}` : ""}.`;
+        }
+        if (refs.length > 1) {
+          const lines = [`Symbol "${entrypoint}" is ambiguous (${refs.length} matches). Pass \`file\` to disambiguate:`, ""];
+          for (const r of refs) lines.push(`  - ${r.file}`);
+          return lines.join("\n");
+        }
+        const depth = typeof args.depth === "number" ? args.depth : 5;
+        const tree = await getCallFlow(cache, refs[0].id, depth);
+        if (!tree) return `Could not load symbol "${entrypoint}".`;
 
-      const lines = [`Call flow from ${tree.symbolName} (${tree.file}:${tree.line})`, ""];
-      renderFlowTree(tree, "", true, lines);
-      return lines.join("\n");
+        const lines = [`Call flow from ${tree.symbolName} (${tree.file}:${tree.line})`, ""];
+        renderFlowTree(tree, "", true, lines);
+        return lines.join("\n");
+      } finally {
+        release();
+      }
     }
 
     case "codebase_symbol": {
