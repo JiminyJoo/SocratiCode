@@ -83,9 +83,13 @@ describe("symbol-graph collection concurrency", () => {
   });
 
   it("propagates a transient failure and retries only the failed collection", async () => {
-    mockCreateCollection
-      .mockRejectedValueOnce(qdrantError("Service Unavailable", 503))
-      .mockResolvedValue(undefined);
+    const failedCollection = symgraphMetaCollectionName("project");
+    let failedAttempts = 0;
+    mockCreateCollection.mockImplementation(async (name: string) => {
+      if (name === failedCollection && failedAttempts++ === 0) {
+        throw qdrantError("Service Unavailable", 503);
+      }
+    });
 
     await expect(ensureSymbolGraphCollections("project")).rejects.toThrow(
       "Service Unavailable",
@@ -94,6 +98,19 @@ describe("symbol-graph collection concurrency", () => {
 
     expect(mockGetCollections).toHaveBeenCalledTimes(4);
     expect(mockCreateCollection).toHaveBeenCalledTimes(4);
+    expect(
+      mockCreateCollection.mock.calls.filter(([name]) => name === failedCollection),
+    ).toHaveLength(2);
+    expect(
+      mockCreateCollection.mock.calls.filter(
+        ([name]) => name === symgraphFileCollectionName("project"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      mockCreateCollection.mock.calls.filter(
+        ([name]) => name === symgraphIndexCollectionName("project"),
+      ),
+    ).toHaveLength(1);
   });
 
   it("does not recreate existing collections", async () => {
