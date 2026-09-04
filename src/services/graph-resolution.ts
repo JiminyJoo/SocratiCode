@@ -1911,10 +1911,19 @@ export function resolveRustImport(
 
   // The package whose manifest governs this file, which is what says under
   // which names its dependencies are imported: the same crate answers to
-  // different names in two members of one workspace.
+  // different names in two members of one workspace. The innermost manifest
+  // containing the file wins, so depth is what ranks them — and the root's
+  // `"."` names no directory at all, it is the empty prefix. Measured by its
+  // length it is one character, which ties with every member directory of one
+  // character and, the sort being stable and manifests walked shallowest
+  // first, wins the tie: every file of `a/` was then governed by the root's
+  // manifest. A `[workspace]`-only root declares no dependency and no edition,
+  // so `a/`'s crates went unreachable and its 2018-or-later files were read as
+  // 2015 (review finding).
+  const depthOf = (crate: RustCrate): number => (crate.dir === "." ? 0 : crate.dir.length);
   const importingCrate = crates
     .filter((crate) => crate.dir === "." || relSourceFile.startsWith(`${crate.dir}/`))
-    .sort((a, b) => b.dir.length - a.dir.length)[0];
+    .sort((a, b) => depthOf(b) - depthOf(a))[0];
 
   // A crate this project declares, preferring one whose directory contains the
   // importing file — two manifests can carry the same package name, and a
@@ -2187,13 +2196,14 @@ export function resolveRustImport(
     // not the dependency. `declaredMods` left undefined keeps the older,
     // looser reading, so every existing caller behaves as before.
     //
-    // The gate is a 2018 rule and only a 2018 rule. In edition 2015 the path
-    // is absolute from the crate root, so it names a module of the crate and
-    // not one in the file's scope: `use registry::write;` in `src/client.rs`
-    // compiles with `mod registry;` written in `lib.rs` and nothing at all in
-    // `client.rs` — checked on cargo 1.70.0 and 1.98.0. Gating that on a
-    // declaration in the importing file would drop the edge on every 2015
-    // crate, which is every crate whose manifest omits the key.
+    // The gate is on in every edition. An earlier round wrote here that it was
+    // a 2018 rule only, on the ground that `use registry::write;` in
+    // `src/client.rs` compiles with `mod registry;` written in `lib.rs` — true
+    // of rustc, and the edge is indeed one this resolver does not draw. What
+    // the decision recorded above `edition2015` says is that acting on it costs
+    // more than it buys: see that comment for the four ways it drew edges rustc
+    // rejects. This paragraph is what that decision replaced (review finding:
+    // it contradicted the code and the other comment both).
     // A head the declaration moved is answered from where it moved it, and its
     // own children from the directory that file sits in — `src/inner.rs` for a
     // module filed at `src/custom.rs`, which is what E0583 asks for.

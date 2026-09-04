@@ -497,3 +497,108 @@ describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info, in editi
     expect(pairs.has("src/deep/child.rs -> src/deep/local.rs")).toBe(true);
   });
 });
+
+// A member directory of a single character, under a `[workspace]`-only root.
+// The root's `"."` is the empty prefix, but measured as a string it is one
+// character long and tied with `a/`, and the tie went to the root: every file
+// of `a/` was governed by a manifest that declares no dependency and no
+// edition. Both halves of that show here, and cargo settles both — `a` really
+// does depend on `bb`, and `::bb` really is the crate rather than the local
+// module, since `a/src/bb.rs` defines no `Thing`.
+//
+// `a/sub` is here because ranking by depth decides two orderings, not one:
+// root against member, and shallow member against the one nested inside it. A
+// first cut of this fixture pinned only the first, and answering "0 for the
+// root, 1 for everything else" kept it green while `a` governed `a/sub` — where
+// `use cc::Deep;` is E0432, `cc` being declared by `sub` alone.
+describe.skipIf(!haveCargo())("the Rust graph against cargo's dep-info, in a one-letter member (needs cargo on PATH)", () => {
+  let root: string;
+  let read: Set<string>;
+
+  beforeAll(() => {
+    ensureDynamicLanguages();
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-cargo-short-"));
+
+    write(root, "Cargo.toml", ["[workspace]", 'members = ["a", "a/sub", "bb", "cc"]', 'resolver = "2"', ""].join("\n"));
+    write(
+      root,
+      "a/Cargo.toml",
+      ["[package]", 'name = "pkg"', 'version = "0.1.0"', 'edition = "2021"', "", "[dependencies]", 'bb = { path = "../bb" }', ""].join("\n"),
+    );
+    write(root, "a/src/lib.rs", ["pub mod bb;", "", "use ::bb::Thing;", "", "pub fn go() -> Thing {", "    Thing", "}", ""].join("\n"));
+    // Declared, so rustc compiles it — and it defines no `Thing`, which is why
+    // the `use` above compiles only when `::bb` is the dependency crate.
+    write(root, "a/src/bb.rs", "pub struct Other;\n");
+    // Nested inside `a/`, and depending on what `a` does not: `cc` is declared
+    // here and nowhere else, so `a` governing this file loses the edge.
+    write(
+      root,
+      "a/sub/Cargo.toml",
+      ["[package]", 'name = "sub"', 'version = "0.1.0"', 'edition = "2021"', "", "[dependencies]", 'cc = { path = "../../cc" }', ""].join("\n"),
+    );
+    write(root, "a/sub/src/lib.rs", ["use cc::Deep;", "", "pub fn deep() -> Deep {", "    Deep", "}", ""].join("\n"));
+    write(root, "bb/Cargo.toml", ["[package]", 'name = "bb"', 'version = "0.1.0"', 'edition = "2021"', ""].join("\n"));
+    write(root, "bb/src/lib.rs", "pub struct Thing;\n");
+    write(root, "cc/Cargo.toml", ["[package]", 'name = "cc"', 'version = "0.1.0"', 'edition = "2021"', ""].join("\n"));
+    write(root, "cc/src/lib.rs", "pub struct Deep;\n");
+
+    try {
+      execFileSync("cargo", ["check", "--offline", "--quiet", "-p", "pkg", "-p", "sub", "--lib"], {
+        cwd: root,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 120_000,
+      });
+    } catch (err) {
+      const details = err instanceof Error && "stderr" in err ? String(err.stderr) : String(err);
+      throw new Error(`the fixture workspace did not compile, so there is no oracle:\n${details}`);
+    }
+
+    read = sourcesRustcRead(root);
+  }, 180_000);
+
+  afterAll(() => {
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+    } catch {
+      // ignore cleanup errors
+    }
+  });
+
+  it("reads a dep-info that names the dependency and the local module both", () => {
+    expect(read.has("a/src/lib.rs")).toBe(true);
+    expect(read.has("a/src/bb.rs")).toBe(true);
+    expect(read.has("bb/src/lib.rs")).toBe(true);
+    expect(read.has("a/sub/src/lib.rs")).toBe(true);
+    expect(read.has("cc/src/lib.rs")).toBe(true);
+  });
+
+  // Three assertions, three tests: each names a different way the ranking goes
+  // wrong, and one `it` holding all three reports only the first to fail.
+  it("reaches a one-letter member's own dependency, which the root declares nothing of", async () => {
+    // Review finding. Governed by a `[workspace]`-only root, `a` declared
+    // nothing, and the fence turned every crate it names away.
+    const graph = await buildCodeGraph(root);
+    const pairs = graph.edges.map((e) => `${e.source} -> ${e.target}`);
+    expect(pairs).toContain("a/src/lib.rs -> bb/src/lib.rs");
+  });
+
+  it("does not read a one-letter member's 2021 file as edition 2015", async () => {
+    // The root declares no edition either, which defaults to 2015, where a
+    // leading `::` counts from the crate root — turning `use ::bb::Thing` into
+    // a second edge to the local `a/src/bb.rs`. The `mod bb;` declaration draws
+    // one edge there, and it is the only one.
+    const graph = await buildCodeGraph(root);
+    const pairs = graph.edges.map((e) => `${e.source} -> ${e.target}`);
+    expect(pairs.filter((p) => p === "a/src/lib.rs -> a/src/bb.rs")).toHaveLength(1);
+  });
+
+  it("governs a nested member by its own manifest, not its parent package's", async () => {
+    // The other ordering depth decides. `a` declares `bb` and not `cc`, so
+    // `a` governing `a/sub` loses this edge — and `use cc::Deep;` there is
+    // E0432 to rustc, which is what the build above proves it is not.
+    const graph = await buildCodeGraph(root);
+    const pairs = graph.edges.map((e) => `${e.source} -> ${e.target}`);
+    expect(pairs).toContain("a/sub/src/lib.rs -> cc/src/lib.rs");
+  });
+});
