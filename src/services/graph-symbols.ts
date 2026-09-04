@@ -804,8 +804,9 @@ function extractFromTsLike(
     if (!node) return new Set();
     const range = node.range?.();
     const cacheKey = range ? `${node.kind?.()}:${range.start.index}:${range.end.index}` : "";
-    if (cacheKey && declaredBindingsCache.has(cacheKey)) {
-      return declaredBindingsCache.get(cacheKey)!;
+    if (cacheKey) {
+      const cached = declaredBindingsCache.get(cacheKey);
+      if (cached) return cached;
     }
 
     const bound = new Set<string>();

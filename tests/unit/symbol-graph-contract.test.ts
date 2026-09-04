@@ -613,9 +613,8 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
       ],
     });
 
-    // 3. Concurrent startup cleanup runs for projId while gen1 is still active
-    // cleanStaleGenerations should respect stagedGen for projId
-    await cleanStaleGenerations(projId, gen1!);
+    if (!gen1) throw new Error("Expected gen1 to be defined");
+    await cleanStaleGenerations(projId, gen1);
 
     // Verify point for stagedGen was NOT deleted
     const stored = await qdrant.retrieve(collName, { ids: ["point-staged-1"] });

@@ -777,7 +777,7 @@ export async function coordinateProject<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const current = projectLocks.get(projectId) ?? Promise.resolve();
-  let release: () => void;
+  let release: () => void = () => {};
   const next = new Promise<void>((res) => {
     release = res;
   });
@@ -790,7 +790,7 @@ export async function coordinateProject<T>(
   try {
     return await fn();
   } finally {
-    release!();
+    release();
     if (projectLocks.get(projectId) === chained) {
       projectLocks.delete(projectId);
     }
