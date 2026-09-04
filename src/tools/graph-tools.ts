@@ -279,7 +279,7 @@ async function dispatchGraphTool(
       ensureDynamicLanguages();
       const grammarStatus = getDynamicLanguageStatus();
       const BUILTIN_AST_LANGUAGES = [
-        "csharp", "go", "java", "javascript", "kotlin", "python", "rust", "tsx", "typescript",
+        "css", "html", "javascript", "tsx", "typescript",
       ];
       const renderGrammarBlock = (): string[] => {
         const block: string[] = ["", "AST grammars:"];

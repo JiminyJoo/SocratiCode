@@ -289,7 +289,7 @@ async function saveShardPoints<V>(
     vector: [0],
     payload: {
       ...payloadFor(record, 0, 1),
-      ...(generation !== undefined ? { generation } : {}),
+      ...(generation ? { generation } : {}),
     },
   };
   const parts =
@@ -313,7 +313,7 @@ async function saveShardPoints<V>(
           payload: {
             ...payloadFor(entries, i, parts.length),
             write: writeId,
-            ...(generation !== undefined ? { generation } : {}),
+            ...(generation ? { generation } : {}),
           },
         }));
 
@@ -556,7 +556,7 @@ export async function saveFilePayload(
     vector: [0],
     payload: {
       filePayload: payload,
-      ...(generation !== undefined ? { generation } : {}),
+      ...(generation ? { generation } : {}),
     },
   };
   assertPointFits(point, `symbol payload for ${payload.file}`);
@@ -582,7 +582,7 @@ export async function saveFilePayloads(
     vector: [0],
     payload: {
       filePayload: p,
-      ...(generation !== undefined ? { generation } : {}),
+      ...(generation ? { generation } : {}),
     },
   }));
   await upsertWithinBudget(collName, points, (i) => `symbol payload for ${payloads[i].file}`);
@@ -781,19 +781,17 @@ export async function coordinateProject<T>(
   const next = new Promise<void>((res) => {
     release = res;
   });
-  projectLocks.set(
-    projectId,
-    current.then(
-      () => next,
-      () => next,
-    ),
+  const chained = current.then(
+    () => next,
+    () => next,
   );
+  projectLocks.set(projectId, chained);
   await current;
   try {
     return await fn();
   } finally {
     release!();
-    if (projectLocks.get(projectId) === next) {
+    if (projectLocks.get(projectId) === chained) {
       projectLocks.delete(projectId);
     }
   }

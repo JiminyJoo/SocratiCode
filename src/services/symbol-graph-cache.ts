@@ -139,50 +139,60 @@ export class SymbolGraphCache {
   /** Get the full name index, loading all shards on first access. */
   async getNameIndex(): Promise<Map<string, SymbolRef[]>> {
     if (this.nameIndex) return this.nameIndex;
-    const merged = new Map<string, SymbolRef[]>();
-    const shardKeys = allNameShardKeys();
-    const shards = await Promise.all(
-      shardKeys.map((k) => loadNameShard(this.projectId, k, this.meta.generation)),
-    );
-    for (const shard of shards) {
-      if (!shard) continue;
-      for (const [name, refs] of Object.entries(shard)) {
-        const existing = merged.get(name);
-        if (existing) {
-          existing.push(...refs);
-        } else {
-          merged.set(name, [...refs]);
+    const release = this.acquireReader();
+    try {
+      const merged = new Map<string, SymbolRef[]>();
+      const shardKeys = allNameShardKeys();
+      const shards = await Promise.all(
+        shardKeys.map((k) => loadNameShard(this.projectId, k, this.meta.generation)),
+      );
+      for (const shard of shards) {
+        if (!shard) continue;
+        for (const [name, refs] of Object.entries(shard)) {
+          const existing = merged.get(name);
+          if (existing) {
+            existing.push(...refs);
+          } else {
+            merged.set(name, [...refs]);
+          }
         }
       }
+      this.nameIndex = merged;
+      this.stats.nameIndexLoaded = true;
+      return merged;
+    } finally {
+      release();
     }
-    this.nameIndex = merged;
-    this.stats.nameIndexLoaded = true;
-    return merged;
   }
 
   /** Get the full reverse symbol index (calleeSymbolId -> Set<callerSymbolId>), loading all shards on first access. */
   async getReverseSymbolIndex(): Promise<Map<string, Set<string>>> {
     if (this.reverseSymbolIndex) return this.reverseSymbolIndex;
-    const merged = new Map<string, Set<string>>();
-    const buckets: number[] = [];
-    for (let i = 0; i < SYMBOL_REVERSE_SHARDS; i++) buckets.push(i);
-    const shards = await Promise.all(
-      buckets.map((b) => loadReverseShard(this.projectId, b, this.meta.generation)),
-    );
-    for (const shard of shards) {
-      if (!shard) continue;
-      for (const [calleeKey, callerList] of Object.entries(shard)) {
-        const existing = merged.get(calleeKey);
-        if (existing) {
-          for (const f of callerList) existing.add(f);
-        } else {
-          merged.set(calleeKey, new Set(callerList));
+    const release = this.acquireReader();
+    try {
+      const merged = new Map<string, Set<string>>();
+      const buckets: number[] = [];
+      for (let i = 0; i < SYMBOL_REVERSE_SHARDS; i++) buckets.push(i);
+      const shards = await Promise.all(
+        buckets.map((b) => loadReverseShard(this.projectId, b, this.meta.generation)),
+      );
+      for (const shard of shards) {
+        if (!shard) continue;
+        for (const [calleeKey, callerList] of Object.entries(shard)) {
+          const existing = merged.get(calleeKey);
+          if (existing) {
+            for (const f of callerList) existing.add(f);
+          } else {
+            merged.set(calleeKey, new Set(callerList));
+          }
         }
       }
+      this.reverseSymbolIndex = merged;
+      this.stats.reverseIndexLoaded = true;
+      return merged;
+    } finally {
+      release();
     }
-    this.reverseSymbolIndex = merged;
-    this.stats.reverseIndexLoaded = true;
-    return merged;
   }
 
   /** Get the full reverse-call file index, derived from reverseSymbolIndex. */
