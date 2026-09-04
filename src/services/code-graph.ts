@@ -16,7 +16,7 @@ import { ensureElixirTemplateParsers, isElixirTemplateExtension } from "./elixir
 import { detectExtensionFromSource, resolveExtensionlessExtension } from "./extensionless.js";
 import { loadPathAliases } from "./graph-aliases.js";
 import { extractImports } from "./graph-imports.js";
-import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
+import { buildCsNamespaceMap, buildDartPackageMap, buildElixirModuleMap, buildGoModuleInfo, buildJvmSuffixMap, buildPhpFqcnMap, buildPhpPsr4Map, buildPythonManifests, buildRustCrateMap, pythonRootsForFile, resolveImport } from "./graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
 import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
 import { createIgnoreFilter, shouldIgnore } from "./ignore.js";
@@ -533,6 +533,13 @@ export async function getGraphStatus(projectPath: string): Promise<{
 // ── Register dynamic language grammars ───────────────────────────────────
 
 let dynamicLangsRegistered = false;
+/**
+ * The declaration map a path written inside an inline `mod { … }` block is
+ * answered with: empty, because the file's own declarations are not in that
+ * block's scope. Shared and never written.
+ */
+const EMPTY_DECLARED_MODS: Map<string, string> = new Map();
+
 const loadedDynamicLanguages = new Set<string>();
 const failedDynamicLanguages = new Map<string, string>();
 
@@ -908,6 +915,17 @@ export async function buildCodeGraph(
   const hasElixir = files.some((f) => [".ex", ".exs"].includes(path.extname(f).toLowerCase()));
   const elixirModuleMap = hasElixir ? buildElixirModuleMap(fileSet, resolvedPath) : undefined;
 
+  // Record every crate the tree declares, from each Cargo.toml (discovered by
+  // walking, like go.mod and pubspec.yaml — Cargo.toml is never in the
+  // graphable file set). A Rust path names a position in a module tree
+  // (`crate::`, `super::`) or another crate by name, neither of which the
+  // resolver could follow without knowing where each crate's root module sits:
+  // every specifier containing `::` resolved to null, so the file graph held
+  // only bare `mod` declarations. An empty list keeps `mod`, `super` and `self`
+  // resolving from the file's own position, as before.
+  const hasRust = files.some((f) => path.extname(f).toLowerCase() === ".rs");
+  const rustCrates = hasRust ? buildRustCrateMap(fileSet, resolvedPath) : undefined;
+
   for (const relPath of files) {
     let ext = path.extname(relPath).toLowerCase();
     let lang = getAstGrepLang(ext);
@@ -1023,13 +1041,48 @@ export async function buildCodeGraph(
       });
     }
 
+    // Which modules this file brings into the tree by declaring them. A Rust
+    // path with an unanchored head can only reach a module the file declares,
+    // and the declaration is the only evidence of that in the source: matching
+    // a neighbouring file by name instead let a third-party head capture the
+    // import whenever a file of that name happened to exist.
+    //
+    // The name comes from the declaration itself and not from its specifier.
+    // Reading the specifier's last segment got both ends wrong: a
+    // `#[path = "custom.rs"] mod foo;` recorded `custom.rs` and lost every
+    // `use foo::Item;` in that file, and a `mod bar;` written inside
+    // `mod outer { … }` recorded `bar` as if the file declared it — which
+    // handed a same-named neighbouring file back the capture this gate exists
+    // to stop. Both checked with cargo 1.70.0 and 1.98.0: the attribute form
+    // compiles with `foo` in scope, and at the file's own level a name
+    // declared inside an inline block reaches the dependency instead, or
+    // fails with E0432 when there is none.
+    // The map carries the file with the name, because half the declarations
+    // move it: `#[path = "custom.rs"] mod foo;` names `foo` and files it at
+    // `custom.rs`, and a resolver holding only the name looks for `src/foo.rs`,
+    // finds nothing, and falls through to a library called `foo` if the
+    // workspace has one — an edge into an unrelated crate. Where the
+    // declaration does not move anything, the value is the name itself.
+    const declaredMods = new Map<string, string>();
+    for (const imp of importInfos) {
+      if (imp.declaredName) declaredMods.set(imp.declaredName, imp.moduleSpecifier);
+    }
+
     for (const imp of importInfos) {
       node.imports.push(imp.moduleSpecifier);
 
       // Try to resolve to a project file
       // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
       const resolutionLanguage = imp.isCssImport ? "css" : language;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap);
+      // A bare path written inside an inline `mod { … }` block is answered
+      // without the file's declarations: they are not in that block's scope,
+      // and handing them over drew an edge rustc rejects with E0432. The map is
+      // emptied rather than omitted — omitting it turns the gate off entirely,
+      // which is the looser reading, not a stricter one. Edition 2015 is
+      // unaffected: there the path is absolute from the crate root and never
+      // consulted the map to begin with.
+      const scopedMods = imp.fromInlineBlock ? EMPTY_DECLARED_MODS : declaredMods;
+      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo, phpPsr4Map, dartPackageMap, pythonRootsFor(relPath), elixirModuleMap, phpFqcnMap, rustCrates, scopedMods, imp.isModuleDeclaration === true);
       if (resolved) {
         node.dependencies.push(resolved);
 

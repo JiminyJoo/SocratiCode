@@ -31,8 +31,11 @@ vi.mock("../../src/services/logger.js", () => ({
   },
 }));
 
-vi.mock("../../src/services/ignore.js", () => ({
-  createIgnoreFilter: vi.fn(() => ({ ignores: () => false })),
+vi.mock("../../src/services/ignore.js", async (importOriginal) => ({
+  // The marker test is the real one: it is what the watcher relies on to see
+  // an environment appear or vanish, and a stub would prove nothing about it.
+  ...(await importOriginal<typeof import("../../src/services/ignore.js")>()),
+  createIgnoreFilter: vi.fn(() => ({ ignores: () => false, isEnvironmentRoot: () => false })),
   shouldIgnore: vi.fn(() => false),
 }));
 
@@ -75,7 +78,7 @@ vi.mock("../../src/services/lock.js", () => ({
 }));
 
 import { DETECT_HEAD_BYTES } from "../../src/constants.js";
-import { shouldIgnore } from "../../src/services/ignore.js";
+import { createIgnoreFilter, shouldIgnore } from "../../src/services/ignore.js";
 import { logger } from "../../src/services/logger.js";
 // Import after mocks
 import {
@@ -291,6 +294,33 @@ describe("watcher (unit)", () => {
       await expect(stopWatching("/nonexistent")).resolves.not.toThrow();
       expect(mockUnsubscribe).not.toHaveBeenCalled();
     });
+
+    it("does not start a queued update while native unsubscribe is pending", async () => {
+      vi.useFakeTimers();
+      let releaseUnsubscribe: () => void = () => {};
+      const unsubscribePending = new Promise<void>((resolve) => {
+        releaseUnsubscribe = resolve;
+      });
+      mockUnsubscribe.mockReturnValueOnce(unsubscribePending);
+
+      try {
+        await startWatching(TEST_PROJECT);
+        mockSubscribeCallback?.(null, [
+          { path: path.join(RESOLVED_PROJECT, "src/app.ts"), type: "update" },
+        ]);
+        await vi.advanceTimersByTimeAsync(0);
+
+        const stopping = stopWatching(TEST_PROJECT);
+        await vi.advanceTimersByTimeAsync(2100);
+        expect(mockUpdateProjectIndex).not.toHaveBeenCalled();
+
+        releaseUnsubscribe();
+        await stopping;
+      } finally {
+        releaseUnsubscribe();
+        vi.useRealTimers();
+      }
+    });
   });
 
   describe("stopAllWatchers", () => {
@@ -415,6 +445,369 @@ describe("watcher (unit)", () => {
       // All events were filtered by shouldIgnore, so no update
       expect(mockUpdateProjectIndex).not.toHaveBeenCalled();
       vi.useRealTimers();
+    });
+
+    // ── Environments appearing and vanishing under the watcher ──────────
+    //
+    // Review finding: the filter was built once, at start, and the tree
+    // changes under a watcher. These run on a real directory, because the
+    // gate lets an event through only where the filter and the disk disagree
+    // — a stubbed path would prove nothing about that. `backend/env` rather
+    // than a root `env/`, since the native watcher never reports the latter
+    // (it is skipped at the top level, as `/env` is by the defaults).
+    describe("environments", () => {
+      let root: string;
+      const filterOf = (excluded: (relative: string) => boolean, roots: string[] = []) => ({
+        ignores: excluded,
+        isEnvironmentRoot: (relative: string) => roots.includes(relative.replace(/\/$/, "")),
+      });
+      const underEnv = (relative: string) =>
+        relative === "backend/env" || relative.startsWith("backend/env/");
+      const marker = () => path.join(root, "backend", "env", "pyvenv.cfg");
+
+      beforeEach(() => {
+        root = fs.mkdtempSync(path.join(os.tmpdir(), "socraticode-watch-env-"));
+        vi.mocked(shouldIgnore).mockImplementation((ig, relative) => ig.ignores(relative));
+      });
+
+      afterEach(async () => {
+        await stopAllWatchers();
+        vi.mocked(shouldIgnore).mockReturnValue(false);
+        vi.mocked(createIgnoreFilter).mockReset().mockImplementation(() => filterOf(() => false));
+        fs.rmSync(root, { recursive: true, force: true });
+      });
+
+      // Fake timers live inside this call alone: the debounce is created and
+      // fired here, and nothing else in these tests needs a clock. Installed
+      // in `beforeEach` and restored in `afterEach`, they left vitest's own
+      // hook clock counting on the fake one, and on Node 18 every hook of the
+      // block was reported as timed out after it had already returned (CI
+      // finding); the rest of this file switches them inside the test body
+      // for the same reason.
+      const updatesAfter = async (events: Array<{ path: string; type: "create" | "update" | "delete" }>) => {
+        vi.useFakeTimers();
+        try {
+          mockSubscribeCallback?.(null, events);
+          await vi.advanceTimersByTimeAsync(2100);
+        } finally {
+          vi.useRealTimers();
+        }
+        return mockUpdateProjectIndex.mock.calls.length;
+      };
+
+      it("schedules a reconcile when a marker appears, though nothing about it is indexable", async () => {
+        // A `pyvenv.cfg` is not a source file, so an event on it used to fail
+        // the indexability check and schedule nothing, leaving the
+        // environment's installed libraries in the index until some unrelated
+        // change came along.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(() => false));
+        await startWatching(root);
+
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+        expect(await updatesAfter([{ path: marker(), type: "create" }])).toBe(1);
+
+        // Conda's marker is a directory, and its creation arrives as the
+        // files inside it.
+        const history = path.join(root, "tools", "env", "conda-meta", "history");
+        fs.mkdirSync(path.dirname(history), { recursive: true });
+        fs.writeFileSync(history, "");
+        expect(await updatesAfter([{ path: history, type: "create" }])).toBe(2);
+      });
+
+      it("schedules a reconcile when a marker is deleted from a directory the filter excludes", async () => {
+        // Once the environment exists its directory is excluded, so the
+        // marker's deletion used to be dropped by the filter before anything
+        // looked at it — and the source files written in its place stayed
+        // hidden.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(underEnv, ["backend/env"]));
+        await startWatching(root);
+
+        expect(await updatesAfter([{ path: marker(), type: "delete" }])).toBe(1);
+      });
+
+      it("rebuilds its filter after each update, in both directions", async () => {
+        const nothing = filterOf(() => false);
+        const envExcluded = filterOf(underEnv, ["backend/env"]);
+        vi.mocked(createIgnoreFilter)
+          .mockReturnValueOnce(nothing)       // at start: no environment yet
+          .mockReturnValueOnce(envExcluded)   // after the update that saw it appear
+          .mockReturnValueOnce(nothing);      // after the update that saw it go
+        await startWatching(root);
+        expect(createIgnoreFilter).toHaveBeenCalledTimes(1);
+
+        // The environment appears: its marker schedules the update, and the
+        // filter rebuilt after it excludes the directory.
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+        expect(await updatesAfter([{ path: marker(), type: "create" }])).toBe(1);
+        expect(createIgnoreFilter).toHaveBeenCalledTimes(2);
+
+        // A library installed into it no longer schedules anything.
+        const dep = path.join(root, "backend", "env", "lib", "dep.py");
+        fs.mkdirSync(path.dirname(dep), { recursive: true });
+        fs.writeFileSync(dep, "");
+        expect(await updatesAfter([{ path: dep, type: "create" }])).toBe(1);
+
+        // The environment goes: the marker's deletion is seen through the
+        // exclusion, the update runs, and the filter rebuilt after it lets
+        // the source files written in its place through again.
+        fs.rmSync(marker());
+        expect(await updatesAfter([{ path: marker(), type: "delete" }])).toBe(2);
+        expect(createIgnoreFilter).toHaveBeenCalledTimes(3);
+
+        const source = path.join(root, "backend", "env", "main.py");
+        fs.writeFileSync(source, "");
+        expect(await updatesAfter([{ path: source, type: "create" }])).toBe(3);
+      });
+
+      it("sees an environment moved away, which arrives as one event on its directory", async () => {
+        // Review finding. `mv env env.old` is reported by FSEvents and inotify
+        // as `delete env` and nothing on the marker inside it; the directory
+        // is not a marker and the filter excludes it, so the event was
+        // dropped and the filter stayed stale.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(underEnv, ["backend/env"]));
+        await startWatching(root);
+
+        expect(await updatesAfter([{ path: path.join(root, "backend", "env"), type: "delete" }])).toBe(1);
+      });
+
+      it("sees an environment moved into place, which arrives as one event on a directory it never heard of", async () => {
+        // The other half of a rename: one `create` on the directory, and the
+        // marker inside it produces nothing. The directory is asked for its
+        // marker on disk.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(() => false));
+        await startWatching(root);
+
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+        expect(await updatesAfter([{ path: path.join(root, "backend", "env"), type: "create" }])).toBe(1);
+
+        // A plain directory moved into place is not one.
+        const plain = path.join(root, "backend", "lib");
+        fs.mkdirSync(plain, { recursive: true });
+        expect(await updatesAfter([{ path: plain, type: "create" }])).toBe(1);
+      });
+
+      it("sees a dot-named environment moved into place", async () => {
+        // Review finding. `backend/venv.3.12` moved in is one `create` on the
+        // directory; a first cut read the dot as a file extension and skipped
+        // the stat, so the event was dropped and the environment's files
+        // stayed indexed until something unrelated changed. Every created
+        // path is asked whether it is a directory first.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(() => false));
+        await startWatching(root);
+
+        const dotted = path.join(root, "backend", "venv.3.12");
+        fs.mkdirSync(dotted, { recursive: true });
+        fs.writeFileSync(path.join(dotted, "pyvenv.cfg"), "home = /usr\n");
+        expect(await updatesAfter([{ path: dotted, type: "create" }])).toBe(1);
+
+        // A created *file* with an extension still costs one stat and no more:
+        // it is not a directory, and nothing else is asked of it here.
+        const image = path.join(root, "backend", "logo.png");
+        fs.writeFileSync(image, "");
+        expect(await updatesAfter([{ path: image, type: "create" }])).toBe(1);
+      });
+
+      it("drops a marker event that changes nothing the filter answers", async () => {
+        // Review finding. `conda install` rewrites `conda-meta/` on every run,
+        // and `uv venv` rewrites `pyvenv.cfg`; in an environment the filter
+        // already excludes, each of those used to reconcile the whole tree.
+        // Present on disk and excluded by the filter is agreement, and
+        // agreement schedules nothing.
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(underEnv, ["backend/env"]));
+        await startWatching(root);
+
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+        const history = path.join(root, "backend", "env", "conda-meta", "history");
+        fs.mkdirSync(path.dirname(history), { recursive: true });
+        fs.writeFileSync(history, "");
+        const installed = path.join(root, "backend", "env", "conda-meta", "numpy.json");
+        fs.writeFileSync(installed, "{}");
+
+        expect(await updatesAfter([
+          { path: marker(), type: "update" },
+          { path: history, type: "update" },
+          { path: installed, type: "create" },
+        ])).toBe(0);
+
+        // Removing one file or marker does not change the filter while another
+        // valid environment marker remains at the same root.
+        fs.rmSync(history);
+        expect(await updatesAfter([{ path: history, type: "delete" }])).toBe(0);
+        fs.rmSync(marker());
+        expect(await updatesAfter([{ path: marker(), type: "delete" }])).toBe(0);
+      });
+
+      it("reconciles once more when an environment reverses while the update runs", async () => {
+        // Review finding. While `updateProjectIndex` runs, the filter is the
+        // one that update started from, so an environment reversing in that
+        // window cannot be judged against it: here the marker is created and
+        // deleted while the first update scans, and to the stale filter the
+        // deletion reads as agreement — it excludes nothing, and the disk now
+        // holds nothing. What the old code did with it depended on the marker:
+        // dropped where it is not an indexable file, and where it is —
+        // `pyvenv.cfg` is — passed on to the debounce, which fired *while the
+        // first update was still running*. That second update takes the index
+        // lock's "already indexing" path, returns zeros and reconciles
+        // nothing, so the intermediate state stood until some later event.
+        // Either way the reversal was lost. Now such an event is remembered
+        // and one reconciliation follows the update it arrived under, with the
+        // rebuilt filter to judge it by.
+        const nothing = filterOf(() => false);
+        const envExcluded = filterOf(underEnv, ["backend/env"]);
+        vi.mocked(createIgnoreFilter)
+          .mockReturnValueOnce(nothing)        // at start
+          .mockReturnValueOnce(envExcluded)    // after the update that saw the marker
+          .mockReturnValueOnce(nothing);       // after the follow-up, marker gone again
+        await startWatching(root);
+
+        // The update is held open, so the reversal below lands squarely inside
+        // it rather than before or after.
+        let releaseUpdate: () => void = () => {};
+        const updateStarted = new Promise<void>((updateIsRunning) => {
+          mockUpdateProjectIndex.mockImplementationOnce(async () => {
+            updateIsRunning();
+            await new Promise<void>((resolve) => {
+              releaseUpdate = resolve;
+            });
+            return { added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false };
+          });
+        });
+
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+
+        vi.useFakeTimers();
+        try {
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "create" }]);
+          await vi.advanceTimersByTimeAsync(2100);
+          await updateStarted;
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+
+          // The environment goes away again while that update is still
+          // scanning. Judged against the filter it started from, this looks
+          // like nothing happened.
+          fs.rmSync(marker());
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "delete" }]);
+
+          // An ordinary source event in the same window must join the pending
+          // reconciliation rather than start a competing update and clear the
+          // remembered environment reversal.
+          const source = path.join(root, "backend", "app.ts");
+          fs.writeFileSync(source, "export const value = 1;\n");
+          mockSubscribeCallback?.(null, [{ path: source, type: "update" }]);
+
+          await vi.advanceTimersByTimeAsync(2100);
+          // No second update while the first still holds the lock: that one
+          // would return zeros and reconcile nothing.
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+
+          releaseUpdate();
+          await vi.advanceTimersByTimeAsync(2100);
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(2);
+
+          // Exactly one: nothing moved under the second update, so it starts
+          // no third. This has to be asked on the same clock — a timer left
+          // pending when the fake one is put away never fires, and an
+          // unconditional follow-up would go unnoticed.
+          await vi.advanceTimersByTimeAsync(10_000);
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(2);
+        } finally {
+          vi.useRealTimers();
+        }
+
+        // The filter was rebuilt after each of the two updates.
+        expect(createIgnoreFilter).toHaveBeenCalledTimes(3);
+      });
+
+      it("remembers an environment reversal that arrives with nothing else", async () => {
+        // The twin of the test above, with the ordinary source event left out.
+        // An environment event never reaches `scheduleUpdate` — the filter
+        // answers it and returns null — so the remembering it does for itself
+        // is the only thing that carries the reversal to the follow-up. With
+        // the source event beside it, `scheduleUpdate` sets the same flag and
+        // hides whether that path works at all: found by mutating it away and
+        // watching the suite stay green.
+        const nothing = filterOf(() => false);
+        const envExcluded = filterOf(underEnv, ["backend/env"]);
+        vi.mocked(createIgnoreFilter)
+          .mockReturnValueOnce(nothing)
+          .mockReturnValueOnce(envExcluded)
+          .mockReturnValueOnce(nothing);
+        await startWatching(root);
+
+        let releaseUpdate: () => void = () => {};
+        const updateStarted = new Promise<void>((updateIsRunning) => {
+          mockUpdateProjectIndex.mockImplementationOnce(async () => {
+            updateIsRunning();
+            await new Promise<void>((resolve) => {
+              releaseUpdate = resolve;
+            });
+            return { added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false };
+          });
+        });
+
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+
+        vi.useFakeTimers();
+        try {
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "create" }]);
+          await vi.advanceTimersByTimeAsync(2100);
+          await updateStarted;
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+
+          fs.rmSync(marker());
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "delete" }]);
+          await vi.advanceTimersByTimeAsync(2100);
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+
+          releaseUpdate();
+          await vi.advanceTimersByTimeAsync(2100);
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(2);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+
+      it("drops a deferred reconciliation when the watcher stops", async () => {
+        vi.mocked(createIgnoreFilter).mockReturnValue(filterOf(() => false));
+        await startWatching(root);
+
+        let releaseUpdate: () => void = () => {};
+        const updateStarted = new Promise<void>((updateIsRunning) => {
+          mockUpdateProjectIndex.mockImplementationOnce(async () => {
+            updateIsRunning();
+            await new Promise<void>((resolve) => {
+              releaseUpdate = resolve;
+            });
+            return { added: 0, updated: 0, removed: 0, chunksCreated: 0, cancelled: false };
+          });
+        });
+
+        fs.mkdirSync(path.dirname(marker()), { recursive: true });
+        fs.writeFileSync(marker(), "home = /usr\n");
+
+        vi.useFakeTimers();
+        try {
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "create" }]);
+          await vi.advanceTimersByTimeAsync(2100);
+          await updateStarted;
+
+          fs.rmSync(marker());
+          mockSubscribeCallback?.(null, [{ path: marker(), type: "delete" }]);
+          await stopWatching(root);
+
+          releaseUpdate();
+          await vi.advanceTimersByTimeAsync(10_000);
+          expect(mockUpdateProjectIndex).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
     });
 
     it("ignores files outside the project tree", async () => {
