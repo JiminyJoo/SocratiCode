@@ -130,6 +130,8 @@ export interface SymbolNode {
   endLine: number;
   /** Re-export alias, if any */
   exportedAs?: string;
+  /** Whether the symbol is exported from its containing module */
+  isExported?: boolean;
   language: string;
 }
 

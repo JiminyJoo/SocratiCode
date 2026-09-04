@@ -27,6 +27,9 @@ import {
   loadNameShard,
   loadReverseShard,
   loadSymbolGraphMeta,
+  releaseReader,
+  resetGenerationLifecycleState,
+  retainReader,
 } from "./symbol-graph-store.js";
 
 // ── Tiny LRU (handwritten, ~20 lines) ────────────────────────────────────
@@ -102,6 +105,8 @@ export class SymbolGraphCache {
     reverseIndexLoaded: false,
   };
 
+  private activeReaders = 0;
+
   constructor(
     public readonly projectId: string,
     meta: SymbolGraphMeta,
@@ -109,6 +114,26 @@ export class SymbolGraphCache {
   ) {
     this.meta = meta;
     this.fileDataLru = new LRUCache(lruCapacity);
+  }
+
+  /**
+   * Acquire a reader lease for this cache instance.
+   * While any reader lease is held, the generation backing this cache cannot be cleaned up.
+   */
+  acquireReader(): () => void {
+    this.activeReaders++;
+    retainReader(this.projectId, this.meta.generation);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.activeReaders--;
+      releaseReader(this.projectId, this.meta.generation);
+    };
+  }
+
+  get activeReaderCount(): number {
+    return this.activeReaders;
   }
 
   /** Get the full name index, loading all shards on first access. */
@@ -195,10 +220,15 @@ export class SymbolGraphCache {
       return cached;
     }
     this.stats.fileLruMisses++;
-    const payload = await loadFilePayload(this.projectId, relativePath, this.meta.generation);
-    if (payload) this.fileDataLru.set(relativePath, payload);
-    this.stats.fileLruSize = this.fileDataLru.size;
-    return payload;
+    const release = this.acquireReader();
+    try {
+      const payload = await loadFilePayload(this.projectId, relativePath, this.meta.generation);
+      if (payload) this.fileDataLru.set(relativePath, payload);
+      this.stats.fileLruSize = this.fileDataLru.size;
+      return payload;
+    } finally {
+      release();
+    }
   }
 
   /** Invalidate cached state for a file (called by watcher on file changes). */
@@ -317,5 +347,6 @@ export function dropSymbolGraphCache(projectId: string): void {
 /** Reset all caches (testing only). */
 export function resetSymbolGraphCacheRegistry(): void {
   cacheRegistry.clear();
+  resetGenerationLifecycleState();
   logger.debug("Symbol graph cache registry cleared");
 }

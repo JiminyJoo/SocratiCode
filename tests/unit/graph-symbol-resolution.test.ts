@@ -691,4 +691,143 @@ describe("graph-symbol-resolution", () => {
     expect(appEdge?.confidence).toBe("unresolved");
     expect(appEdge?.calleeCandidates).toHaveLength(0);
   });
+
+  it("distinguishes private declaration from exported symbol re-exported from dependency", () => {
+    const graph: CodeGraph = {
+      projectId: "p1",
+      projectPath: "/test",
+      builtAt: Date.now(),
+      nodes: [
+        {
+          relativePath: "src/app.ts",
+          imports: ["./index"],
+          exports: [],
+          dependencies: ["src/index.ts"],
+          dependents: [],
+        },
+        {
+          relativePath: "src/index.ts",
+          imports: ["./dep"],
+          exports: [],
+          dependencies: ["src/dep.ts"],
+          dependents: ["src/app.ts"],
+        },
+        {
+          relativePath: "src/dep.ts",
+          imports: [],
+          exports: ["helper"],
+          dependencies: [],
+          dependents: ["src/index.ts"],
+        },
+      ],
+      edges: [],
+    };
+
+    const symIndexPrivateHelper: SymbolNode = {
+      id: "src/index.ts::helper#1",
+      name: "helper",
+      qualifiedName: "helper",
+      kind: "function",
+      file: "src/index.ts",
+      line: 1,
+      endLine: 3,
+      language: "typescript",
+      isExported: false,
+    };
+    const symIndexLocalCaller: SymbolNode = {
+      id: "src/index.ts::callLocal#5",
+      name: "callLocal",
+      qualifiedName: "callLocal",
+      kind: "function",
+      file: "src/index.ts",
+      line: 5,
+      endLine: 7,
+      language: "typescript",
+      isExported: false,
+    };
+    const symDepHelper: SymbolNode = {
+      id: "src/dep.ts::helper#1",
+      name: "helper",
+      qualifiedName: "helper",
+      kind: "function",
+      file: "src/dep.ts",
+      line: 1,
+      endLine: 3,
+      language: "typescript",
+      isExported: true,
+    };
+    const symAppMain: SymbolNode = {
+      id: "src/app.ts::main#1",
+      name: "main",
+      qualifiedName: "main",
+      kind: "function",
+      file: "src/app.ts",
+      line: 1,
+      endLine: 4,
+      language: "typescript",
+      isExported: true,
+    };
+
+    const symbolsByFile = new Map<string, SymbolNode[]>([
+      ["src/index.ts", [symIndexPrivateHelper, symIndexLocalCaller]],
+      ["src/dep.ts", [symDepHelper]],
+      ["src/app.ts", [symAppMain]],
+    ]);
+
+    const outgoing = new Map<string, SymbolEdge[]>([
+      [
+        "src/index.ts",
+        [
+          // Wildcard re-export from dep: `export * from './dep'`
+          {
+            callerId: "src/index.ts::<module>#1",
+            calleeName: "*",
+            kind: "reexport",
+            sourceModule: "./dep",
+            importedName: "*",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/index.ts", line: 4 },
+          },
+          // Same-file local call: callLocal calls helper (unrestricted local resolution)
+          {
+            callerId: "src/index.ts::callLocal#5",
+            calleeName: "helper",
+            kind: "call",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/index.ts", line: 6 },
+          },
+        ],
+      ],
+      [
+        "src/app.ts",
+        [
+          // External import from index: `import { helper } from './index'`
+          {
+            callerId: "src/app.ts::main#1",
+            calleeName: "helper",
+            kind: "call",
+            sourceModule: "./index",
+            importedName: "helper",
+            calleeCandidates: [],
+            confidence: "unresolved",
+            callSite: { file: "src/app.ts", line: 2 },
+          },
+        ],
+      ],
+    ]);
+
+    resolveCallSites(graph, symbolsByFile, outgoing);
+
+    // External caller should resolve uniquely to dep.ts::helper (ignoring index.ts's private helper)
+    const appEdge = outgoing.get("src/app.ts")?.[0];
+    expect(appEdge?.confidence).toBe("unique");
+    expect(appEdge?.calleeCandidates).toEqual(["src/dep.ts::helper#1"]);
+
+    // Local caller inside index.ts should resolve locally to index.ts::helper
+    const indexLocalEdge = outgoing.get("src/index.ts")?.[1];
+    expect(indexLocalEdge?.confidence).toBe("local");
+    expect(indexLocalEdge?.calleeCandidates).toEqual(["src/index.ts::helper#1"]);
+  });
 });

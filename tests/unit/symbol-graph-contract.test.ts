@@ -75,24 +75,28 @@ vi.mock("../../src/services/qdrant.js", async (importOriginal) => {
   };
 });
 
-import { projectIdFromPath } from "../../src/config.js";
+import { projectIdFromPath, symgraphFileCollectionName } from "../../src/config.js";
 import { rebuildGraph } from "../../src/services/code-graph.js";
 import { getImpactRadius, getSymbolContext } from "../../src/services/graph-impact.js";
 import { getClient } from "../../src/services/qdrant.js";
 import { getSymbolGraphCache, resetSymbolGraphCacheRegistry } from "../../src/services/symbol-graph-cache.js";
 import { applyRemoval, updateChangedFilesSymbolGraph } from "../../src/services/symbol-graph-incremental.js";
 import {
+  cleanStaleGenerations,
+  coordinateProject,
   deleteFilePayload,
   listStoredGenerations,
   loadFilePayload,
   loadNameShard,
   loadReverseShard,
   loadSymbolGraphMeta,
+  registerStagingGeneration,
   resetSymbolGraphCollectionCache,
   reverseShardKeyForCallee,
   StorageReadError,
   saveReverseShard,
   saveSymbolGraphMeta,
+  unregisterStagingGeneration,
 } from "../../src/services/symbol-graph-store.js";
 import { handleGraphTool } from "../../src/tools/graph-tools.js";
 import type { SymbolGraphMeta, SymbolRef } from "../../src/types.js";
@@ -581,5 +585,122 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     expect(gen3).not.toBe(gen2);
     // Superseded gen2 has been safely retired
     expect(await listStoredGenerations(projId)).toEqual([gen3]);
+  });
+
+  it("protects newly staged build from being swept by concurrent startup cleanup", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "file1.ts"), `export function alpha() { return 1; }`);
+
+    // 1. Initial build -> gen1
+    const { cache: cache1 } = await runPipeline();
+    const gen1 = cache1.meta.generation;
+    expect(gen1).toBeDefined();
+
+    // 2. Simulate new build staging gen2
+    const stagedGen = "staged-gen-xyz";
+    registerStagingGeneration(projId, stagedGen);
+    // Write points for stagedGen into file collection
+    const qdrant = getClient();
+    const collName = symgraphFileCollectionName(projId);
+    await qdrant.createCollection(collName);
+    await qdrant.upsert(collName, {
+      points: [
+        {
+          id: "point-staged-1",
+          vector: [0],
+          payload: { projectId: projId, generation: stagedGen, file: "src/file1.ts" },
+        },
+      ],
+    });
+
+    // 3. Concurrent startup cleanup runs for projId while gen1 is still active
+    // cleanStaleGenerations should respect stagedGen for projId
+    await cleanStaleGenerations(projId, gen1!);
+
+    // Verify point for stagedGen was NOT deleted
+    const stored = await qdrant.retrieve(collName, { ids: ["point-staged-1"] });
+    expect(stored.length).toBe(1);
+    expect(stored[0]?.payload?.generation).toBe(stagedGen);
+
+    // Also verify coordinateProject queues operations sequentially
+    let cleanupRan = false;
+    let buildCompleted = false;
+
+    // Simulate build holding coordinateProject lock
+    const buildCoord = coordinateProject(projId, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      buildCompleted = true;
+    });
+
+    // Startup cleanup tries to run concurrently for the same project
+    const startupCoord = coordinateProject(projId, async () => {
+      // Must only run after build completes
+      expect(buildCompleted).toBe(true);
+      cleanupRan = true;
+    });
+
+    await Promise.all([buildCoord, startupCoord]);
+    expect(cleanupRan).toBe(true);
+
+    unregisterStagingGeneration(projId, stagedGen);
+  });
+
+  it("preserves old generation in storage while active reader holds cache during activation and rebuild", async () => {
+    fs.mkdirSync(path.join(tmpDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, "src", "first.ts"), `export function first() { return 1; }`);
+    fs.writeFileSync(path.join(tmpDir, "src", "second.ts"), `export function second() { return 2; }`);
+
+    // 1. Initial build -> gen1
+    const { cache: oldCache } = await runPipeline();
+    const gen1 = oldCache.meta.generation;
+    expect(gen1).toBeDefined();
+
+    // Ensure LRU does NOT contain second.ts initially
+    oldCache.fileDataLru.delete("src/second.ts");
+
+    // 2. Reader acquires lease on oldCache
+    const releaseReader = oldCache.acquireReader();
+
+    // 3. New build occurs and activates gen2 while reader is still active
+    fs.writeFileSync(path.join(tmpDir, "src", "first.ts"), `export function first() { return 100; }`);
+    fs.writeFileSync(
+      path.join(tmpDir, "src", "second.ts"),
+      `export function second() { return 200; }\nexport function secondGen2Extra() { return 201; }`,
+    );
+    await rebuildGraph(tmpDir);
+
+    const meta2 = await loadSymbolGraphMeta(projId);
+    const gen2 = meta2?.generation;
+    expect(gen2).toBeDefined();
+    expect(gen2).not.toBe(gen1);
+
+    // Because oldCache has an active reader lease for gen1,
+    // gen1 points were NOT deleted by cleanStaleGenerations during rebuildGraph!
+    // Reader now lazily loads second.ts from storage via oldCache:
+    const lazyPayload = await oldCache.getFilePayload("src/second.ts");
+    expect(lazyPayload).not.toBeNull();
+    // oldCache still sees gen1 content (does not contain secondGen2Extra from gen2)
+    expect(lazyPayload?.symbols.some((s) => s.name === "second")).toBe(true);
+    expect(lazyPayload?.symbols.some((s) => s.name === "secondGen2Extra")).toBe(false);
+
+    // Verify a fresh cache on gen2 sees gen2 content
+    const newCache = await getSymbolGraphCache(projId);
+    const newPayload = await newCache?.getFilePayload("src/second.ts");
+    expect(newPayload?.symbols.some((s) => s.name === "secondGen2Extra")).toBe(true);
+
+    // Generations in storage still include gen1 because lease was held
+    let storedGens = await listStoredGenerations(projId);
+    expect(storedGens).toContain(gen1);
+    expect(storedGens).toContain(gen2);
+
+    // 4. Reader finishes and releases the lease
+    releaseReader();
+
+    // Give deferred deletion a microtick
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // After release, deferred cleanup removes gen1 from storage
+    storedGens = await listStoredGenerations(projId);
+    expect(storedGens).toEqual([gen2]);
   });
 });

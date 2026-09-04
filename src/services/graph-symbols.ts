@@ -797,6 +797,117 @@ function extractFromTsLike(
   const scopes: ScopeFrame[] = [];
   const scopeLocalNames = new Map<string, Set<string>>();
 
+  const declaredBindingsCache = new Map<string, Set<string>>();
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  function getDeclaredBindingsInNode(node: any): Set<string> {
+    if (!node) return new Set();
+    const range = node.range?.();
+    const cacheKey = range ? `${node.kind?.()}:${range.start.index}:${range.end.index}` : "";
+    if (cacheKey && declaredBindingsCache.has(cacheKey)) {
+      return declaredBindingsCache.get(cacheKey)!;
+    }
+
+    const bound = new Set<string>();
+    const kind = node.kind?.();
+
+    // 1. Function parameters & function hoisted vars
+    if (
+      kind === "function_declaration" ||
+      kind === "function_expression" ||
+      kind === "arrow_function" ||
+      kind === "method_definition"
+    ) {
+      const params = node.field?.("parameters") ?? safeFind(node, "formal_parameters");
+      if (params) {
+        for (const child of params.children?.() ?? []) {
+          for (const b of extractBindingIdentifiers(child)) {
+            bound.add(b.name);
+          }
+        }
+      }
+      for (const varDecl of safeFindAll(node, "variable_declaration")) {
+        for (const decl of varDecl.children?.() ?? []) {
+          if (decl.kind?.() === "variable_declarator") {
+            const nameNode = decl.field?.("name") ?? decl.children?.()[0];
+            if (nameNode) {
+              for (const b of extractBindingIdentifiers(nameNode)) {
+                bound.add(b.name);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 2. Catch clause parameter
+    if (kind === "catch_clause") {
+      const param = node.field?.("parameter") ?? safeFind(node, "identifier");
+      if (param) {
+        for (const b of extractBindingIdentifiers(param)) {
+          bound.add(b.name);
+        }
+      }
+    }
+
+    // 3. For loops: for (const x of items), for (let i = 0; ...), for (const k in obj)
+    if (kind === "for_statement" || kind === "for_in_statement" || kind === "for_of_statement") {
+      const init = node.field?.("initializer") ?? node.field?.("left");
+      if (init) {
+        for (const decl of safeFindAll(init, "variable_declarator")) {
+          const nameNode = decl.field?.("name") ?? decl.children?.()[0];
+          if (nameNode) {
+            for (const b of extractBindingIdentifiers(nameNode)) {
+              bound.add(b.name);
+            }
+          }
+        }
+      }
+    }
+
+    // 4. Block / function body / switch case declarations
+    if (kind === "statement_block" || kind === "switch_case" || kind === "switch_block") {
+      for (const child of node.children?.() ?? []) {
+        const cKind = child.kind?.();
+        if (cKind === "lexical_declaration" || cKind === "variable_declaration") {
+          for (const decl of child.children?.() ?? []) {
+            if (decl.kind?.() === "variable_declarator") {
+              const nameNode = decl.field?.("name") ?? decl.children?.()[0];
+              if (nameNode) {
+                for (const b of extractBindingIdentifiers(nameNode)) {
+                  bound.add(b.name);
+                }
+              }
+            }
+          }
+        } else if (cKind === "function_declaration" || cKind === "class_declaration") {
+          const nameNode = child.field?.("name") ?? safeFind(child, "identifier");
+          if (nameNode) {
+            bound.add(nameNode.text());
+          }
+        }
+      }
+    }
+
+    if (cacheKey) {
+      declaredBindingsCache.set(cacheKey, bound);
+    }
+    return bound;
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  function isLexicallyBound(idNode: any, name: string): boolean {
+    let curr = idNode.parent?.();
+    while (curr && curr.kind?.() !== "program") {
+      const bound = getDeclaredBindingsInNode(curr);
+      if (bound.has(name)) {
+        return true;
+      }
+      curr = curr.parent?.();
+    }
+    return false;
+  }
+
   // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
   function recordScopeParams(node: any, symbolId: string) {
     const params = node.field?.("parameters") ?? safeFind(node, "formal_parameters");
@@ -825,10 +936,12 @@ function extractFromTsLike(
     const endLine = range.end.line + 1;
     const parentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
     const isDefaultExport = /^\s*export\s+default\b/.test(node.text()) || /^\s*export\s+default\b/.test(parentText);
+    const isExported = isDefaultExport || /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(parentText);
     const sym: SymbolNode = {
       id: makeId(file, name, startLine),
       name, qualifiedName: name, kind: "class",
       exportedAs: isDefaultExport ? "default" : undefined,
+      isExported,
       file, line: startLine, endLine, language,
     };
     symbols.push(sym);
@@ -873,10 +986,12 @@ function extractFromTsLike(
     const endLine = r.end.line + 1;
     const fnParentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
     const isDefaultExport = /^\s*export\s+default\b/.test(node.text()) || /^\s*export\s+default\b/.test(fnParentText);
+    const isExported = isDefaultExport || /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(fnParentText);
     const sym: SymbolNode = {
       id: makeId(file, name, startLine),
       name, qualifiedName: name, kind: "function",
       exportedAs: isDefaultExport ? "default" : undefined,
+      isExported,
       file, line: startLine, endLine, language,
     };
     symbols.push(sym);
@@ -892,9 +1007,15 @@ function extractFromTsLike(
     const r = node.range();
     const startLine = r.start.line + 1;
     const endLine = r.end.line + 1;
+    const genParentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isDefaultExport = /^\s*export\s+default\b/.test(node.text()) || /^\s*export\s+default\b/.test(genParentText);
+    const isExported = isDefaultExport || /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(genParentText);
     const sym: SymbolNode = {
       id: makeId(file, name, startLine),
-      name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
+      name, qualifiedName: name, kind: "function",
+      exportedAs: isDefaultExport ? "default" : undefined,
+      isExported,
+      file, line: startLine, endLine, language,
     };
     symbols.push(sym);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
@@ -911,9 +1032,11 @@ function extractFromTsLike(
     const r = node.range();
     const startLine = r.start.line + 1;
     const endLine = r.end.line + 1;
+    const ifaceParentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isExported = /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(ifaceParentText);
     const sym: SymbolNode = {
       id: makeId(file, name, startLine),
-      name, qualifiedName: name, kind: "interface", file, line: startLine, endLine, language,
+      name, qualifiedName: name, kind: "interface", isExported, file, line: startLine, endLine, language,
     };
     symbols.push(sym);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
@@ -929,9 +1052,11 @@ function extractFromTsLike(
     const r = node.range();
     const startLine = r.start.line + 1;
     const endLine = r.end.line + 1;
+    const typeParentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isExported = /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(typeParentText);
     const sym: SymbolNode = {
       id: makeId(file, name, startLine),
-      name, qualifiedName: name, kind: "type", file, line: startLine, endLine, language,
+      name, qualifiedName: name, kind: "type", isExported, file, line: startLine, endLine, language,
     };
     symbols.push(sym);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
@@ -946,9 +1071,11 @@ function extractFromTsLike(
     const r = node.range();
     const startLine = r.start.line + 1;
     const endLine = r.end.line + 1;
+    const enumParentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isExported = /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(enumParentText);
     const sym: SymbolNode = {
       id: makeId(file, name, startLine),
-      name, qualifiedName: name, kind: "enum", file, line: startLine, endLine, language,
+      name, qualifiedName: name, kind: "enum", isExported, file, line: startLine, endLine, language,
     };
     symbols.push(sym);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
@@ -956,31 +1083,31 @@ function extractFromTsLike(
 
   // Lexical and variable declarations: const, let, var (top-level only, direct declarators)
   // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
-  const topLevelDeclNodes: any[] = [];
+  const topLevelDeclNodes: Array<{ node: any; isExported: boolean }> = [];
   try {
     for (const child of root.children()) {
       if (child.kind() === "export_statement") {
         const decl = child.field("declaration");
         if (decl) {
           if (decl.kind() === "lexical_declaration" || decl.kind() === "variable_declaration") {
-            topLevelDeclNodes.push(decl);
+            topLevelDeclNodes.push({ node: decl, isExported: true });
           }
         } else {
           for (const sub of child.children()) {
             if (sub.kind() === "lexical_declaration" || sub.kind() === "variable_declaration") {
-              topLevelDeclNodes.push(sub);
+              topLevelDeclNodes.push({ node: sub, isExported: true });
             }
           }
         }
       } else if (child.kind() === "lexical_declaration" || child.kind() === "variable_declaration") {
-        topLevelDeclNodes.push(child);
+        topLevelDeclNodes.push({ node: child, isExported: false });
       }
     }
   } catch {
     // fallback if root.children() is unavailable
   }
 
-  for (const node of topLevelDeclNodes) {
+  for (const { node, isExported } of topLevelDeclNodes) {
     // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
     const declarators = (node.children?.() ?? []).filter((c: any) => c.kind() === "variable_declarator");
     for (const decl of declarators) {
@@ -998,7 +1125,7 @@ function extractFromTsLike(
         const endLine = r.end.line + 1;
         const sym: SymbolNode = {
           id: makeId(file, name, startLine),
-          name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
+          name, qualifiedName: name, kind: "function", isExported, file, line: startLine, endLine, language,
         };
         symbols.push(sym);
         scopes.push({ name, startLine, endLine, symbolId: sym.id });
@@ -1010,7 +1137,7 @@ function extractFromTsLike(
           const endLine = r.end.line + 1;
           const sym: SymbolNode = {
             id: makeId(file, name, startLine),
-            name, qualifiedName: name, kind: "variable", file, line: startLine, endLine, language,
+            name, qualifiedName: name, kind: "variable", isExported, file, line: startLine, endLine, language,
           };
           symbols.push(sym);
         }
@@ -1143,6 +1270,19 @@ function extractFromTsLike(
       });
     }
 
+    if (!sourceModule) {
+      const defMatch = expText.match(/^\s*export\s+default\s+([a-zA-Z_$][\w$]*)/);
+      if (defMatch) {
+        const defName = defMatch[1];
+        for (const s of symbols) {
+          if (s.name === defName && s.file === file) {
+            s.isExported = true;
+            s.exportedAs = "default";
+          }
+        }
+      }
+    }
+
     for (const spec of safeFindAll(exp, "export_specifier")) {
       const nameNode = spec.field("name") ?? safeFind(spec, "identifier");
       if (!nameNode) continue;
@@ -1150,6 +1290,16 @@ function extractFromTsLike(
       const aliasNode = spec.field("alias");
       const localName = aliasNode ? aliasNode.text() : expName;
       localToExportedName.set(localName, expName);
+      if (!sourceModule) {
+        for (const s of symbols) {
+          if (s.name === expName && s.file === file) {
+            s.isExported = true;
+            if (aliasNode) {
+              s.exportedAs = aliasNode.text();
+            }
+          }
+        }
+      }
       rawCalls.push({
         callerId: moduleSym.id,
         calleeName: expName,
@@ -1297,8 +1447,8 @@ function extractFromTsLike(
         }
       }
       const callerId = findCallerId(scopes, line, moduleSym.id);
-      // Skip if shadowed by local parameter or variable in this scope
-      if (callerId !== moduleSym.id && scopeLocalNames.get(callerId)?.has(localName)) {
+      // Skip if shadowed by local parameter, variable, destructuring, catch binding, or block scope
+      if (isLexicallyBound(idNode, localName)) {
         continue;
       }
       const impInfo = localToImportInfo.get(localName);

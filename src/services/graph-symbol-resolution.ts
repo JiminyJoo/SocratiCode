@@ -136,17 +136,29 @@ export function resolveCallSites(
     const candidates: string[] = [];
     const targetIdx = symbolIndexByFile.get(targetFile);
 
-    // 1. Direct definition in targetFile
+    // 1. Direct definition in targetFile (exported bindings only)
     const directMatches = targetIdx?.get(symbolName);
     if (directMatches && directMatches.length > 0) {
-      for (const s of directMatches) candidates.push(s.id);
+      for (const s of directMatches) {
+        if (s.isExported !== false) {
+          if (symbolName === "default") {
+            if (s.exportedAs === "default" || s.name === "default") {
+              candidates.push(s.id);
+            }
+          } else {
+            if (s.exportedAs === undefined || s.exportedAs === symbolName || s.name === symbolName) {
+              candidates.push(s.id);
+            }
+          }
+        }
+      }
     }
 
     // If seeking default export and no exact name match, look for any symbol with exportedAs === "default"
     if (symbolName === "default" && candidates.length === 0) {
       const syms = symbolsByFile.get(targetFile) ?? [];
       for (const s of syms) {
-        if (s.exportedAs === "default" || s.name === "default") {
+        if (s.isExported !== false && (s.exportedAs === "default" || s.name === "default")) {
           candidates.push(s.id);
         }
       }

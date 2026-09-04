@@ -18,7 +18,7 @@ import { getIndexingInProgressProjects, getPersistedIndexingStatus, indexProject
 import { getLockHolderPid, releaseAllLocks } from "./lock.js";
 import { logger } from "./logger.js";
 import { getProjectMetadata, listCodebaseCollections } from "./qdrant.js";
-import { cleanStaleGenerations, loadSymbolGraphMeta } from "./symbol-graph-store.js";
+import { cleanStaleGenerations, coordinateProject, loadSymbolGraphMeta } from "./symbol-graph-store.js";
 import { isWatching, startWatching, stopAllWatchers } from "./watcher.js";
 
 /**
@@ -313,13 +313,15 @@ async function resumeProject(
   }
 
   // Retire any abandoned or superseded symbol graph generations left from previous sessions,
-  // excluding any project currently undergoing a graph rebuild
+  // coordinated per project with any active or upcoming graph rebuild
   if (!isGraphBuildInProgress(resolvedPath)) {
     try {
-      const meta = await loadSymbolGraphMeta(projectId);
-      if (meta?.generation) {
-        await cleanStaleGenerations(projectId, meta.generation);
-      }
+      await coordinateProject(projectId, async () => {
+        const meta = await loadSymbolGraphMeta(projectId);
+        if (meta?.generation) {
+          await cleanStaleGenerations(projectId, meta.generation);
+        }
+      });
     } catch {
       // Non-fatal
     }

@@ -761,16 +761,126 @@ export async function loadReverseShard(
   }
 }
 
-// ── Generation lifecycle and cleanup ────────────────────────────────────
+// ── Generation lifecycle and coordination ───────────────────────────────
 
-const activeStagingGenerations = new Set<string>();
+const projectLocks = new Map<string, Promise<void>>();
+const stagingGenerationsByProject = new Map<string, Set<string>>();
+const activeReadersByProject = new Map<string, Map<string, number>>();
+const deferredDeletionsByProject = new Map<string, Set<string>>();
 
-export function registerStagingGeneration(gen: string): void {
-  activeStagingGenerations.add(gen);
+/**
+ * Coordinate staging, activation, and cleanup operations per project.
+ * Guarantees operations for the same projectId do not interleave concurrently.
+ */
+export async function coordinateProject<T>(
+  projectId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const current = projectLocks.get(projectId) ?? Promise.resolve();
+  let release: () => void;
+  const next = new Promise<void>((res) => {
+    release = res;
+  });
+  projectLocks.set(
+    projectId,
+    current.then(
+      () => next,
+      () => next,
+    ),
+  );
+  await current;
+  try {
+    return await fn();
+  } finally {
+    release!();
+    if (projectLocks.get(projectId) === next) {
+      projectLocks.delete(projectId);
+    }
+  }
 }
 
-export function unregisterStagingGeneration(gen: string): void {
-  activeStagingGenerations.delete(gen);
+export function registerStagingGeneration(projectIdOrGen: string, gen?: string): void {
+  const projectId = gen !== undefined ? projectIdOrGen : "";
+  const generation = gen !== undefined ? gen : projectIdOrGen;
+  if (!generation) return;
+  let set = stagingGenerationsByProject.get(projectId);
+  if (!set) {
+    set = new Set();
+    stagingGenerationsByProject.set(projectId, set);
+  }
+  set.add(generation);
+}
+
+export function unregisterStagingGeneration(projectIdOrGen: string, gen?: string): void {
+  const projectId = gen !== undefined ? projectIdOrGen : "";
+  const generation = gen !== undefined ? gen : projectIdOrGen;
+  if (!generation) return;
+  const set = stagingGenerationsByProject.get(projectId);
+  if (set) {
+    set.delete(generation);
+    if (set.size === 0) stagingGenerationsByProject.delete(projectId);
+  }
+}
+
+export function getStagingGenerations(projectId: string): string[] {
+  const projectSpecific = stagingGenerationsByProject.get(projectId);
+  const legacyGlobal = stagingGenerationsByProject.get("");
+  const all = new Set<string>([
+    ...(projectSpecific ?? []),
+    ...(legacyGlobal ?? []),
+  ]);
+  return Array.from(all);
+}
+
+export function retainReader(projectId: string, generation?: string): void {
+  if (!generation) return;
+  let map = activeReadersByProject.get(projectId);
+  if (!map) {
+    map = new Map();
+    activeReadersByProject.set(projectId, map);
+  }
+  map.set(generation, (map.get(generation) ?? 0) + 1);
+}
+
+export function releaseReader(projectId: string, generation?: string): void {
+  if (!generation) return;
+  const map = activeReadersByProject.get(projectId);
+  if (!map) return;
+  const count = (map.get(generation) ?? 1) - 1;
+  if (count <= 0) {
+    map.delete(generation);
+    if (map.size === 0) activeReadersByProject.delete(projectId);
+    const deferred = deferredDeletionsByProject.get(projectId);
+    if (deferred?.has(generation)) {
+      deferred.delete(generation);
+      if (deferred.size === 0) deferredDeletionsByProject.delete(projectId);
+      deleteGeneration(projectId, generation).catch((err) => {
+        logger.warn("Deferred generation deletion failed", {
+          projectId,
+          generation,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+  } else {
+    map.set(generation, count);
+  }
+}
+
+export function getActiveReaderGenerations(projectId: string): string[] {
+  const map = activeReadersByProject.get(projectId);
+  return map ? Array.from(map.keys()) : [];
+}
+
+export function hasActiveReaders(projectId: string, generation: string): boolean {
+  return (activeReadersByProject.get(projectId)?.get(generation) ?? 0) > 0;
+}
+
+export function resetGenerationLifecycleState(): void {
+  projectLocks.clear();
+  stagingGenerationsByProject.clear();
+  activeReadersByProject.clear();
+  deferredDeletionsByProject.clear();
 }
 
 /** Delete all points belonging to a specific generation from file and index collections. */
@@ -836,7 +946,8 @@ export async function listStoredGenerations(projectId: string): Promise<string[]
 }
 
 /**
- * Remove points belonging to superseded or abandoned generations, keeping only activeGeneration.
+ * Remove points belonging to superseded or abandoned generations, keeping activeGeneration,
+ * generations currently in staging, and generations held by active readers.
  */
 export async function cleanStaleGenerations(
   projectId: string,
@@ -849,7 +960,11 @@ export async function cleanStaleGenerations(
     symgraphIndexCollectionName(projectId),
   ];
 
-  const excludedGenerations = Array.from(new Set([activeGeneration, ...activeStagingGenerations]));
+  const stagingGens = getStagingGenerations(projectId);
+  const readerGens = getActiveReaderGenerations(projectId);
+  const excludedGenerations = Array.from(
+    new Set([activeGeneration, ...stagingGens, ...readerGens]),
+  );
   let allDeletesSucceeded = true;
 
   for (const collName of collNames) {
@@ -865,7 +980,19 @@ export async function cleanStaleGenerations(
     }
   }
 
-  // If filtered deletes did not both succeed cleanly, fall back to generation scan
+  // Register deferred deletion for any stale generations currently held by active readers
+  for (const gen of readerGens) {
+    if (gen !== activeGeneration && !stagingGens.includes(gen)) {
+      let deferred = deferredDeletionsByProject.get(projectId);
+      if (!deferred) {
+        deferred = new Set();
+        deferredDeletionsByProject.set(projectId, deferred);
+      }
+      deferred.add(gen);
+    }
+  }
+
+  // If filtered delete did not succeed on all collections, fall back to explicit per-generation delete
   if (!allDeletesSucceeded) {
     const stored = await listStoredGenerations(projectId);
     for (const gen of stored) {

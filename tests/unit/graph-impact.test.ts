@@ -542,4 +542,97 @@ describe("graph-impact exact symbol traversal and fail-closed", () => {
     expect(fileResult.totalFiles).toBe(1);
     expect(fileResult.filesByDepth.get(1)).toEqual(["src/serviceA.ts"]);
   });
+
+  it("traverses target -> same-file helper -> external caller on legacy schema v1", async () => {
+    const symTarget: SymbolNode = {
+      id: "src/utils.ts::computeCore#1",
+      name: "computeCore",
+      qualifiedName: "computeCore",
+      kind: "function",
+      file: "src/utils.ts",
+      line: 1,
+      endLine: 5,
+      language: "typescript",
+    };
+    const symHelper: SymbolNode = {
+      id: "src/utils.ts::publicHelper#10",
+      name: "publicHelper",
+      qualifiedName: "publicHelper",
+      kind: "function",
+      file: "src/utils.ts",
+      line: 10,
+      endLine: 15,
+      language: "typescript",
+    };
+    const symApp: SymbolNode = {
+      id: "src/app.ts::main#1",
+      name: "main",
+      qualifiedName: "main",
+      kind: "function",
+      file: "src/app.ts",
+      line: 1,
+      endLine: 10,
+      language: "typescript",
+    };
+
+    const cache = createMockCache({
+      symbols: [symTarget, symHelper, symApp],
+      reverseFileIndex: new Map([
+        ["src/utils.ts", new Set(["src/app.ts"])],
+      ]),
+      filePayloads: new Map([
+        [
+          "src/utils.ts",
+          {
+            file: "src/utils.ts",
+            language: "typescript",
+            contentHash: "h_u",
+            symbols: [symTarget, symHelper],
+            outgoingCalls: [
+              // Same-file call: publicHelper calls computeCore
+              {
+                callerId: "src/utils.ts::publicHelper#10",
+                calleeName: "computeCore",
+                kind: "call",
+                calleeCandidates: ["src/utils.ts::computeCore#1"],
+                confidence: "local",
+                callSite: { file: "src/utils.ts", line: 12 },
+              },
+            ],
+          },
+        ],
+        [
+          "src/app.ts",
+          {
+            file: "src/app.ts",
+            language: "typescript",
+            contentHash: "h_a",
+            symbols: [symApp],
+            outgoingCalls: [
+              // External call: main calls publicHelper
+              {
+                callerId: "src/app.ts::main#1",
+                calleeName: "publicHelper",
+                kind: "call",
+                sourceModule: "./utils",
+                importedName: "publicHelper",
+                calleeCandidates: ["src/utils.ts::publicHelper#10"],
+                confidence: "unique",
+                callSite: { file: "src/app.ts", line: 3 },
+              },
+            ],
+          },
+        ],
+      ]),
+    });
+    cache.meta.schemaVersion = 1;
+
+    const result = await getImpactRadius(cache, "computeCore", 3);
+    expect(result.status).toBe("ok");
+    expect(result.totalFiles).toBe(1);
+    // Hop 1 had only same-file helper (utils.ts already visited as target file)
+    expect(result.filesByDepth.get(1)).toBeUndefined();
+    // Hop 2 reaches external caller app.ts via publicHelper
+    expect(result.filesByDepth.get(2)).toEqual(["src/app.ts"]);
+  });
 });

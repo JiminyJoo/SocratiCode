@@ -482,31 +482,36 @@ async function dispatchGraphTool(
 
       // Zero-arg mode → ranked entry-point list
       if (!entrypoint) {
-        // Build a fresh detection using the file graph + per-file payloads from the cache.
-        // For efficiency we only list entry points by walking known symbols via the name index.
-        const fileGraph = await getOrBuildGraph(projectPath);
-        const nameIndex = await cache.getNameIndex();
-        const seenFiles = new Set<string>();
-        const payloads = [];
-        for (const refs of nameIndex.values()) {
-          for (const ref of refs) {
-            if (seenFiles.has(ref.file)) continue;
-            seenFiles.add(ref.file);
-            const p = await cache.getFilePayload(ref.file);
-            if (p) payloads.push(p);
+        const release = cache.acquireReader();
+        try {
+          // Build a fresh detection using the file graph + per-file payloads from the cache.
+          // For efficiency we only list entry points by walking known symbols via the name index.
+          const fileGraph = await getOrBuildGraph(projectPath);
+          const nameIndex = await cache.getNameIndex();
+          const seenFiles = new Set<string>();
+          const payloads = [];
+          for (const refs of nameIndex.values()) {
+            for (const ref of refs) {
+              if (seenFiles.has(ref.file)) continue;
+              seenFiles.add(ref.file);
+              const p = await cache.getFilePayload(ref.file);
+              if (p) payloads.push(p);
+            }
           }
+          const entries = detectEntryPoints(fileGraph, payloads);
+          if (entries.length === 0) {
+            return "No entry points detected. The codebase may not have orphan files, conventional main() functions, or framework routes.";
+          }
+          const lines = [`Detected ${entries.length} entry point(s):`, ""];
+          for (const e of entries.slice(0, 50)) {
+            lines.push(`  ${e.name} (${e.file}${e.line ? `:${e.line}` : ""}) — ${e.reason}`);
+          }
+          if (entries.length > 50) lines.push(`  ... and ${entries.length - 50} more`);
+          lines.push("", "Pass `entrypoint` to trace forward call flow from any of these.");
+          return lines.join("\n");
+        } finally {
+          release();
         }
-        const entries = detectEntryPoints(fileGraph, payloads);
-        if (entries.length === 0) {
-          return "No entry points detected. The codebase may not have orphan files, conventional main() functions, or framework routes.";
-        }
-        const lines = [`Detected ${entries.length} entry point(s):`, ""];
-        for (const e of entries.slice(0, 50)) {
-          lines.push(`  ${e.name} (${e.file}${e.line ? `:${e.line}` : ""}) — ${e.reason}`);
-        }
-        if (entries.length > 50) lines.push(`  ... and ${entries.length - 50} more`);
-        lines.push("", "Pass `entrypoint` to trace forward call flow from any of these.");
-        return lines.join("\n");
       }
 
       // Resolve symbol name → id via name index (file hint disambiguates)

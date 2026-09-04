@@ -883,5 +883,48 @@ const direct = run();
       const runCalls = out.rawCalls.filter((c) => c.calleeName === "run" && c.kind === "call");
       expect(runCalls).toHaveLength(1);
     });
+
+    it("shadows imported references when local variable, destructuring, or catch binding exists", () => {
+      const src = `
+import { config, logger, error } from "./lib";
+
+function run() {
+  const config = loadLocal();
+  const { logger } = getContext();
+  try {
+    doWork(config, logger);
+  } catch (error) {
+    handle(error);
+  }
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/shadow.ts");
+      const configRefs = out.rawCalls.filter((c) => c.calleeName === "config" && c.kind === "value_reference");
+      const loggerRefs = out.rawCalls.filter((c) => c.calleeName === "logger" && c.kind === "value_reference");
+      const errorRefs = out.rawCalls.filter((c) => c.calleeName === "error" && c.kind === "value_reference");
+      expect(configRefs).toHaveLength(0);
+      expect(loggerRefs).toHaveLength(0);
+      expect(errorRefs).toHaveLength(0);
+    });
+
+    it("does not suppress imported reference outside a nested block scope", () => {
+      const src = `
+import { data } from "./data";
+
+function process(condition: boolean) {
+  if (condition) {
+    const data = "local";
+    console.log(data);
+  }
+  return data;
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/block-scope.ts");
+      const dataRefs = out.rawCalls.filter((c) => c.calleeName === "data" && c.kind === "value_reference");
+      // Outside the if-block, `return data` must emit an imported value_reference
+      expect(dataRefs).toHaveLength(1);
+      expect(dataRefs[0].callSite.line).toBe(9);
+      expect(dataRefs[0].sourceModule).toBe("./data");
+    });
   });
 });
