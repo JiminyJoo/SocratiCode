@@ -31,7 +31,7 @@ import type {
   SymbolRef,
 } from "../types.js";
 import { logger } from "./logger.js";
-import { getClient } from "./qdrant.js";
+import { getClient, isAlreadyExistsError } from "./qdrant.js";
 
 // ── Shard key helpers ────────────────────────────────────────────────────
 
@@ -486,26 +486,47 @@ async function loadShardPoints<V>(
 // ── Collection lifecycle ─────────────────────────────────────────────────
 
 const collectionsReady = new Set<string>();
+const collectionsInFlight = new Map<string, Promise<void>>();
 
 /** Ensure a single collection exists (idempotent, cached after first success). */
 async function ensureCollection(name: string): Promise<void> {
   if (collectionsReady.has(name)) return;
-  const qdrant = getClient();
-  const collections = await qdrant.getCollections();
-  const exists = collections.collections.some((c) => c.name === name);
-  if (!exists) {
-    await qdrant.createCollection(name, {
-      vectors: { size: 1, distance: "Cosine" },
-      on_disk_payload: true,
-    });
-    logger.info("Created symbol-graph collection", { name });
+  const current = collectionsInFlight.get(name);
+  if (current) return current;
+
+  const attempt = (async () => {
+    const qdrant = getClient();
+    const collections = await qdrant.getCollections();
+    const exists = collections.collections.some((c) => c.name === name);
+    if (!exists) {
+      try {
+        await qdrant.createCollection(name, {
+          vectors: { size: 1, distance: "Cosine" },
+          on_disk_payload: true,
+        });
+        logger.info("Created symbol-graph collection", { name });
+      } catch (err) {
+        if (!isAlreadyExistsError(err)) throw err;
+        logger.info("Symbol-graph collection already created by another process", { name });
+      }
+    }
+  })();
+  collectionsInFlight.set(name, attempt);
+
+  try {
+    await attempt;
+    // A test-only reset may have removed this attempt while it was running.
+    // Only the current attempt may publish readiness.
+    if (collectionsInFlight.get(name) === attempt) collectionsReady.add(name);
+  } finally {
+    if (collectionsInFlight.get(name) === attempt) collectionsInFlight.delete(name);
   }
-  collectionsReady.add(name);
 }
 
 /** Reset readiness cache (testing only). */
 export function resetSymbolGraphCollectionCache(): void {
   collectionsReady.clear();
+  collectionsInFlight.clear();
 }
 
 /** Ensure all three symbol-graph collections exist for a project. */
