@@ -43,7 +43,12 @@ function sourcesRustcRead(root: string): Set<string> {
       if (colon === -1) continue;
       for (const raw of line.slice(colon + 1).trim().split(/\s+/)) {
         if (!raw.endsWith(".rs")) continue;
-        const rel = path.relative(root, path.resolve(root, raw));
+        // Every comparison below this — against graph edges and against
+        // literals like `src/lib.rs` — is written with forward slashes, and so
+        // is the `target/` guard. On Windows `path.relative` answers with the
+        // platform separator, which would fail every lookup and let the build
+        // directory through (review finding).
+        const rel = path.relative(root, path.resolve(root, raw)).split(path.sep).join("/");
         if (!rel || rel.startsWith("..") || rel.startsWith("target/")) continue;
         read.add(rel);
       }

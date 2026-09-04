@@ -965,7 +965,11 @@ describe("buildCodeGraph — Rust edges rustc rejects", () => {
     roots.push(dir);
     fs.writeFileSync(
       path.join(dir, "Cargo.toml"),
-      `[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\npath = "${path.join(dir, "custom/lib.rs")}"\n`,
+      // Forward slashes even on Windows: a backslash in a TOML basic string
+      // opens an escape, and `\U` or `\c` out of a drive path is one smol-toml
+      // rejects — the manifest would be dropped and the edge with it, which is
+      // the very thing this asserts (review finding).
+      `[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\npath = "${path.join(dir, "custom/lib.rs").split(path.sep).join("/")}"\n`,
     );
     const graph = await buildCodeGraph(dir);
 

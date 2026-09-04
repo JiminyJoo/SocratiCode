@@ -2156,15 +2156,28 @@ describe("graph-resolution", () => {
       expect(resolveRustImport("registry::write", "src/client.rs", fileSet, crates)).toBeNull();
     });
 
-    it("reads an unanchored path from the module itself from edition 2018 on", () => {
+    it("reads an unanchored path from the file's own module directory, never the crate root", () => {
       const crates = rustProject({
         "Cargo.toml": '[package]\nname = "app"\nedition = "2021"\n',
         "src/lib.rs": "",
+        // The crate root's `registry`, which is what the 2015 reading would
+        // reach and this one must not.
         "src/registry.rs": "",
         "src/client.rs": "",
+        "src/client/registry.rs": "",
       });
 
-      expect(resolveRustImport("registry::write", "src/client.rs", fileSet, crates)).toBeNull();
+      // `src/client.rs` owns `src/client/`, so the head is read from there and
+      // the crate root's `registry` is not it. The rule holds in every
+      // edition — the 2015 case above is the same walk with nothing to find.
+      // Review finding: this asserted `null` on a fixture without
+      // `src/client/registry.rs`, which is also what the 2015 case answers, so
+      // it passed on the absence of a file and proved nothing. Its name said
+      // "from edition 2018 on", a distinction the resolver stopped making when
+      // the declaration gate was turned on for every edition.
+      expect(resolveRustImport("registry::write", "src/client.rs", fileSet, crates)).toBe(
+        "src/client/registry.rs",
+      );
     });
 
     it("lets a local module win over a sibling crate of the same name", () => {
