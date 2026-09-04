@@ -11,6 +11,7 @@ import { MAX_FLOW_DEPTH, MAX_IMPACT_DEPTH, toForwardSlash } from "../constants.j
 import type { SymbolNode } from "../types.js";
 import {
   type SymbolGraphCache,
+  type SymbolGraphReaderToken,
   symbolIdToFile,
 } from "./symbol-graph-cache.js";
 import { StorageReadError } from "./symbol-graph-store.js";
@@ -52,6 +53,7 @@ export async function getImpactRadius(
   options?: ImpactOptions,
 ): Promise<ImpactResult> {
   const release = cache.acquireReader();
+  const readerToken = release.token;
   const safeDepth = Math.max(1, Math.min(depth, MAX_IMPACT_DEPTH));
   const isIncomplete = options?.isIncomplete ?? (cache.meta.schemaVersion < 2);
 
@@ -63,9 +65,9 @@ export async function getImpactRadius(
 
   try {
     if (targetKind === "file") {
-      const reverseIndex = await cache.getReverseFileIndex();
+      const reverseIndex = await cache.getReverseFileIndex(readerToken);
       const normTarget = toForwardSlash(target);
-      const targetPayload = await cache.getFilePayload(normTarget);
+      const targetPayload = await cache.getFilePayload(normTarget, readerToken);
       if (!targetPayload) {
         return {
           target,
@@ -158,7 +160,7 @@ export async function getImpactRadius(
           message: `Invalid symbolId '${options.symbolId}'.`,
         };
       }
-      const payload = await cache.getFilePayload(sFile);
+      const payload = await cache.getFilePayload(sFile, readerToken);
       const sym = payload?.symbols.find((s) => s.id === options.symbolId);
       if (!sym) {
         return {
@@ -174,7 +176,7 @@ export async function getImpactRadius(
       }
       selectedRefs = [{ file: sFile, id: options.symbolId }];
     } else {
-      const nameIndex = await cache.getNameIndex();
+      const nameIndex = await cache.getNameIndex(readerToken);
       let refs = nameIndex.get(target) ?? [];
 
       if (options?.file) {
@@ -199,7 +201,7 @@ export async function getImpactRadius(
       if (distinctIds.length > 1) {
         const candidates: SymbolNode[] = [];
         for (const ref of refs) {
-          const payload = await cache.getFilePayload(ref.file);
+          const payload = await cache.getFilePayload(ref.file, readerToken);
           const sym = payload?.symbols.find((s) => s.id === ref.id);
           if (sym) candidates.push(sym);
         }
@@ -224,7 +226,7 @@ export async function getImpactRadius(
     }
 
     if (cache.meta.schemaVersion < 2) {
-      const reverseIndex = await cache.getReverseFileIndex();
+      const reverseIndex = await cache.getReverseFileIndex(readerToken);
       const targetSymbolIds = new Set(selectedRefs.map((r) => r.id));
       const visitedSymbols = new Set<string>(targetSymbolIds);
       const distinctFiles = Array.from(new Set(selectedRefs.map((r) => r.file)));
@@ -245,7 +247,7 @@ export async function getImpactRadius(
           potentialCallerFiles.add(calleeFile);
 
           for (const callerFile of potentialCallerFiles) {
-            const callerPayload = await cache.getFilePayload(callerFile);
+            const callerPayload = await cache.getFilePayload(callerFile, readerToken);
             if (!callerPayload) continue;
 
             let matched = false;
@@ -284,7 +286,7 @@ export async function getImpactRadius(
             const potentialCallerFiles = new Set(reverseIndex.get(calleeFile) ?? []);
             potentialCallerFiles.add(calleeFile);
             for (const callerFile of potentialCallerFiles) {
-              const cp = await cache.getFilePayload(callerFile);
+              const cp = await cache.getFilePayload(callerFile, readerToken);
               if (!cp) continue;
               const hasMoreCalls = cp.outgoingCalls.some(
                 (e) =>
@@ -328,7 +330,7 @@ export async function getImpactRadius(
       };
     }
 
-    const reverseSymbolIndex = await cache.getReverseSymbolIndex();
+    const reverseSymbolIndex = await cache.getReverseSymbolIndex(readerToken);
     const targetSymbolIds = new Set(selectedRefs.map((r) => r.id));
     const visitedSymbols = new Set<string>(targetSymbolIds);
     const visitedFiles = new Set<string>(selectedRefs.map((r) => r.file));
@@ -440,19 +442,21 @@ export async function getCallFlow(
   cache: SymbolGraphCache,
   entrypointId: string,
   depth: number = 5,
+  operationToken?: SymbolGraphReaderToken,
 ): Promise<FlowNode | null> {
-  const release = cache.acquireReader();
+  const release = cache.acquireReader(operationToken);
+  const readerToken = release.token;
   try {
     const safeDepth = Math.max(1, Math.min(depth, MAX_FLOW_DEPTH));
     const file = symbolIdToFile(entrypointId);
     if (!file) return null;
-    const payload = await cache.getFilePayload(file);
+    const payload = await cache.getFilePayload(file, readerToken);
     if (!payload) return null;
     const sym = payload.symbols.find((s) => s.id === entrypointId);
     if (!sym) return null;
 
     const visited = new Set<string>();
-    return await walk(cache, sym, 0, safeDepth, visited);
+    return await walk(cache, sym, 0, safeDepth, visited, readerToken);
   } finally {
     release();
   }
@@ -464,6 +468,7 @@ async function walk(
   hop: number,
   maxDepth: number,
   visited: Set<string>,
+  readerToken: SymbolGraphReaderToken,
 ): Promise<FlowNode> {
   const node: FlowNode = {
     symbolId: sym.id,
@@ -482,7 +487,7 @@ async function walk(
     return node;
   }
 
-  const payload = await cache.getFilePayload(sym.file);
+  const payload = await cache.getFilePayload(sym.file, readerToken);
   if (!payload) return node;
 
   const calls = payload.outgoingCalls.filter(
@@ -493,11 +498,18 @@ async function walk(
     for (const calleeId of e.calleeCandidates) {
       const calleeFile = symbolIdToFile(calleeId);
       if (!calleeFile) continue;
-      const calleePayload = await cache.getFilePayload(calleeFile);
+      const calleePayload = await cache.getFilePayload(calleeFile, readerToken);
       if (!calleePayload) continue;
       const calleeSym = calleePayload.symbols.find((s) => s.id === calleeId);
       if (!calleeSym) continue;
-      node.children.push(await walk(cache, calleeSym, hop + 1, maxDepth, visited));
+      node.children.push(await walk(
+        cache,
+        calleeSym,
+        hop + 1,
+        maxDepth,
+        visited,
+        readerToken,
+      ));
     }
   }
   return node;
@@ -531,8 +543,9 @@ export async function getSymbolContext(
   fileHint?: string,
 ): Promise<SymbolContext[]> {
   const release = cache.acquireReader();
+  const readerToken = release.token;
   try {
-    const nameIndex = await cache.getNameIndex();
+    const nameIndex = await cache.getNameIndex(readerToken);
     let refs = nameIndex.get(name) ?? [];
     if (fileHint) {
       const normalizedHint = toForwardSlash(fileHint);
@@ -540,11 +553,11 @@ export async function getSymbolContext(
     }
     if (refs.length === 0) return [];
 
-    const reverseSymbolIndex = await cache.getReverseSymbolIndex();
+    const reverseSymbolIndex = await cache.getReverseSymbolIndex(readerToken);
     const out: SymbolContext[] = [];
 
     for (const ref of refs) {
-      const payload = await cache.getFilePayload(ref.file);
+      const payload = await cache.getFilePayload(ref.file, readerToken);
       if (!payload) continue;
       const sym = payload.symbols.find((s) => s.id === ref.id);
       if (!sym) continue;
@@ -577,7 +590,7 @@ export async function getSymbolContext(
         }
 
         for (const [cFile, cIds] of callerIdsByFile.entries()) {
-          const cp = await cache.getFilePayload(cFile);
+          const cp = await cache.getFilePayload(cFile, readerToken);
           if (!cp) continue;
           for (const e of cp.outgoingCalls) {
             if (e.calleeCandidates.includes(sym.id) && cIds.includes(e.callerId)) {
@@ -591,11 +604,11 @@ export async function getSymbolContext(
           }
         }
       } else {
-        const reverseIndex = await cache.getReverseFileIndex();
+        const reverseIndex = await cache.getReverseFileIndex(readerToken);
         const callerFiles = new Set(reverseIndex.get(ref.file) ?? []);
         callerFiles.add(ref.file);
         for (const cf of callerFiles) {
-          const cp = await cache.getFilePayload(cf);
+          const cp = await cache.getFilePayload(cf, readerToken);
           if (!cp) continue;
           for (const e of cp.outgoingCalls) {
             if (e.calleeCandidates.includes(sym.id)) {
@@ -625,12 +638,13 @@ export async function listSymbols(
   opts: { file?: string; query?: string; limit?: number },
 ): Promise<SymbolNode[]> {
   const release = cache.acquireReader();
+  const readerToken = release.token;
   try {
     const limit = opts.limit ?? 200;
     const out: SymbolNode[] = [];
 
     if (opts.file) {
-      const payload = await cache.getFilePayload(toForwardSlash(opts.file));
+      const payload = await cache.getFilePayload(toForwardSlash(opts.file), readerToken);
       if (!payload) return [];
       for (const s of payload.symbols) {
         if (s.name === "<module>") continue;
@@ -640,12 +654,12 @@ export async function listSymbols(
       return out;
     }
 
-    const nameIndex = await cache.getNameIndex();
+    const nameIndex = await cache.getNameIndex(readerToken);
     const q = opts.query?.toLowerCase() ?? "";
     for (const [name, refs] of nameIndex.entries()) {
       if (q && !name.toLowerCase().includes(q)) continue;
       for (const r of refs) {
-        const payload = await cache.getFilePayload(r.file);
+        const payload = await cache.getFilePayload(r.file, readerToken);
         if (!payload) continue;
         const sym = payload.symbols.find((s) => s.id === r.id);
         if (sym) out.push(sym);

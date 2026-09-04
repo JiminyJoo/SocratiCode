@@ -522,18 +522,19 @@ async function dispatchGraphTool(
       // Zero-arg mode → ranked entry-point list
       if (!entrypoint) {
         const release = cache.acquireReader();
+        const readerToken = release.token;
         try {
           // Build a fresh detection using the file graph + per-file payloads from the cache.
           // For efficiency we only list entry points by walking known symbols via the name index.
           const fileGraph = await getOrBuildGraph(projectPath);
-          const nameIndex = await cache.getNameIndex();
+          const nameIndex = await cache.getNameIndex(readerToken);
           const seenFiles = new Set<string>();
           const payloads = [];
           for (const refs of nameIndex.values()) {
             for (const ref of refs) {
               if (seenFiles.has(ref.file)) continue;
               seenFiles.add(ref.file);
-              const p = await cache.getFilePayload(ref.file);
+              const p = await cache.getFilePayload(ref.file, readerToken);
               if (p) payloads.push(p);
             }
           }
@@ -555,8 +556,9 @@ async function dispatchGraphTool(
 
       // Hold one generation across name resolution and the complete traversal.
       const release = cache.acquireReader();
+      const readerToken = release.token;
       try {
-        const nameIndex = await cache.getNameIndex();
+        const nameIndex = await cache.getNameIndex(readerToken);
         let refs = nameIndex.get(entrypoint) ?? [];
         const fileHint = (args.file as string | undefined)?.trim();
         if (fileHint) refs = refs.filter((r) => r.file === fileHint);
@@ -569,7 +571,7 @@ async function dispatchGraphTool(
           return lines.join("\n");
         }
         const depth = typeof args.depth === "number" ? args.depth : 5;
-        const tree = await getCallFlow(cache, refs[0].id, depth);
+        const tree = await getCallFlow(cache, refs[0].id, depth, readerToken);
         if (!tree) return `Could not load symbol "${entrypoint}".`;
 
         const lines = [`Call flow from ${tree.symbolName} (${tree.file}:${tree.line})`, ""];

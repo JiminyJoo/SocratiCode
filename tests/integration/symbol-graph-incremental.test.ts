@@ -11,6 +11,7 @@ import {
 import {
   dropSymbolGraphCache,
   getSymbolGraphCache,
+  type SymbolGraphReaderRelease,
 } from "../../src/services/symbol-graph-cache.js";
 import { updateChangedFilesSymbolGraph } from "../../src/services/symbol-graph-incremental.js";
 import {
@@ -211,7 +212,7 @@ describe.skipIf(!dockerAvailable)(
       const legacyProjectId = projectIdFromPath(legacyFixture.root);
       const relativePath = "src/index.ts";
       const absolutePath = path.join(legacyFixture.root, relativePath);
-      let releaseLegacyReader: (() => void) | undefined;
+      let releaseLegacyReader: SymbolGraphReaderRelease | undefined;
 
       const legacyPayload: SymbolGraphFilePayload = {
         file: relativePath,
@@ -258,7 +259,10 @@ describe.skipIf(!dockerAvailable)(
         );
         await rebuildGraph(legacyFixture.root);
 
-        const legacyRead = await legacyCache.getFilePayload(relativePath);
+        const legacyRead = await legacyCache.getFilePayload(
+          relativePath,
+          releaseLegacyReader.token,
+        );
         expect(legacyRead?.symbols.map((symbol) => symbol.name)).toContain("legacyEntry");
         expect(legacyRead?.symbols.map((symbol) => symbol.name)).not.toContain("currentEntry");
 

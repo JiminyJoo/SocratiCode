@@ -88,6 +88,11 @@ export interface SymbolGraphCacheStats {
   reverseIndexLoaded: boolean;
 }
 
+export type SymbolGraphReaderToken = symbol;
+export type SymbolGraphReaderRelease = (() => void) & {
+  readonly token: SymbolGraphReaderToken;
+};
+
 export class SymbolGraphCache {
   meta: SymbolGraphMeta;
   /** name → list of symbol refs (lazy-loaded as a whole) */
@@ -108,6 +113,7 @@ export class SymbolGraphCache {
   };
 
   private activeReaders = 0;
+  private readonly activeReaderTokens = new Map<SymbolGraphReaderToken, number>();
 
   constructor(
     public readonly projectId: string,
@@ -122,20 +128,33 @@ export class SymbolGraphCache {
    * Acquire a reader lease for this cache instance.
    * While any reader lease is held, the generation backing this cache cannot be cleaned up.
    */
-  acquireReader(): () => void {
+  acquireReader(
+    operationToken?: SymbolGraphReaderToken,
+  ): SymbolGraphReaderRelease {
     const generation = this.meta.generation ?? LEGACY_SYMBOL_GRAPH_GENERATION;
-    // Once another generation is active, a new query may not start on this
-    // cache. Nested reads belonging to a lease already held by this cache are
-    // allowed so an in-flight query can finish against one stable generation.
-    retainReader(this.projectId, generation, this.activeReaders > 0);
+    const continuesOwnedOperation = operationToken !== undefined
+      && this.activeReaderTokens.has(operationToken);
+    const token = continuesOwnedOperation ? operationToken : Symbol("symbol-graph-reader");
+
+    // Once another generation is active, only nested reads carrying the token
+    // of an operation already holding this cache may continue. An unrelated
+    // request cannot borrow another request's lease merely because the cache
+    // has active readers.
+    retainReader(this.projectId, generation, continuesOwnedOperation);
     this.activeReaders++;
+    this.activeReaderTokens.set(token, (this.activeReaderTokens.get(token) ?? 0) + 1);
     let released = false;
-    return () => {
+    const release = (() => {
       if (released) return;
       released = true;
       this.activeReaders--;
+      const tokenCount = (this.activeReaderTokens.get(token) ?? 1) - 1;
+      if (tokenCount <= 0) this.activeReaderTokens.delete(token);
+      else this.activeReaderTokens.set(token, tokenCount);
       releaseReader(this.projectId, generation);
-    };
+    }) as SymbolGraphReaderRelease;
+    Object.defineProperty(release, "token", { value: token });
+    return release;
   }
 
   get activeReaderCount(): number {
@@ -143,10 +162,12 @@ export class SymbolGraphCache {
   }
 
   /** Get the full name index, loading all shards on first access. */
-  async getNameIndex(): Promise<Map<string, SymbolRef[]>> {
-    if (this.nameIndex) return this.nameIndex;
-    const release = this.acquireReader();
+  async getNameIndex(
+    operationToken?: SymbolGraphReaderToken,
+  ): Promise<Map<string, SymbolRef[]>> {
+    const release = this.acquireReader(operationToken);
     try {
+      if (this.nameIndex) return this.nameIndex;
       const merged = new Map<string, SymbolRef[]>();
       const shardKeys = allNameShardKeys();
       const shards = await Promise.all(
@@ -176,10 +197,12 @@ export class SymbolGraphCache {
   }
 
   /** Get the full reverse symbol index (calleeSymbolId -> Set<callerSymbolId>), loading all shards on first access. */
-  async getReverseSymbolIndex(): Promise<Map<string, Set<string>>> {
-    if (this.reverseSymbolIndex) return this.reverseSymbolIndex;
-    const release = this.acquireReader();
+  async getReverseSymbolIndex(
+    operationToken?: SymbolGraphReaderToken,
+  ): Promise<Map<string, Set<string>>> {
+    const release = this.acquireReader(operationToken);
     try {
+      if (this.reverseSymbolIndex) return this.reverseSymbolIndex;
       const merged = new Map<string, Set<string>>();
       const buckets: number[] = [];
       for (let i = 0; i < SYMBOL_REVERSE_SHARDS; i++) buckets.push(i);
@@ -210,42 +233,50 @@ export class SymbolGraphCache {
   }
 
   /** Get the full reverse-call file index, derived from reverseSymbolIndex. */
-  async getReverseFileIndex(): Promise<Map<string, Set<string>>> {
-    if (this.reverseFileIndex) return this.reverseFileIndex;
-    const symIndex = await this.getReverseSymbolIndex();
-    const fileIndex = new Map<string, Set<string>>();
+  async getReverseFileIndex(
+    operationToken?: SymbolGraphReaderToken,
+  ): Promise<Map<string, Set<string>>> {
+    const release = this.acquireReader(operationToken);
+    try {
+      if (this.reverseFileIndex) return this.reverseFileIndex;
+      const symIndex = await this.getReverseSymbolIndex(release.token);
+      const fileIndex = new Map<string, Set<string>>();
 
-    for (const [calleeKey, callerList] of symIndex.entries()) {
-      const calleeFile = calleeKey.includes("::") ? calleeKey.split("::")[0] : calleeKey;
-      let callerSet = fileIndex.get(calleeFile);
-      if (!callerSet) {
-        callerSet = new Set<string>();
-        fileIndex.set(calleeFile, callerSet);
-      }
-      for (const callerId of callerList) {
-        const callerFile = callerId.includes("::") ? callerId.split("::")[0] : callerId;
-        if (callerFile !== calleeFile) {
-          callerSet.add(callerFile);
+      for (const [calleeKey, callerList] of symIndex.entries()) {
+        const calleeFile = calleeKey.includes("::") ? calleeKey.split("::")[0] : calleeKey;
+        let callerSet = fileIndex.get(calleeFile);
+        if (!callerSet) {
+          callerSet = new Set<string>();
+          fileIndex.set(calleeFile, callerSet);
+        }
+        for (const callerId of callerList) {
+          const callerFile = callerId.includes("::") ? callerId.split("::")[0] : callerId;
+          if (callerFile !== calleeFile) {
+            callerSet.add(callerFile);
+          }
         }
       }
-    }
 
-    this.reverseFileIndex = fileIndex;
-    return fileIndex;
+      this.reverseFileIndex = fileIndex;
+      return fileIndex;
+    } finally {
+      release();
+    }
   }
 
   /** Get a per-file payload, hitting the LRU first then Qdrant. */
   async getFilePayload(
     relativePath: string,
+    operationToken?: SymbolGraphReaderToken,
   ): Promise<SymbolGraphFilePayload | null> {
-    const cached = this.fileDataLru.get(relativePath);
-    if (cached) {
-      this.stats.fileLruHits++;
-      return cached;
-    }
-    this.stats.fileLruMisses++;
-    const release = this.acquireReader();
+    const release = this.acquireReader(operationToken);
     try {
+      const cached = this.fileDataLru.get(relativePath);
+      if (cached) {
+        this.stats.fileLruHits++;
+        return cached;
+      }
+      this.stats.fileLruMisses++;
       const payload = await loadFilePayload(
         this.projectId,
         relativePath,

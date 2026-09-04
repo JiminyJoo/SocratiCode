@@ -360,24 +360,33 @@ async function persistSymbolGraph(
     const newGeneration = randomUUID();
     registerStagingGeneration(projectId, newGeneration);
 
-    const reverseShards = new Map<number, Record<string, string[]>>();
+    const reverseShardSets = new Map<number, Map<string, Set<string>>>();
     for (const edges of outgoingCallsByFile.values()) {
       for (const e of edges) {
         for (const calleeId of e.calleeCandidates) {
           const bucket = reverseShardKeyForCallee(calleeId);
-          let shard = reverseShards.get(bucket);
+          let shard = reverseShardSets.get(bucket);
           if (!shard) {
-            shard = {};
-            reverseShards.set(bucket, shard);
+            shard = new Map();
+            reverseShardSets.set(bucket, shard);
           }
-          const existing = shard[calleeId];
-          if (existing) {
-            if (!existing.includes(e.callerId)) existing.push(e.callerId);
-          } else {
-            shard[calleeId] = [e.callerId];
+          let callers = shard.get(calleeId);
+          if (!callers) {
+            callers = new Set();
+            shard.set(calleeId, callers);
           }
+          callers.add(e.callerId);
         }
       }
+    }
+
+    const reverseShards = new Map<number, Record<string, string[]>>();
+    for (const [bucket, shardSets] of reverseShardSets.entries()) {
+      const shard: Record<string, string[]> = {};
+      for (const [calleeId, callers] of shardSets.entries()) {
+        shard[calleeId] = Array.from(callers);
+      }
+      reverseShards.set(bucket, shard);
     }
 
     try {

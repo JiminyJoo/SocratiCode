@@ -687,11 +687,20 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     // Because oldCache has an active reader lease for gen1,
     // gen1 points were NOT deleted by cleanStaleGenerations during rebuildGraph!
     // Reader now lazily loads second.ts from storage via oldCache:
-    const lazyPayload = await oldCache.getFilePayload("src/second.ts");
+    const lazyPayload = await oldCache.getFilePayload(
+      "src/second.ts",
+      releaseReader.token,
+    );
     expect(lazyPayload).not.toBeNull();
     // oldCache still sees gen1 content (does not contain secondGen2Extra from gen2)
     expect(lazyPayload?.symbols.some((s) => s.name === "second")).toBe(true);
     expect(lazyPayload?.symbols.some((s) => s.name === "secondGen2Extra")).toBe(false);
+
+    // A separate operation cannot borrow the first operation's lease merely
+    // because the old cache still has an active reader.
+    await expect(oldCache.getFilePayload("src/first.ts")).rejects.toThrow(
+      SymbolGraphGenerationChangedError,
+    );
 
     // Verify a fresh cache on gen2 sees gen2 content
     const newCache = await getSymbolGraphCache(projId);
@@ -706,12 +715,11 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     // 4. Reader finishes and releases the lease
     releaseReader();
 
-    // Give deferred deletion a microtick
-    await new Promise((resolve) => setTimeout(resolve, 50));
-
     // After release, deferred cleanup removes gen1 from storage
-    storedGens = await listStoredGenerations(projId);
-    expect(storedGens).toEqual([gen2]);
+    await vi.waitFor(async () => {
+      storedGens = await listStoredGenerations(projId);
+      expect(storedGens).toEqual([gen2]);
+    });
   });
 
   it("keeps a generation-less legacy graph readable through first v2 activation", async () => {
@@ -756,7 +764,10 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
 
     // The committed pointer now names v2, but a query already holding the
     // legacy lease still reads generation-less payloads until it releases.
-    const legacyRead = await legacyCache.getFilePayload("src/sample.ts");
+    const legacyRead = await legacyCache.getFilePayload(
+      "src/sample.ts",
+      releaseLegacyReader.token,
+    );
     expect(legacyRead?.symbols.some((symbol) => symbol.name === "legacy")).toBe(true);
     expect(legacyRead?.symbols.some((symbol) => symbol.name === "current")).toBe(false);
 
@@ -770,8 +781,9 @@ describe("symbol-graph-contract (End-to-End Pipeline on Disk)", () => {
     );
 
     releaseLegacyReader();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(await listStoredGenerations(projId)).toEqual([currentGeneration]);
+    await vi.waitFor(async () => {
+      expect(await listStoredGenerations(projId)).toEqual([currentGeneration]);
+    });
   });
 
   it("rejects a stale cache lease while its generation is being deleted", async () => {
