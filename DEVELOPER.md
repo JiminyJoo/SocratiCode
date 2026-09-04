@@ -261,7 +261,7 @@ Defined in `src/services/watcher.ts`: file changes are debounced for **2000ms** 
 
 ### Maximum file size
 
-Defined in `src/constants.ts` as `MAX_FILE_BYTES`: files larger than **5 MB** are skipped (configurable via `MAX_FILE_SIZE_MB` env var).
+Defined in `src/constants.ts` as `MAX_FILE_BYTES`: files larger than **5 MB** are skipped (configurable via `MAX_FILE_SIZE_MB` env var). The value is parsed as a complete finite number, so partial values such as `5MB` are rejected rather than silently truncated.
 
 ### Qdrant health check
 

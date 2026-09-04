@@ -99,10 +99,11 @@ export const INDEX_BATCH_SIZE = 50; // files per batch for batched/resumable ind
  *  Default: 5 MB. Override via MAX_FILE_SIZE_MB env var. */
 export const MAX_FILE_BYTES = (() => {
   const raw = process.env.MAX_FILE_SIZE_MB || "5";
-  const bytes = Math.round(parseFloat(raw) * 1_000_000);
-  if (!Number.isFinite(bytes)) {
+  const megabytes = raw.trim().length > 0 ? Number(raw) : Number.NaN;
+  const bytes = Math.round(megabytes * 1_000_000);
+  if (!Number.isFinite(megabytes) || !Number.isFinite(bytes)) {
     throw new Error(
-      `Invalid MAX_FILE_SIZE_MB: "${raw}". Must resolve to a finite number of bytes.`,
+      `Invalid MAX_FILE_SIZE_MB: "${raw}". Must be a complete finite number of megabytes.`,
     );
   }
   return bytes;

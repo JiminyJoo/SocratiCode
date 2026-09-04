@@ -27,16 +27,31 @@ describe("MAX_FILE_SIZE_MB", () => {
     expect(MAX_FILE_BYTES).toBe(5_000_000);
   });
 
-  it("keeps finite limits accepted by earlier releases", async () => {
-    process.env[ENV_KEY] = "0";
+  it("keeps the default byte limit for an empty setting", async () => {
+    process.env[ENV_KEY] = "";
     const { MAX_FILE_BYTES } = await import("../../src/constants.js");
-    expect(MAX_FILE_BYTES).toBe(0);
+    expect(MAX_FILE_BYTES).toBe(5_000_000);
   });
 
-  it("rejects a value that cannot be persisted in an effective profile", async () => {
-    process.env[ENV_KEY] = "not-a-number";
-    await expect(import("../../src/constants.js")).rejects.toThrow(
-      /Invalid MAX_FILE_SIZE_MB/,
-    );
+  it.each([
+    ["0", 0],
+    ["-1.25", -1_250_000],
+    ["0.0000004", 0],
+    [" 2.5 ", 2_500_000],
+    ["1e1", 10_000_000],
+  ])("keeps the earlier finite numeric behavior for %s", async (raw, expected) => {
+    process.env[ENV_KEY] = raw;
+    const { MAX_FILE_BYTES } = await import("../../src/constants.js");
+    expect(MAX_FILE_BYTES).toBe(expected);
   });
+
+  it.each(["not-a-number", "5MB", "5 MB", "1_000", "Infinity", "1e309", "   "])(
+    "rejects the complete invalid value %j",
+    async (raw) => {
+      process.env[ENV_KEY] = raw;
+      await expect(import("../../src/constants.js")).rejects.toThrow(
+        /Invalid MAX_FILE_SIZE_MB/,
+      );
+    },
+  );
 });
