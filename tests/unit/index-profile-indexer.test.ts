@@ -384,4 +384,21 @@ describe("code-index effective profile compatibility", () => {
       indexer.hashContent("   \n\t\n"),
     );
   });
+
+  it("invokes exactly one full graph rebuild on a file update without double rebuilding", async () => {
+    const indexer = await loadIndexer();
+    const { legacyIndexProfile } = await import("../../src/services/index-profile.js");
+    const { rebuildGraph } = await import("../../src/services/code-graph.js");
+    const project = await createProject("notes.txt", "new changed content");
+    collectionInfo = { pointsCount: 1, status: "green" };
+    storedProfile = legacyIndexProfile("code");
+    storedHashes = new Map([["notes.txt", indexer.hashContent("old source")]]);
+
+    vi.mocked(rebuildGraph).mockClear();
+    const result = await indexer.updateProjectIndex(project);
+
+    expect(result.updated).toBe(1);
+    expect(vi.mocked(rebuildGraph)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(rebuildGraph)).toHaveBeenCalledWith(project, { skipSymbolGraph: false });
+  });
 });

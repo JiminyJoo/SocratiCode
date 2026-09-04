@@ -110,6 +110,7 @@ export type SymbolKind =
   | "enum"
   | "module"
   | "struct"
+  | "type"
   | "variable";
 
 /** A single symbol (definition) extracted from source code */
@@ -129,8 +130,18 @@ export interface SymbolNode {
   endLine: number;
   /** Re-export alias, if any */
   exportedAs?: string;
+  /** Whether the symbol is exported from its containing module */
+  isExported?: boolean;
   language: string;
 }
+
+/** Kind of relationship an edge represents */
+export type EdgeKind =
+  | "call"
+  | "value_reference"
+  | "type_reference"
+  | "import"
+  | "reexport";
 
 /** Confidence level for a resolved call edge */
 export type SymbolEdgeConfidence =
@@ -148,6 +159,16 @@ export interface SymbolEdge {
   /** Resolved SymbolNode.ids: 0 = external, 1 = unique, >1 = ambiguous */
   calleeCandidates: string[];
   confidence: SymbolEdgeConfidence;
+  kind: EdgeKind;
+  /** Source module specifier from import statement (e.g. "./utils") */
+  sourceModule?: string;
+  /** Original imported or exported name in the source module */
+  importedName?: string;
+  /**
+   * Local binding alias in the caller file for import edges (e.g. `localFoo` in `import { foo as localFoo }`),
+   * or the exported alias for re-export edges (e.g. `Y` in `export { X as Y }` or `export * as Y from './mod'`).
+   */
+  localAlias?: string;
   callSite: { file: string; line: number };
 }
 
@@ -167,7 +188,8 @@ export interface SymbolGraphMeta {
   fileCount: number;
   unresolvedEdgePct: number;
   builtAt: number;
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
+  generation?: string;
 }
 
 /** Per-file payload stored in `_symgraph_file` */

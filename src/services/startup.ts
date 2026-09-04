@@ -12,11 +12,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { collectionName, projectIdFromPath } from "../config.js";
 import { QDRANT_COLLECTION_PREFIX, QDRANT_MODE } from "../constants.js";
+import { isGraphBuildInProgress } from "./code-graph.js";
 import { isDockerAvailable, isQdrantRunning } from "./docker.js";
 import { getIndexingInProgressProjects, getPersistedIndexingStatus, indexProject, requestCancellation, updateProjectIndex } from "./indexer.js";
 import { getLockHolderPid, releaseAllLocks } from "./lock.js";
 import { logger } from "./logger.js";
 import { getProjectMetadata, listCodebaseCollections } from "./qdrant.js";
+import { cleanStaleGenerations, coordinateProject, loadSymbolGraphMeta } from "./symbol-graph-store.js";
 import { isWatching, startWatching, stopAllWatchers } from "./watcher.js";
 
 /**
@@ -308,6 +310,21 @@ async function resumeProject(
       projectPath: resolvedPath,
       error: err instanceof Error ? err.message : String(err),
     });
+  }
+
+  // Retire any abandoned or superseded symbol graph generations left from previous sessions,
+  // coordinated per project with any active or upcoming graph rebuild
+  if (!isGraphBuildInProgress(resolvedPath)) {
+    try {
+      await coordinateProject(projectId, async () => {
+        const meta = await loadSymbolGraphMeta(projectId);
+        if (meta?.generation) {
+          await cleanStaleGenerations(projectId, meta.generation);
+        }
+      });
+    } catch {
+      // Non-fatal
+    }
   }
 }
 

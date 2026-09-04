@@ -11,8 +11,8 @@ import {
 } from "../../src/services/graph-symbols.js";
 import { logger } from "../../src/services/logger.js";
 
-beforeAll(() => {
-  ensureDynamicLanguages();
+beforeAll(async () => {
+  await ensureDynamicLanguages();
 });
 
 describe("graph-symbols", () => {
@@ -64,6 +64,91 @@ const helper = function () { return 42; };
       const names = out.symbols.map((s) => s.name);
       expect(names).toContain("validate");
       expect(names).toContain("helper");
+    });
+
+    it("extracts interfaces, type aliases, enums, and plain constants (issue #132)", () => {
+      const src = `
+export interface UserProfile { id: string; name: string; }
+export type JobOfferSnapshot = { id: string; score: number; };
+export enum OfferStatus { Active, Expired }
+export const STALE_EVALUATION_WHERE = "status = 'stale'";
+export let retryCount = 3;
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/types.ts");
+      const syms = new Map(out.symbols.map((s) => [s.name, s]));
+      expect(syms.get("UserProfile")?.kind).toBe("interface");
+      expect(syms.get("JobOfferSnapshot")?.kind).toBe("type");
+      expect(syms.get("OfferStatus")?.kind).toBe("enum");
+      expect(syms.get("STALE_EVALUATION_WHERE")?.kind).toBe("variable");
+      expect(syms.get("retryCount")?.kind).toBe("variable");
+    });
+
+    it("extracts import, re-export, and type reference edges (issue #132)", () => {
+      const src = `
+import { JobOfferSnapshot, STALE_EVALUATION_WHERE } from "./types";
+import type { UserProfile } from "./user";
+import DefaultService from "./service";
+export { OfferStatus } from "./enums";
+
+export function processOffer(offer: JobOfferSnapshot): UserProfile {
+  const query = STALE_EVALUATION_WHERE;
+  return { id: "1", name: query };
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/worker.ts");
+      const calleeNames = out.rawCalls.map((c) => c.calleeName);
+      expect(calleeNames).toContain("JobOfferSnapshot");
+      expect(calleeNames).toContain("STALE_EVALUATION_WHERE");
+      expect(calleeNames).toContain("UserProfile");
+      expect(calleeNames).toContain("DefaultService");
+      expect(calleeNames).toContain("OfferStatus");
+
+      const processOfferCall = out.rawCalls.find(
+        (c) => c.calleeName === "JobOfferSnapshot" && c.callerId.includes("::processOffer#"),
+      );
+      expect(processOfferCall).toBeDefined();
+    });
+
+    it("resolves aliased imports to their original exported names", () => {
+      const src = `
+import { calculateSum as sum, UserConfig as Config, API_KEY as KEY } from "./utils";
+
+export function execute(cfg: Config): number {
+  const secret = KEY;
+  return sum(1, 2);
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/client.ts");
+      const calleeNames = out.rawCalls.map((c) => c.calleeName);
+      expect(calleeNames).toContain("calculateSum");
+      expect(calleeNames).toContain("UserConfig");
+      expect(calleeNames).toContain("API_KEY");
+      expect(calleeNames).not.toContain("sum");
+      expect(calleeNames).not.toContain("Config");
+      expect(calleeNames).not.toContain("KEY");
+
+      const executeCalls = out.rawCalls.filter((c) => c.callerId.includes("::execute#"));
+      const executeCallees = executeCalls.map((c) => c.calleeName);
+      expect(executeCallees).toContain("calculateSum");
+      expect(executeCallees).toContain("UserConfig");
+      expect(executeCallees).toContain("API_KEY");
+    });
+
+    it("resolves namespace imports to the accessed exported symbols", () => {
+      const src = `
+import * as Utils from "./utils";
+
+export function run(config: Utils.DatabaseConfig): number {
+  const defaultVal = Utils.DEFAULT_LIMIT;
+  return Utils.add(defaultVal, 10);
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/caller.ts");
+      const runCalls = out.rawCalls.filter((c) => c.callerId.includes("::run#"));
+      const runCallees = runCalls.map((c) => c.calleeName);
+      expect(runCallees).toContain("DatabaseConfig");
+      expect(runCallees).toContain("DEFAULT_LIMIT");
+      expect(runCallees).toContain("add");
     });
   });
 
@@ -715,17 +800,178 @@ enum Color { red, green }
     });
   });
 
-  describe("Regex fallback (Svelte, Vue, unknown)", () => {
-    it("handles unknown language without throwing", () => {
-      const src = "some random text\nwith no recognizable structure";
-      const out = extractSymbolsAndCalls(
-        src,
-        "unknown" as unknown as Lang,
-        ".xyz",
-        "data.xyz",
+  describe("Destructuring & Call Provenance", () => {
+    it("extracts only left binding from object_assignment_pattern, ignoring default value expression", () => {
+      const src = `
+export const { port = getDefaultPort(), host: serverHost = "localhost" } = config;
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/config.ts");
+      const names = out.symbols.map((s) => s.name);
+      expect(names).toContain("port");
+      expect(names).toContain("serverHost");
+      expect(names).not.toContain("getDefaultPort");
+      expect(names).not.toContain("config");
+    });
+
+    it("does not classify an object binding as a function because its initializer contains one", () => {
+      const src = `
+export const config = { handler: () => "ok" };
+export const direct = () => "ok";
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/config.ts");
+      expect(out.symbols.find((symbol) => symbol.name === "config")?.kind).toBe("variable");
+      expect(out.symbols.find((symbol) => symbol.name === "direct")?.kind).toBe("function");
+    });
+
+    it("does not attach bare import provenance to member method calls", () => {
+      const src = `
+import { run } from "./runner";
+export function main(obj: any): void {
+  obj.run();
+  run();
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/app.ts");
+      const runCalls = out.rawCalls.filter((c) => c.kind === "call" && c.calleeName === "run");
+      expect(runCalls).toHaveLength(2);
+
+      const memberCall = runCalls.find((c) => c.callSite.line === 4);
+      expect(memberCall).toBeDefined();
+      expect(memberCall?.sourceModule).toBeUndefined();
+      expect(memberCall?.importedName).toBeUndefined();
+
+      const bareCall = runCalls.find((c) => c.callSite.line === 5);
+      expect(bareCall).toBeDefined();
+      expect(bareCall?.sourceModule).toBe("./runner");
+      expect(bareCall?.importedName).toBe("run");
+    });
+
+    it("extracts namespace re-export with export * as ns from './dep'", () => {
+      const src = `
+export * as utils from "./utils";
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/index.ts");
+      const reexport = out.rawCalls.find((c) => c.kind === "reexport");
+      expect(reexport).toBeDefined();
+      expect(reexport?.calleeName).toBe("utils");
+      expect(reexport?.localAlias).toBe("utils");
+      expect(reexport?.sourceModule).toBe("./utils");
+      expect(reexport?.importedName).toBeUndefined();
+    });
+
+    it("does not emit self-referential value_reference for locally exported declaration lines", () => {
+      const src = `
+export function computeTotal(a: number, b: number): number {
+  return a + b;
+}
+export { computeTotal };
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/math.ts");
+      const valueRefs = out.rawCalls.filter((c) => c.kind === "value_reference" && c.calleeName === "computeTotal");
+      expect(valueRefs).toHaveLength(0);
+    });
+
+    it("marks only the module-scope binding named by a local export specifier", () => {
+      const src = `
+function outer() {
+  function Thing() {}
+}
+function Thing() {}
+export { Thing as PublicThing };
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/things.ts");
+      const things = out.symbols.filter((symbol) => symbol.name === "Thing");
+      expect(things).toHaveLength(2);
+
+      const exported = things.filter((symbol) => symbol.isExported);
+      expect(exported).toHaveLength(1);
+      expect(exported[0]).toMatchObject({ line: 5, exportedAs: "PublicThing" });
+      expect(things.find((symbol) => symbol.line === 3)?.isExported).toBe(false);
+    });
+
+    it("skips non-computed member properties and shadowed parameters", () => {
+      const src = `
+import { config, run } from "./lib";
+
+function execute(config: string) {
+  const result = obj.run;
+  console.log(config);
+}
+
+const direct = run();
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/caller.ts");
+      // obj.run is a member property, not a value reference to imported run
+      const runRefs = out.rawCalls.filter((c) => c.calleeName === "run" && c.kind === "value_reference");
+      expect(runRefs).toHaveLength(0);
+      // config inside execute is shadowed by parameter `config: string`
+      const configRefs = out.rawCalls.filter((c) => c.calleeName === "config" && c.kind === "value_reference");
+      expect(configRefs).toHaveLength(0);
+      // direct call to run() is preserved as call
+      const runCalls = out.rawCalls.filter((c) => c.calleeName === "run" && c.kind === "call");
+      expect(runCalls).toHaveLength(1);
+    });
+
+    it("shadows imported references when local variable, destructuring, or catch binding exists", () => {
+      const src = `
+import { config, logger, error } from "./lib";
+
+function run() {
+  const config = loadLocal();
+  const { logger } = getContext();
+  try {
+    doWork(config, logger);
+  } catch (error) {
+    handle(error);
+  }
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/shadow.ts");
+      const configRefs = out.rawCalls.filter((c) => c.calleeName === "config" && c.kind === "value_reference");
+      const loggerRefs = out.rawCalls.filter((c) => c.calleeName === "logger" && c.kind === "value_reference");
+      const errorRefs = out.rawCalls.filter((c) => c.calleeName === "error" && c.kind === "value_reference");
+      expect(configRefs).toHaveLength(0);
+      expect(loggerRefs).toHaveLength(0);
+      expect(errorRefs).toHaveLength(0);
+    });
+
+    it("does not suppress imported reference outside a nested block scope", () => {
+      const src = `
+import { data } from "./data";
+
+function process(condition: boolean) {
+  if (condition) {
+    const data = "local";
+    console.log(data);
+  }
+  return data;
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/block-scope.ts");
+      const dataRefs = out.rawCalls.filter((c) => c.calleeName === "data" && c.kind === "value_reference");
+      // Outside the if-block, `return data` must emit an imported value_reference
+      expect(dataRefs).toHaveLength(1);
+      expect(dataRefs[0].callSite.line).toBe(9);
+      expect(dataRefs[0].sourceModule).toBe("./data");
+    });
+
+    it("does not let a nested function's var shadow an outer imported reference", () => {
+      const src = `
+import { dep } from "./dep";
+
+function outer() {
+  function inner() { var dep = 1; return dep; }
+  return dep;
+}
+`;
+      const out = extractSymbolsAndCalls(src, Lang.TypeScript, ".ts", "src/nested-var.ts");
+      const depRefs = out.rawCalls.filter(
+        (call) => call.calleeName === "dep" && call.kind === "value_reference",
       );
-      expect(out.symbols.some((s) => s.name === "<module>")).toBe(true);
-      expect(out.rawCalls).toEqual([]);
+      expect(depRefs).toHaveLength(1);
+      expect(depRefs[0].callSite.line).toBe(6);
+      expect(depRefs[0].sourceModule).toBe("./dep");
+      expect(depRefs[0].callerId).toContain("::outer#");
     });
   });
 });

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Giancarlo Erra - Altaire Limited
 
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -28,15 +29,20 @@ import {
 } from "./symbol-graph-cache.js";
 import {
   allNameShardKeys,
+  cleanStaleGenerations,
   contentHashOf,
+  coordinateProject,
+  deleteGeneration,
   deleteSymbolGraphData,
   ensureSymbolGraphCollections,
   nameShardKey,
-  reverseShardKey,
+  registerStagingGeneration,
+  reverseShardKeyForCallee,
   saveFilePayloads,
   saveNameShard,
   saveReverseShard,
   saveSymbolGraphMeta,
+  unregisterStagingGeneration,
 } from "./symbol-graph-store.js";
 
 // Re-export analysis functions for external consumers
@@ -305,105 +311,135 @@ async function persistSymbolGraph(
   symbolsByFile: Map<string, SymbolNode[]>,
   outgoingCallsByFile: Map<string, SymbolEdge[]>,
 ): Promise<void> {
-  await ensureSymbolGraphCollections(projectId);
+  return coordinateProject(projectId, async () => {
+    await ensureSymbolGraphCollections(projectId);
 
-  // Build per-file payloads (need source bytes for contentHash).
-  const payloads: SymbolGraphFilePayload[] = [];
-  let totalSymbols = 0;
-  let totalEdges = 0;
-  for (const [relPath, symbols] of symbolsByFile.entries()) {
-    const outgoingCalls = outgoingCallsByFile.get(relPath) ?? [];
-    let language = "plaintext";
-    const firstNonModule = symbols.find((s) => s.name !== "<module>");
-    if (firstNonModule) language = firstNonModule.language;
-    else language = symbols[0]?.language ?? language;
+    // Build per-file payloads (need source bytes for contentHash).
+    const payloads: SymbolGraphFilePayload[] = [];
+    let totalSymbols = 0;
+    let totalEdges = 0;
+    for (const [relPath, symbols] of symbolsByFile.entries()) {
+      const outgoingCalls = outgoingCallsByFile.get(relPath) ?? [];
+      let language = "plaintext";
+      const firstNonModule = symbols.find((s) => s.name !== "<module>");
+      if (firstNonModule) language = firstNonModule.language;
+      else language = symbols[0]?.language ?? language;
 
-    let contentHash = "";
-    try {
-      const src = await fs.readFile(path.join(resolvedPath, relPath), "utf-8");
-      contentHash = contentHashOf(src);
-    } catch {
-      // ignore
+      let contentHash = "";
+      try {
+        const src = await fs.readFile(path.join(resolvedPath, relPath), "utf-8");
+        contentHash = contentHashOf(src);
+      } catch {
+        // ignore
+      }
+      payloads.push({
+        file: relPath, language, contentHash, symbols, outgoingCalls,
+      });
+      totalSymbols += symbols.filter((s) => s.name !== "<module>").length;
+      totalEdges += outgoingCalls.length;
     }
-    payloads.push({
-      file: relPath, language, contentHash, symbols, outgoingCalls,
-    });
-    totalSymbols += symbols.filter((s) => s.name !== "<module>").length;
-    totalEdges += outgoingCalls.length;
-  }
 
-  // Build sharded indices
-  const nameShards = new Map<string, Record<string, SymbolRef[]>>();
-  for (const key of allNameShardKeys()) nameShards.set(key, {});
-  for (const [file, symbols] of symbolsByFile.entries()) {
-    for (const sym of symbols) {
-      if (sym.name === "<module>") continue;
-      const shardKey = nameShardKey(sym.name);
-      const shard = nameShards.get(shardKey);
-      if (!shard) continue;
-      const ref: SymbolRef = { file, id: sym.id };
-      // Use hasOwn — `shard[sym.name]` would return Object.prototype.constructor
-      // (a function) for symbol names like "constructor" / "toString" / "hasOwnProperty".
-      const existing = Object.hasOwn(shard, sym.name) ? shard[sym.name] : undefined;
-      if (existing) existing.push(ref);
-      else shard[sym.name] = [ref];
+    // Build sharded indices
+    const nameShards = new Map<string, Record<string, SymbolRef[]>>();
+    for (const key of allNameShardKeys()) nameShards.set(key, {});
+    for (const [file, symbols] of symbolsByFile.entries()) {
+      for (const sym of symbols) {
+        if (sym.name === "<module>") continue;
+        const shardKey = nameShardKey(sym.name);
+        const shard = nameShards.get(shardKey);
+        if (!shard) continue;
+        const ref: SymbolRef = { file, id: sym.id };
+        // Use hasOwn — `shard[sym.name]` would return Object.prototype.constructor
+        // (a function) for symbol names like "constructor" / "toString" / "hasOwnProperty".
+        const existing = Object.hasOwn(shard, sym.name) ? shard[sym.name] : undefined;
+        if (existing) existing.push(ref);
+        else shard[sym.name] = [ref];
+      }
     }
-  }
 
-  const reverseShards = new Map<number, Record<string, string[]>>();
-  for (const [callerFile, edges] of outgoingCallsByFile.entries()) {
-    for (const e of edges) {
-      for (const calleeId of e.calleeCandidates) {
-        const calleeFile = calleeId.split("::")[0];
-        if (!calleeFile || calleeFile === callerFile) continue;
-        const bucket = reverseShardKey(calleeFile);
-        let shard = reverseShards.get(bucket);
-        if (!shard) {
-          shard = {};
-          reverseShards.set(bucket, shard);
-        }
-        const existing = shard[calleeFile];
-        if (existing) {
-          if (!existing.includes(callerFile)) existing.push(callerFile);
-        } else {
-          shard[calleeFile] = [callerFile];
+    const newGeneration = randomUUID();
+    registerStagingGeneration(projectId, newGeneration);
+
+    const reverseShardSets = new Map<number, Map<string, Set<string>>>();
+    for (const edges of outgoingCallsByFile.values()) {
+      for (const e of edges) {
+        for (const calleeId of e.calleeCandidates) {
+          const bucket = reverseShardKeyForCallee(calleeId);
+          let shard = reverseShardSets.get(bucket);
+          if (!shard) {
+            shard = new Map();
+            reverseShardSets.set(bucket, shard);
+          }
+          let callers = shard.get(calleeId);
+          if (!callers) {
+            callers = new Set();
+            shard.set(calleeId, callers);
+          }
+          callers.add(e.callerId);
         }
       }
     }
-  }
 
-  // Persist
-  await saveFilePayloads(projectId, payloads);
-  for (const [shardKey, shard] of nameShards.entries()) {
-    if (Object.keys(shard).length === 0) continue;
-    await saveNameShard(projectId, shardKey, shard);
-  }
-  for (const [bucket, shard] of reverseShards.entries()) {
-    if (Object.keys(shard).length === 0) continue;
-    await saveReverseShard(projectId, bucket, shard);
-  }
+    const reverseShards = new Map<number, Record<string, string[]>>();
+    for (const [bucket, shardSets] of reverseShardSets.entries()) {
+      const shard: Record<string, string[]> = {};
+      for (const [calleeId, callers] of shardSets.entries()) {
+        shard[calleeId] = Array.from(callers);
+      }
+      reverseShards.set(bucket, shard);
+    }
 
-  const meta: SymbolGraphMeta = {
-    projectId,
-    symbolCount: totalSymbols,
-    edgeCount: totalEdges,
-    fileCount: symbolsByFile.size,
-    unresolvedEdgePct: computeUnresolvedPct(outgoingCallsByFile),
-    builtAt: Date.now(),
-    schemaVersion: 1,
-  };
-  await saveSymbolGraphMeta(projectId, meta);
+    try {
+      // Persist all payloads and shards into the staged generation first
+      await saveFilePayloads(projectId, payloads, newGeneration);
+      for (const [shardKey, shard] of nameShards.entries()) {
+        if (Object.keys(shard).length === 0) continue;
+        await saveNameShard(projectId, shardKey, shard, newGeneration);
+      }
+      for (const [bucket, shard] of reverseShards.entries()) {
+        if (Object.keys(shard).length === 0) continue;
+        await saveReverseShard(projectId, bucket, shard, newGeneration);
+      }
 
-  // Replace cache entry
-  const cache = new SymbolGraphCache(projectId, meta);
-  setSymbolGraphCache(cache);
+      // Activate that generation with one metadata-pointer write only after every staged write succeeds
+      const meta: SymbolGraphMeta = {
+        projectId,
+        symbolCount: totalSymbols,
+        edgeCount: totalEdges,
+        fileCount: symbolsByFile.size,
+        unresolvedEdgePct: computeUnresolvedPct(outgoingCallsByFile),
+        builtAt: Date.now(),
+        schemaVersion: 2,
+        generation: newGeneration,
+      };
+      await saveSymbolGraphMeta(projectId, meta);
 
-  logger.info("Symbol graph persisted", {
-    projectId,
-    files: meta.fileCount,
-    symbols: meta.symbolCount,
-    edges: meta.edgeCount,
-    unresolvedPct: meta.unresolvedEdgePct.toFixed(1),
+      // Replace cache entry
+      const cache = new SymbolGraphCache(projectId, meta);
+      setSymbolGraphCache(cache);
+
+      // Safely retire superseded generations and clean abandoned staged generations
+      await cleanStaleGenerations(projectId, newGeneration).catch((err) => {
+        logger.warn("Failed to clean stale symbol-graph generations", {
+          projectId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+      logger.info("Symbol graph persisted", {
+        projectId,
+        files: meta.fileCount,
+        symbols: meta.symbolCount,
+        edges: meta.edgeCount,
+        unresolvedPct: meta.unresolvedEdgePct.toFixed(1),
+      });
+    } catch (err) {
+      // Staging failed: clean up the incomplete staged generation immediately
+      await deleteGeneration(projectId, newGeneration).catch(() => {});
+      throw err;
+    } finally {
+      unregisterStagingGeneration(projectId, newGeneration);
+    }
   });
 }
 

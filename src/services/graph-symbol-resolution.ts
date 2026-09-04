@@ -19,6 +19,76 @@
 
 import type { CodeGraph, SymbolEdge, SymbolNode } from "../types.js";
 
+/** Normalize relative path components like `foo/../bar` -> `bar` */
+function normalizePath(p: string): string {
+  const parts = p.split("/").filter(Boolean);
+  const stack: string[] = [];
+  for (const part of parts) {
+    if (part === ".") continue;
+    if (part === "..") {
+      stack.pop();
+    } else {
+      stack.push(part);
+    }
+  }
+  return stack.join("/");
+}
+
+const KNOWN_CODE_EXT =
+  /\.(?:[jt]sx?|m[jt]s|c[jt]s|py|rb|php|go|rs|java|kt|scala|cs|swift|dart|c|cpp|h|hpp|ex|exs|vue|svelte|lua|sh)$/i;
+
+function stripKnownExt(p: string): string {
+  const lastSlash = p.lastIndexOf("/");
+  const dir = lastSlash >= 0 ? p.slice(0, lastSlash + 1) : "";
+  const fileName = lastSlash >= 0 ? p.slice(lastSlash + 1) : p;
+  const stripped = fileName.replace(KNOWN_CODE_EXT, "");
+  return dir + stripped;
+}
+
+/** Resolve an import's module specifier to a dependency file path */
+function resolveDepFile(callerFile: string, sourceModule: string, deps: string[]): string | null {
+  if (!sourceModule) return null;
+  const callerDir = callerFile.includes("/") ? callerFile.slice(0, callerFile.lastIndexOf("/")) : "";
+  const rawCombined = callerDir ? `${callerDir}/${sourceModule}` : sourceModule;
+  const normalized = stripKnownExt(normalizePath(rawCombined.replace(/^\.\//, "")));
+  const cleanSpec = stripKnownExt(sourceModule.replace(/^[./\\]+/, ""));
+
+  // Pass 1: exact normalized match or normalized/index
+  for (const dep of deps) {
+    const depWithoutExt = stripKnownExt(dep);
+    if (depWithoutExt === normalized || depWithoutExt === `${normalized}/index`) {
+      return dep;
+    }
+  }
+
+  // Pass 2: suffix match (only if uniquely matched among dependencies)
+  const suffixMatches: string[] = [];
+  for (const dep of deps) {
+    const depWithoutExt = stripKnownExt(dep);
+    if (
+      depWithoutExt.endsWith(`/${cleanSpec}`) ||
+      depWithoutExt.endsWith(`/${cleanSpec}/index`)
+    ) {
+      suffixMatches.push(dep);
+    }
+  }
+  if (suffixMatches.length === 1) {
+    return suffixMatches[0];
+  }
+
+  // Fallback: match by basename if unique among dependencies
+  const baseSpec = cleanSpec.split("/").pop();
+  if (baseSpec) {
+    const matches = deps.filter((d) => {
+      const depBase = stripKnownExt(d.split("/").pop() ?? "");
+      return depBase === baseSpec || d.includes(`/${baseSpec}/index.`);
+    });
+    if (matches.length === 1) return matches[0];
+  }
+
+  return null;
+}
+
 /**
  * Resolve all call sites for every file in `symbolsByFile`. Mutates the
  * passed-in `outgoingCallsByFile` edges in place.
@@ -37,6 +107,12 @@ export function resolveCallSites(
       const existing = idx.get(s.name);
       if (existing) existing.push(s);
       else idx.set(s.name, [s]);
+
+      if (s.exportedAs && s.exportedAs !== s.name) {
+        const asExisting = idx.get(s.exportedAs);
+        if (asExisting) asExisting.push(s);
+        else idx.set(s.exportedAs, [s]);
+      }
     }
     symbolIndexByFile.set(file, idx);
   }
@@ -47,6 +123,87 @@ export function resolveCallSites(
     depsByFile.set(node.relativePath, node.dependencies.slice());
   }
 
+  // Re-export traversal is on the hot path for every unresolved edge. Build
+  // this once rather than rescanning every edge in a barrel on every lookup.
+  const reexportsByFile = new Map<string, SymbolEdge[]>();
+  for (const [file, edges] of outgoingCallsByFile.entries()) {
+    const reexports = edges.filter((edge) => edge.kind === "reexport");
+    if (reexports.length > 0) reexportsByFile.set(file, reexports);
+  }
+
+  /** Recursively find symbols matching `symbolName` in `targetFile` or its re-export chains */
+  function findSymbolsInTarget(
+    targetFile: string,
+    symbolName: string,
+    visited = new Set<string>(),
+  ): string[] {
+    const visitKey = `${targetFile}::${symbolName}`;
+    if (visited.has(visitKey)) return [];
+    visited.add(visitKey);
+
+    const candidates: string[] = [];
+    const targetIdx = symbolIndexByFile.get(targetFile);
+
+    // 1. Direct definition in targetFile (exported bindings only)
+    const directMatches = targetIdx?.get(symbolName);
+    if (directMatches && directMatches.length > 0) {
+      for (const s of directMatches) {
+        if (s.isExported !== false) {
+          if (symbolName === "default") {
+            if (s.exportedAs === "default" || s.name === "default") {
+              candidates.push(s.id);
+            }
+          } else {
+            if (s.exportedAs === undefined || s.exportedAs === symbolName || s.name === symbolName) {
+              candidates.push(s.id);
+            }
+          }
+        }
+      }
+    }
+
+    // If seeking default export and no exact name match, look for any symbol with exportedAs === "default"
+    if (symbolName === "default" && candidates.length === 0) {
+      const syms = symbolsByFile.get(targetFile) ?? [];
+      for (const s of syms) {
+        if (s.isExported !== false && (s.exportedAs === "default" || s.name === "default")) {
+          candidates.push(s.id);
+        }
+      }
+    }
+
+    // 2. Follow re-export chains in targetFile
+    const targetEdges = reexportsByFile.get(targetFile) ?? [];
+    const targetDeps = depsByFile.get(targetFile) ?? [];
+
+    for (const edge of targetEdges) {
+      const edgeSourceDep = edge.sourceModule
+        ? resolveDepFile(targetFile, edge.sourceModule, targetDeps)
+        : null;
+
+      // Named re-export: `export { X as Y } from './mod'` or `export { X } from './mod'`
+      if (edge.localAlias === symbolName || (!edge.localAlias && edge.importedName === symbolName) || (!edge.localAlias && !edge.importedName && edge.calleeName === symbolName)) {
+        const nextName = edge.importedName ?? edge.calleeName;
+        if (edgeSourceDep) {
+          const sub = findSymbolsInTarget(edgeSourceDep, nextName, visited);
+          candidates.push(...sub);
+        } else {
+          // Local re-export within same file
+          const localMatch = targetIdx?.get(nextName);
+          if (localMatch) for (const s of localMatch) candidates.push(s.id);
+        }
+      }
+
+      // Wildcard re-export: `export * from './mod'` (only when unaliased)
+      if (!edge.localAlias && (edge.calleeName === "*" || edge.importedName === "*") && edgeSourceDep) {
+        const sub = findSymbolsInTarget(edgeSourceDep, symbolName, visited);
+        candidates.push(...sub);
+      }
+    }
+
+    return candidates;
+  }
+
   for (const [callerFile, edges] of outgoingCallsByFile.entries()) {
     const localIdx = symbolIndexByFile.get(callerFile);
     const deps = depsByFile.get(callerFile) ?? [];
@@ -54,32 +211,31 @@ export function resolveCallSites(
     for (const edge of edges) {
       const candidates: string[] = [];
 
-      // 1. Local
-      const local = localIdx?.get(edge.calleeName);
-      if (local && local.length > 0) {
-        for (const s of local) candidates.push(s.id);
-        edge.calleeCandidates = candidates;
-        edge.confidence = "local";
-        continue;
+      // 1. Local (unless edge explicitly specifies an external source module)
+      if (!edge.sourceModule) {
+        const local = localIdx?.get(edge.calleeName);
+        if (local && local.length > 0) {
+          for (const s of local) candidates.push(s.id);
+          edge.calleeCandidates = candidates;
+          edge.confidence = "local";
+          continue;
+        }
       }
 
-      // 2. Imported (walk direct dependencies)
-      for (const dep of deps) {
-        const depIdx = symbolIndexByFile.get(dep);
-        const matches = depIdx?.get(edge.calleeName);
-        if (matches) for (const s of matches) candidates.push(s.id);
-      }
-
-      // 3. Wildcard / re-export — one extra hop through dep files
-      if (candidates.length === 0) {
+      // 2. Module-targeted import / reference
+      if (edge.sourceModule) {
+        const targetDep = resolveDepFile(callerFile, edge.sourceModule, deps);
+        const searchName = edge.importedName ?? edge.calleeName;
+        if (targetDep) {
+          const found = findSymbolsInTarget(targetDep, searchName);
+          candidates.push(...found);
+        }
+      } else {
+        // 3. Untargeted cross-file resolution (fallback for languages without explicit module specifiers)
+        const searchName = edge.importedName ?? edge.calleeName;
         for (const dep of deps) {
-          const transitive = depsByFile.get(dep) ?? [];
-          for (const t of transitive) {
-            if (t === callerFile) continue;
-            const tIdx = symbolIndexByFile.get(t);
-            const matches = tIdx?.get(edge.calleeName);
-            if (matches) for (const s of matches) candidates.push(s.id);
-          }
+          const found = findSymbolsInTarget(dep, searchName);
+          candidates.push(...found);
         }
       }
 

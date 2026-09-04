@@ -9,7 +9,7 @@
 
 import { Lang, parse } from "@ast-grep/napi";
 import { getLanguageFromExtension } from "../constants.js";
-import type { SymbolEdge, SymbolKind, SymbolNode } from "../types.js";
+import type { EdgeKind, SymbolEdge, SymbolKind, SymbolNode } from "../types.js";
 import { analyzeElixirTemplate, isElixirTemplateExtension } from "./elixir-templates.js";
 import { logger } from "./logger.js";
 
@@ -20,6 +20,10 @@ export interface ExtractedSymbols {
   rawCalls: Array<{
     callerId: string;
     calleeName: string;
+    kind: EdgeKind;
+    sourceModule?: string;
+    importedName?: string;
+    localAlias?: string;
     callSite: { file: string; line: number };
   }>;
 }
@@ -29,13 +33,50 @@ function makeId(file: string, qualifiedName: string, line: number): string {
   return `${file}::${qualifiedName}#${line}`;
 }
 
-/**
- * Wrapper around `node.findAll({rule:{kind}})` that swallows ast-grep
- * "Invalid Kind" errors. Different language grammars expose different node
- * kinds, so a kind that is valid for Kotlin (`object_declaration`) may be
- * rejected by Java's grammar and abort the entire extraction. Logging is
- * intentionally omitted at debug-level to avoid log spam on every file.
- */
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function extractBindingIdentifiers(node: any): Array<{ name: string; node: any }> {
+  if (!node) return [];
+  const kind = node.kind?.();
+  if (kind === "identifier" || kind === "shorthand_property_identifier_pattern") {
+    return [{ name: node.text(), node }];
+  }
+  if (kind === "pair_pattern" || kind === "pair") {
+    const value = node.field?.("value") ?? node.children?.()[2];
+    return extractBindingIdentifiers(value);
+  }
+  if (kind === "assignment_pattern" || kind === "object_assignment_pattern") {
+    const left = node.field?.("left") ?? node.children?.()[0];
+    return extractBindingIdentifiers(left);
+  }
+  if (kind === "required_parameter" || kind === "optional_parameter") {
+    const pat = node.field?.("pattern") ?? node.children?.()[0];
+    return extractBindingIdentifiers(pat);
+  }
+  if (kind === "rest_pattern") {
+    const kids = node.children?.() ?? [];
+    for (const k of kids) {
+      if (k.kind?.() === "identifier") {
+        return [{ name: k.text(), node: k }];
+      }
+    }
+    return [];
+  }
+  if (kind === "object_pattern" || kind === "array_pattern") {
+    // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+    const result: Array<{ name: string; node: any }> = [];
+    const kids = node.children?.() ?? [];
+    for (const k of kids) {
+      const kKind = k.kind?.();
+      if (kKind !== "{" && kKind !== "}" && kKind !== "[" && kKind !== "]" && kKind !== ",") {
+        result.push(...extractBindingIdentifiers(k));
+      }
+    }
+    return result;
+  }
+  return [];
+}
+
+/** Convert raw call sites to unresolved SymbolEdge objects (resolution in Phase C). */
 // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
 function safeFindAll(node: any, kind: string): any[] {
   try {
@@ -331,6 +372,7 @@ function extractFromElixir(
     rawCalls.push({
       callerId: findCallerId(scopes, line, moduleSym.id),
       calleeName: name,
+      kind: "call",
       callSite: { file, line },
     });
   }
@@ -463,6 +505,7 @@ function extractFromLua(
     rawCalls.push({
       callerId: findCallerId(scopes, line, moduleSym.id),
       calleeName: callee,
+      kind: "call",
       callSite: { file, line },
     });
   }
@@ -732,6 +775,7 @@ function extractFromDart(
     rawCalls.push({
       callerId: findCallerId(scopes, line, moduleSym.id),
       calleeName: callee,
+      kind: "call",
       callSite: { file, line },
     });
   }
@@ -751,15 +795,163 @@ function extractFromTsLike(
   const root = parse(lang, source).root();
   const symbols: SymbolNode[] = [moduleSym];
   const scopes: ScopeFrame[] = [];
+  const moduleScopeSymbolIds = new Set<string>();
+
+  const declaredBindingsCache = new Map<string, Set<string>>();
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  function isModuleScopeDeclaration(node: any): boolean {
+    let parent = node.parent?.();
+    if (parent?.kind?.() === "export_statement") {
+      parent = parent.parent?.();
+    }
+    return parent?.kind?.() === "program";
+  }
+
+  const functionScopeBoundaries = new Set([
+    "function_declaration",
+    "generator_function_declaration",
+    "function_expression",
+    "generator_function",
+    "arrow_function",
+    "method_definition",
+    "class_declaration",
+    "class_expression",
+  ]);
+
+  // `var` is function-scoped, including through nested blocks, but a nested
+  // function or class starts a different scope. A recursive findAll() crosses
+  // those boundaries and can incorrectly shadow an import in the outer function.
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  function collectFunctionScopedVars(functionNode: any, bound: Set<string>): void {
+    const body = functionNode.field?.("body");
+    if (!body) return;
+
+    // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+    function visit(node: any, isRoot = false): void {
+      const nodeKind = node.kind?.();
+      if (!isRoot && functionScopeBoundaries.has(nodeKind)) return;
+
+      if (nodeKind === "variable_declaration") {
+        for (const decl of node.children?.() ?? []) {
+          if (decl.kind?.() !== "variable_declarator") continue;
+          const nameNode = decl.field?.("name") ?? decl.children?.()[0];
+          if (!nameNode) continue;
+          for (const binding of extractBindingIdentifiers(nameNode)) {
+            bound.add(binding.name);
+          }
+        }
+      }
+
+      for (const child of node.children?.() ?? []) {
+        visit(child);
+      }
+    }
+
+    visit(body, true);
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  function getDeclaredBindingsInNode(node: any): Set<string> {
+    if (!node) return new Set();
+    const range = node.range?.();
+    const cacheKey = range ? `${node.kind?.()}:${range.start.index}:${range.end.index}` : "";
+    if (cacheKey) {
+      const cached = declaredBindingsCache.get(cacheKey);
+      if (cached) return cached;
+    }
+
+    const bound = new Set<string>();
+    const kind = node.kind?.();
+
+    // 1. Function parameters & function hoisted vars
+    if (
+      kind === "function_declaration" ||
+      kind === "function_expression" ||
+      kind === "arrow_function" ||
+      kind === "method_definition"
+    ) {
+      const params = node.field?.("parameters") ?? safeFind(node, "formal_parameters");
+      if (params) {
+        for (const child of params.children?.() ?? []) {
+          for (const b of extractBindingIdentifiers(child)) {
+            bound.add(b.name);
+          }
+        }
+      }
+      collectFunctionScopedVars(node, bound);
+    }
+
+    // 2. Catch clause parameter
+    if (kind === "catch_clause") {
+      const param = node.field?.("parameter") ?? safeFind(node, "identifier");
+      if (param) {
+        for (const b of extractBindingIdentifiers(param)) {
+          bound.add(b.name);
+        }
+      }
+    }
+
+    // 3. For loops: for (const x of items), for (let i = 0; ...), for (const k in obj)
+    if (kind === "for_statement" || kind === "for_in_statement" || kind === "for_of_statement") {
+      const init = node.field?.("initializer") ?? node.field?.("left");
+      if (init) {
+        for (const decl of safeFindAll(init, "variable_declarator")) {
+          const nameNode = decl.field?.("name") ?? decl.children?.()[0];
+          if (nameNode) {
+            for (const b of extractBindingIdentifiers(nameNode)) {
+              bound.add(b.name);
+            }
+          }
+        }
+      }
+    }
+
+    // 4. Block / function body / switch case declarations
+    if (kind === "statement_block" || kind === "switch_case" || kind === "switch_block") {
+      for (const child of node.children?.() ?? []) {
+        const cKind = child.kind?.();
+        if (cKind === "lexical_declaration" || cKind === "variable_declaration") {
+          for (const decl of child.children?.() ?? []) {
+            if (decl.kind?.() === "variable_declarator") {
+              const nameNode = decl.field?.("name") ?? decl.children?.()[0];
+              if (nameNode) {
+                for (const b of extractBindingIdentifiers(nameNode)) {
+                  bound.add(b.name);
+                }
+              }
+            }
+          }
+        } else if (cKind === "function_declaration" || cKind === "class_declaration") {
+          const nameNode = child.field?.("name") ?? safeFind(child, "identifier");
+          if (nameNode) {
+            bound.add(nameNode.text());
+          }
+        }
+      }
+    }
+
+    if (cacheKey) {
+      declaredBindingsCache.set(cacheKey, bound);
+    }
+    return bound;
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  function isLexicallyBound(idNode: any, name: string): boolean {
+    let curr = idNode.parent?.();
+    while (curr && curr.kind?.() !== "program") {
+      const bound = getDeclaredBindingsInNode(curr);
+      if (bound.has(name)) {
+        return true;
+      }
+      curr = curr.parent?.();
+    }
+    return false;
+  }
 
   // Class declarations
   for (const node of safeFindAll(root, "class_declaration")) {
-    // The name FIELD, not a subtree search: safeFind's recursive DFS reaches a
-    // decorator's identifier before the class's own name, so `@sealed class X`
-    // would extract as a class named `sealed` and collide with the real
-    // decorator function at resolution time. The field is grammar-precise on
-    // JS (identifier) and TS/TSX (type_identifier) alike; the searches remain
-    // only as a belt for grammars without the field.
     const nameNode = node.field("name")
       ?? safeFind(node, "type_identifier")
       ?? safeFind(node, "identifier");
@@ -768,18 +960,20 @@ function extractFromTsLike(
     const range = node.range();
     const startLine = range.start.line + 1;
     const endLine = range.end.line + 1;
+    const parentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isDefaultExport = /^\s*export\s+default\b/.test(node.text()) || /^\s*export\s+default\b/.test(parentText);
+    const isExported = isDefaultExport || /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(parentText);
     const sym: SymbolNode = {
       id: makeId(file, name, startLine),
-      name, qualifiedName: name, kind: "class", file, line: startLine, endLine, language,
+      name, qualifiedName: name, kind: "class",
+      exportedAs: isDefaultExport ? "default" : undefined,
+      isExported,
+      file, line: startLine, endLine, language,
     };
     symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
 
-    // Methods inside the class — DIRECT children of the class body only. A
-    // recursive scan fabricates phantom methods: an object-literal shorthand
-    // handler inside a field initializer or a call argument, or a nested
-    // class's methods, would all be stamped onto THIS class and persisted into
-    // the name index, corrupting name-based resolution and impact seeds.
     const body = node.field("body");
     // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
     let members: any[] = [];
@@ -790,9 +984,6 @@ function extractFromTsLike(
       members = [];
     }
     for (const m of members) {
-      // Name from the field, accepting only a literal property name: a
-      // computed name like `[Symbol.iterator]` has no static identity, and
-      // searching inside it used to persist a method that does not exist.
       const mNameNode = m.field("name");
       const mName = mNameNode?.kind() === "property_identifier" ? mNameNode.text() : null;
       if (!mName) continue;
@@ -819,11 +1010,18 @@ function extractFromTsLike(
     const r = node.range();
     const startLine = r.start.line + 1;
     const endLine = r.end.line + 1;
+    const fnParentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isDefaultExport = /^\s*export\s+default\b/.test(node.text()) || /^\s*export\s+default\b/.test(fnParentText);
+    const isExported = isDefaultExport || /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(fnParentText);
     const sym: SymbolNode = {
       id: makeId(file, name, startLine),
-      name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
+      name, qualifiedName: name, kind: "function",
+      exportedAs: isDefaultExport ? "default" : undefined,
+      isExported,
+      file, line: startLine, endLine, language,
     };
     symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
 
@@ -835,61 +1033,488 @@ function extractFromTsLike(
     const r = node.range();
     const startLine = r.start.line + 1;
     const endLine = r.end.line + 1;
+    const genParentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isDefaultExport = /^\s*export\s+default\b/.test(node.text()) || /^\s*export\s+default\b/.test(genParentText);
+    const isExported = isDefaultExport || /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(genParentText);
     const sym: SymbolNode = {
       id: makeId(file, name, startLine),
-      name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
+      name, qualifiedName: name, kind: "function",
+      exportedAs: isDefaultExport ? "default" : undefined,
+      isExported,
+      file, line: startLine, endLine, language,
     };
     symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
 
-  // Named arrow functions: `const foo = (...) => {...}` or `const foo = function(...) {...}`
-  for (const node of safeFindAll(root, "lexical_declaration")) {
-    for (const decl of safeFindAll(node, "variable_declarator")) {
-      const idNode = safeFind(decl, "identifier");
-      if (!idNode) continue;
-      const name = idNode.text();
-      const arrow = safeFind(decl, "arrow_function");
-      const fnExpr = safeFind(decl, "function_expression");
-      const fn = arrow ?? fnExpr;
-      if (!fn) continue;
-      const r = fn.range();
-      const startLine = r.start.line + 1;
-      const endLine = r.end.line + 1;
-      const sym: SymbolNode = {
-        id: makeId(file, name, startLine),
-        name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
-      };
-      symbols.push(sym);
-      scopes.push({ name, startLine, endLine, symbolId: sym.id });
+  // Interface declarations (TS / TSX)
+  for (const node of safeFindAll(root, "interface_declaration")) {
+    const nameNode = node.field("name")
+      ?? safeFind(node, "type_identifier")
+      ?? safeFind(node, "identifier");
+    if (!nameNode) continue;
+    const name = nameNode.text();
+    const r = node.range();
+    const startLine = r.start.line + 1;
+    const endLine = r.end.line + 1;
+    const ifaceParentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isExported = /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(ifaceParentText);
+    const sym: SymbolNode = {
+      id: makeId(file, name, startLine),
+      name, qualifiedName: name, kind: "interface", isExported, file, line: startLine, endLine, language,
+    };
+    symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
+    scopes.push({ name, startLine, endLine, symbolId: sym.id });
+  }
+
+  // Type alias declarations (TS / TSX)
+  for (const node of safeFindAll(root, "type_alias_declaration")) {
+    const nameNode = node.field("name")
+      ?? safeFind(node, "type_identifier")
+      ?? safeFind(node, "identifier");
+    if (!nameNode) continue;
+    const name = nameNode.text();
+    const r = node.range();
+    const startLine = r.start.line + 1;
+    const endLine = r.end.line + 1;
+    const typeParentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isExported = /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(typeParentText);
+    const sym: SymbolNode = {
+      id: makeId(file, name, startLine),
+      name, qualifiedName: name, kind: "type", isExported, file, line: startLine, endLine, language,
+    };
+    symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
+    scopes.push({ name, startLine, endLine, symbolId: sym.id });
+  }
+
+  // Enum declarations (TS / TSX)
+  for (const node of safeFindAll(root, "enum_declaration")) {
+    const nameNode = node.field("name")
+      ?? safeFind(node, "identifier");
+    if (!nameNode) continue;
+    const name = nameNode.text();
+    const r = node.range();
+    const startLine = r.start.line + 1;
+    const endLine = r.end.line + 1;
+    const enumParentText = node.parent?.()?.kind?.() === "export_statement" ? node.parent().text() : "";
+    const isExported = /^\s*export\b/.test(node.text()) || /^\s*export\b/.test(enumParentText);
+    const sym: SymbolNode = {
+      id: makeId(file, name, startLine),
+      name, qualifiedName: name, kind: "enum", isExported, file, line: startLine, endLine, language,
+    };
+    symbols.push(sym);
+    if (isModuleScopeDeclaration(node)) moduleScopeSymbolIds.add(sym.id);
+    scopes.push({ name, startLine, endLine, symbolId: sym.id });
+  }
+
+  // Lexical and variable declarations: const, let, var (top-level only, direct declarators)
+  // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+  const topLevelDeclNodes: Array<{ node: any; isExported: boolean }> = [];
+  try {
+    for (const child of root.children()) {
+      if (child.kind() === "export_statement") {
+        const decl = child.field("declaration");
+        if (decl) {
+          if (decl.kind() === "lexical_declaration" || decl.kind() === "variable_declaration") {
+            topLevelDeclNodes.push({ node: decl, isExported: true });
+          }
+        } else {
+          for (const sub of child.children()) {
+            if (sub.kind() === "lexical_declaration" || sub.kind() === "variable_declaration") {
+              topLevelDeclNodes.push({ node: sub, isExported: true });
+            }
+          }
+        }
+      } else if (child.kind() === "lexical_declaration" || child.kind() === "variable_declaration") {
+        topLevelDeclNodes.push({ node: child, isExported: false });
+      }
+    }
+  } catch {
+    // fallback if root.children() is unavailable
+  }
+
+  for (const { node, isExported } of topLevelDeclNodes) {
+    // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+    const declarators = (node.children?.() ?? []).filter((c: any) => c.kind() === "variable_declarator");
+    for (const decl of declarators) {
+      // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+      const nameNode = decl.field("name") ?? (decl.children?.().find((c: any) => c.kind() === "identifier" || c.kind() === "object_pattern" || c.kind() === "array_pattern"));
+      if (!nameNode) continue;
+      const bindings = extractBindingIdentifiers(nameNode);
+      const value = decl.field?.("value");
+      const valueKind = value?.kind?.();
+      const fn = valueKind === "arrow_function" || valueKind === "function_expression"
+        ? value
+        : null;
+      if (fn && bindings.length === 1) {
+        const name = bindings[0].name;
+        const r = (fn ?? decl).range();
+        const startLine = r.start.line + 1;
+        const endLine = r.end.line + 1;
+        const sym: SymbolNode = {
+          id: makeId(file, name, startLine),
+          name, qualifiedName: name, kind: "function", isExported, file, line: startLine, endLine, language,
+        };
+        symbols.push(sym);
+        moduleScopeSymbolIds.add(sym.id);
+        scopes.push({ name, startLine, endLine, symbolId: sym.id });
+      } else {
+        for (const b of bindings) {
+          const name = b.name;
+          const r = b.node.range();
+          const startLine = r.start.line + 1;
+          const endLine = r.end.line + 1;
+          const sym: SymbolNode = {
+            id: makeId(file, name, startLine),
+            name, qualifiedName: name, kind: "variable", isExported, file, line: startLine, endLine, language,
+          };
+          symbols.push(sym);
+          moduleScopeSymbolIds.add(sym.id);
+        }
+      }
     }
   }
 
-  // Call sites
+  // Track declaration names and lines to avoid self-referencing declaration identifiers
+  const declaredNamesAndLines = new Set<string>();
+  for (const s of symbols) {
+    if (s.name !== "<module>") {
+      declaredNamesAndLines.add(`${s.name}#${s.line}`);
+    }
+  }
+
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
-  for (const node of safeFindAll(root, "call_expression")) {
-    const calleeName = extractCalleeNameJs(node.text());
-    if (!calleeName) continue;
+  const localToExportedName = new Map<string, string>();
+  const localToImportInfo = new Map<string, { sourceModule: string; importedName: string }>();
+  const namespaceNames = new Set<string>();
+  const namespaceToModule = new Map<string, string>();
+
+  // 1. Import statements: named imports (`import { X, Y as Z }`), type imports (`import type { T }`), default imports (`import D from ...`), namespace imports (`import * as NS from ...`)
+  for (const imp of safeFindAll(root, "import_statement")) {
+    const r = imp.range();
+    const line = r.start.line + 1;
+    const sourceNode = imp.field("source") ?? safeFind(imp, "string");
+    const sourceModule = sourceNode ? sourceNode.text().replace(/^['"`]|['"`]$/g, "") : undefined;
+
+    for (const spec of safeFindAll(imp, "import_specifier")) {
+      const nameNode = spec.field("name") ?? safeFind(spec, "identifier");
+      if (!nameNode) continue;
+      const originalName = nameNode.text();
+      const aliasNode = spec.field("alias");
+      const localName = aliasNode ? aliasNode.text() : originalName;
+      localToExportedName.set(localName, originalName);
+      if (sourceModule) {
+        localToImportInfo.set(localName, { sourceModule, importedName: originalName });
+      }
+
+      rawCalls.push({
+        callerId: moduleSym.id,
+        calleeName: originalName,
+        kind: "import",
+        sourceModule,
+        importedName: originalName,
+        localAlias: localName !== originalName ? localName : undefined,
+        callSite: { file, line },
+      });
+    }
+
+    // Namespace import: `import * as NS from "..."`
+    const nsNode = safeFind(imp, "namespace_import");
+    if (nsNode) {
+      const idNode = safeFind(nsNode, "identifier");
+      if (idNode) {
+        const nsName = idNode.text();
+        namespaceNames.add(nsName);
+        if (sourceModule) {
+          namespaceToModule.set(nsName, sourceModule);
+        }
+        rawCalls.push({
+          callerId: moduleSym.id,
+          calleeName: nsName,
+          kind: "import",
+          sourceModule,
+          importedName: "*",
+          localAlias: nsName,
+          callSite: { file, line },
+        });
+      }
+    }
+
+    const clause = safeFind(imp, "import_clause");
+    if (clause) {
+      // Direct identifier in import_clause is default import
+      // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+      const kids = (clause as any).children?.() ?? [];
+      for (const k of kids) {
+        if (k.kind() === "identifier") {
+          const defaultName = k.text();
+          localToExportedName.set(defaultName, defaultName);
+          if (sourceModule) {
+            localToImportInfo.set(defaultName, { sourceModule, importedName: "default" });
+          }
+          rawCalls.push({
+            callerId: moduleSym.id,
+            calleeName: defaultName,
+            kind: "import",
+            sourceModule,
+            importedName: "default",
+            localAlias: defaultName,
+            callSite: { file, line },
+          });
+        }
+      }
+    }
+  }
+
+  // 2. Re-export statements (`export { X, Y as Z } from '...'` and `export { X }`)
+  for (const exp of safeFindAll(root, "export_statement")) {
+    const r = exp.range();
+    const line = r.start.line + 1;
+    const sourceNode = exp.field("source") ?? safeFind(exp, "string");
+    const sourceModule = sourceNode ? sourceNode.text().replace(/^['"`]|['"`]$/g, "") : undefined;
+
+    const expText = exp.text();
+    const starReexport = expText.match(/export\s+\*(?:\s+as\s+([\w$]+))?\s+from/);
+    if (sourceModule && starReexport) {
+      const isNamespace = Boolean(starReexport[1]);
+      rawCalls.push({
+        callerId: moduleSym.id,
+        calleeName: starReexport[1] ?? "*",
+        kind: "reexport",
+        sourceModule,
+        importedName: isNamespace ? undefined : "*",
+        localAlias: starReexport[1],
+        callSite: { file, line },
+      });
+    }
+
+    if (!sourceModule) {
+      const defMatch = expText.match(/^\s*export\s+default\s+([a-zA-Z_$][\w$]*)/);
+      if (defMatch) {
+        const defName = defMatch[1];
+        for (const s of symbols) {
+          if (s.name === defName && moduleScopeSymbolIds.has(s.id)) {
+            s.isExported = true;
+            s.exportedAs = "default";
+          }
+        }
+      }
+    }
+
+    for (const spec of safeFindAll(exp, "export_specifier")) {
+      const nameNode = spec.field("name") ?? safeFind(spec, "identifier");
+      if (!nameNode) continue;
+      const expName = nameNode.text();
+      const aliasNode = spec.field("alias");
+      const localName = aliasNode ? aliasNode.text() : expName;
+      localToExportedName.set(localName, expName);
+      if (!sourceModule) {
+        for (const s of symbols) {
+          if (s.name === expName && moduleScopeSymbolIds.has(s.id)) {
+            s.isExported = true;
+            if (aliasNode) {
+              s.exportedAs = aliasNode.text();
+            }
+          }
+        }
+      }
+      rawCalls.push({
+        callerId: moduleSym.id,
+        calleeName: expName,
+        kind: "reexport",
+        sourceModule,
+        importedName: expName,
+        localAlias: localName !== expName ? localName : undefined,
+        callSite: { file, line },
+      });
+    }
+  }
+
+  // 3. Call sites and instantiations
+  for (const k of ["call_expression", "new_expression"]) {
+    for (const node of safeFindAll(root, k)) {
+      const info = extractCalleeInfoJs(node.text());
+      if (!info) continue;
+      let calleeName = info.calleeName;
+      const impInfo = info.isBare ? localToImportInfo.get(calleeName) : undefined;
+      const mapped = info.isBare ? localToExportedName.get(calleeName) : undefined;
+      const localAlias = mapped && mapped !== calleeName ? calleeName : undefined;
+      if (mapped) {
+        calleeName = mapped;
+      }
+      const r = node.range();
+      const callLine = r.start.line + 1;
+      const callerId = findCallerId(scopes, callLine, moduleSym.id);
+      rawCalls.push({
+        callerId,
+        calleeName,
+        kind: "call",
+        sourceModule: impInfo?.sourceModule,
+        importedName: impInfo?.importedName,
+        localAlias,
+        callSite: { file, line: callLine },
+      });
+    }
+  }
+
+  // 4. Type references (type annotations, type arguments, implements, extends)
+  const TS_BUILTIN_TYPES = new Set([
+    "string", "number", "boolean", "any", "unknown", "never", "void", "null", "undefined",
+    "symbol", "bigint", "object", "Function", "true", "false",
+    "Array", "Record", "Promise", "Partial", "Required", "Readonly", "Pick", "Omit",
+    "Exclude", "Extract", "NonNullable", "ReturnType", "InstanceType", "Parameters",
+    "ConstructorParameters", "Awaited", "Map", "Set", "WeakMap", "WeakSet", "Error",
+    "RegExp", "Date", "Uint8Array", "Int8Array", "Uint16Array", "Int16Array",
+    "Uint32Array", "Int32Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
+    "ArrayBuffer", "DataView", "Iterable", "AsyncIterable", "Iterator", "AsyncIterator",
+    "Generator", "AsyncGenerator", "TemplateStringsArray", "PropertyKey",
+    "T", "K", "V", "U", "R", "P",
+  ]);
+
+  for (const node of safeFindAll(root, "type_identifier")) {
+    let name = node.text();
+    if (TS_BUILTIN_TYPES.has(name)) continue;
     const r = node.range();
-    const callLine = r.start.line + 1;
-    const callerId = findCallerId(scopes, callLine, moduleSym.id);
+    const line = r.start.line + 1;
+    if (declaredNamesAndLines.has(`${name}#${line}`)) continue;
+    const impInfo = localToImportInfo.get(name);
+    const mapped = localToExportedName.get(name);
+    const localAlias = mapped && mapped !== name ? name : undefined;
+    if (mapped) {
+      name = mapped;
+    }
+    const callerId = findCallerId(scopes, line, moduleSym.id);
     rawCalls.push({
-      callerId, calleeName,
-      callSite: { file, line: callLine },
+      callerId,
+      calleeName: name,
+      kind: "type_reference",
+      sourceModule: impInfo?.sourceModule,
+      importedName: impInfo?.importedName,
+      localAlias,
+      callSite: { file, line },
     });
   }
-  return { symbols, rawCalls };
+
+  // 5. Value references and namespace member accesses in expressions / statements
+  if (namespaceNames.size > 0) {
+    for (const node of safeFindAll(root, "member_expression")) {
+      const objNode = node.field("object");
+      const propNode = node.field("property");
+      if (objNode && propNode && namespaceNames.has(objNode.text())) {
+        const objText = objNode.text();
+        const propName = propNode.text();
+        const sourceModule = namespaceToModule.get(objText);
+        const r = node.range();
+        const line = r.start.line + 1;
+        const callerId = findCallerId(scopes, line, moduleSym.id);
+        rawCalls.push({
+          callerId,
+          calleeName: propName,
+          kind: "value_reference",
+          sourceModule,
+          importedName: propName,
+          callSite: { file, line },
+        });
+      }
+    }
+  }
+
+  if (localToExportedName.size > 0) {
+    for (const idNode of safeFindAll(root, "identifier")) {
+      const localName = idNode.text();
+      const originalName = localToExportedName.get(localName);
+      if (!originalName) continue;
+      const r = idNode.range();
+      const line = r.start.line + 1;
+      if (declaredNamesAndLines.has(`${localName}#${line}`)) continue;
+      const parent = idNode.parent();
+      const parentKind = parent?.kind?.();
+      // Skip import_specifier / import_clause / export_specifier definition sites themselves
+      if (parentKind === "import_specifier" || parentKind === "import_clause" || parentKind === "export_specifier") {
+        continue;
+      }
+      // Skip non-computed member property access (e.g. obj.foo)
+      if (parentKind === "member_expression") {
+        const prop = parent?.field?.("property");
+        if (prop && prop.range().start.index === r.start.index) {
+          continue;
+        }
+      }
+      // Skip object literal keys (e.g. { foo: 1 })
+      if (parentKind === "pair") {
+        const key = parent?.field?.("key");
+        if (key && key.range().start.index === r.start.index) {
+          continue;
+        }
+      }
+      // Skip property or method definitions
+      if (parentKind === "property_signature" || parentKind === "method_definition" || parentKind === "field_definition") {
+        continue;
+      }
+      // Skip direct invocation sites already recorded as calls
+      if (parentKind === "call_expression") {
+        const fn = parent?.field?.("function");
+        if (fn && fn.range().start.index === r.start.index) {
+          continue;
+        }
+      }
+      if (parentKind === "new_expression") {
+        const ctor = parent?.field?.("constructor");
+        if (ctor && ctor.range().start.index === r.start.index) {
+          continue;
+        }
+      }
+      const callerId = findCallerId(scopes, line, moduleSym.id);
+      // Skip if shadowed by local parameter, variable, destructuring, catch binding, or block scope
+      if (isLexicallyBound(idNode, localName)) {
+        continue;
+      }
+      const impInfo = localToImportInfo.get(localName);
+      rawCalls.push({
+        callerId,
+        calleeName: originalName,
+        kind: "value_reference",
+        sourceModule: impInfo?.sourceModule,
+        importedName: impInfo?.importedName,
+        localAlias: localName !== originalName ? localName : undefined,
+        callSite: { file, line },
+      });
+    }
+  }
+
+  // Deduplicate rawCalls sharing (callerId, calleeName, kind, sourceModule, importedName, localAlias) to keep graph compact
+  const dedupedCalls: ExtractedSymbols["rawCalls"] = [];
+  const seenCalls = new Set<string>();
+  for (const call of rawCalls) {
+    const key = `${call.callerId}::${call.calleeName}::${call.kind}::${call.sourceModule ?? ""}::${call.importedName ?? ""}::${call.localAlias ?? ""}`;
+    if (!seenCalls.has(key)) {
+      seenCalls.add(key);
+      dedupedCalls.push(call);
+    }
+  }
+
+  return { symbols, rawCalls: dedupedCalls };
 }
 
-/** Pull the callee's bare name from the start of a call expression's text. */
-function extractCalleeNameJs(text: string): string | null {
+/** Pull the callee name and whether it was an unqualified bare identifier (not a member call). */
+function extractCalleeInfoJs(text: string): { calleeName: string; isBare: boolean } | null {
+  const cleaned = text.replace(/^\s*new\s+/, "");
   // `foo(...)` → "foo"  ;  `obj.foo(...)` → "foo"  ;  `obj.bar.foo(...)` → "foo"
-  const m = text.match(/^([\w$.]+)\s*\(/);
+  const m = cleaned.match(/^([\w$.]+)\s*(?:\(|$)/);
   if (!m) return null;
   const chain = m[1];
+  const isBare = !chain.includes(".");
   const parts = chain.split(".");
   const last = parts[parts.length - 1];
-  return /^[A-Za-z_$][\w$]*$/.test(last) ? last : null;
+  return /^[A-Za-z_$][\w$]*$/.test(last) ? { calleeName: last, isBare } : null;
+}
+
+/** Pull the callee's bare name from the start of a call/new expression's text. */
+function extractCalleeNameJs(text: string): string | null {
+  return extractCalleeInfoJs(text)?.calleeName ?? null;
 }
 
 /**
@@ -1022,6 +1647,7 @@ function extractFromPython(
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
       calleeName,
+      kind: "call",
       callSite: { file, line: callLine },
     });
   }
@@ -1077,7 +1703,9 @@ function extractFromGo(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1118,7 +1746,9 @@ function extractFromRust(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   for (const node of safeFindAll(root, "macro_invocation")) {
@@ -1128,7 +1758,9 @@ function extractFromRust(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName: nameNode.text(), callSite: { file, line: callLine },
+      calleeName: nameNode.text(),
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1204,7 +1836,9 @@ function extractFromJvm(
       const callLine = r.start.line + 1;
       rawCalls.push({
         callerId: findCallerId(scopes, callLine, moduleSym.id),
-        calleeName, callSite: { file, line: callLine },
+        calleeName,
+        kind: "call",
+        callSite: { file, line: callLine },
       });
     }
   }
@@ -1301,7 +1935,9 @@ function extractFromCSharp(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1369,7 +2005,9 @@ function extractFromCFamily(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1424,15 +2062,6 @@ function extractFromRuby(
 
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
   for (const node of safeFindAll(root, "call")) {
-    // Ask the grammar, not the text. tree-sitter-ruby's `call` node carries the
-    // callee in its `method` field for every call shape — parenthesised or not,
-    // command style (`has_many :posts`), safe navigation (`a&.b`), block calls,
-    // and each link of a fluent chain as its own node. The previous
-    // extractCalleeNameJs(text) parse required a `(` before the name, so every
-    // parenthesis-less call — the dominant Ruby idiom — was silently dropped
-    // and Ruby files contributed almost no call edges. (A bare receiverless,
-    // argumentless `helper` parses as a plain identifier, indistinguishable
-    // from a variable read, so it is not a `call` node and stays out.)
     const methodNode = node.field("method");
     const calleeName = methodNode ? methodNode.text() : extractCalleeNameJs(node.text());
     if (!calleeName) continue;
@@ -1440,7 +2069,9 @@ function extractFromRuby(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1504,7 +2135,9 @@ function extractFromPhp(
       const callLine = r.start.line + 1;
       rawCalls.push({
         callerId: findCallerId(scopes, callLine, moduleSym.id),
-        calleeName, callSite: { file, line: callLine },
+        calleeName,
+        kind: "call",
+        callSite: { file, line: callLine },
       });
     }
   }
@@ -1569,7 +2202,9 @@ function extractFromSwift(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName, callSite: { file, line: callLine },
+      calleeName,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1613,7 +2248,9 @@ function extractFromBash(
     const callLine = r.start.line + 1;
     rawCalls.push({
       callerId: findCallerId(scopes, callLine, moduleSym.id),
-      calleeName: name, callSite: { file, line: callLine },
+      calleeName: name,
+      kind: "call",
+      callSite: { file, line: callLine },
     });
   }
   return { symbols, rawCalls };
@@ -1670,8 +2307,10 @@ function extractFromRegex(
         const callLine = i + 1;
         rawCalls.push({
           callerId: findCallerId(scopes, callLine, moduleSym.id),
-        calleeName: name, callSite: { file, line: callLine },
-      });
+          calleeName: name,
+          kind: "call",
+          callSite: { file, line: callLine },
+        });
       }
       m = callRegex.exec(lines[i]);
     }
@@ -1688,6 +2327,10 @@ export function rawCallsToUnresolvedEdges(
     calleeName: c.calleeName,
     calleeCandidates: [],
     confidence: "unresolved" as const,
+    kind: c.kind,
+    sourceModule: c.sourceModule,
+    importedName: c.importedName,
+    localAlias: c.localAlias,
     callSite: c.callSite,
   }));
 }

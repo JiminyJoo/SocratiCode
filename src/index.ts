@@ -330,7 +330,9 @@ server.tool(
   "Impact Analysis — return the BLAST RADIUS for a file or symbol. Lists every file (and, where helpful, function) that could break if you change the target. Polymorphic on target: a path-like string ('src/foo.ts') triggers file-mode; a name-like string ('validateUser') triggers symbol-mode. Use this BEFORE refactoring, renaming, or deleting code to know what depends on it.",
   {
     projectPath: z.string().describe("Absolute path to the project directory.").optional(),
-    target: z.string().describe("Target file path (relative) OR symbol name."),
+    target: z.string().describe("Target file path (relative) OR symbol name.").optional(),
+    file: z.string().describe("Optional file path to disambiguate the target symbol.").optional(),
+    symbolId: z.string().describe("Exact symbol ID (e.g. 'src/foo.ts::validateUser#10') to disambiguate.").optional(),
     depth: z.number().describe("How many hops back to walk (default 3, max 10).").optional(),
   },
   async (args) => ({
