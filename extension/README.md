@@ -83,8 +83,8 @@ their own MCP configuration.
    listed and running.
 3. **Index the workspace.** Open the SocratiCode sidebar (Activity Bar
    icon) and click *Index this workspace*. A local Ollama setup downloads
-   its embedding model on first use; cloud and external providers do not.
-   Subsequent updates are incremental.
+   its embedding model on first use if it is not already available; cloud
+   and external providers do not. Subsequent updates are incremental.
 4. **Ask anything.** Use the editor's native agent: "where is auth handled?",
    "what breaks if I change `processOrder`?", "trace the nightly cron
    job", "what tables does this API touch?".
@@ -98,6 +98,11 @@ A walkthrough is shown on first install; re-open it any time via
 
 - Microsoft VS Code 1.99+, or a compatible editor that implements
   `vscode.lm.registerMcpServerDefinitionProvider`.
+- To verify tools in Microsoft VS Code's native Agent Chat, enable AI features
+  and agents (`chat.agent.enabled`) and provide an available model through
+  GitHub Copilot or another supported configured provider. When using Copilot,
+  sign in with the account that has access and keep GitHub Copilot Chat current.
+  Organization policy can disable agents or restrict model access.
 - Node.js 18.17+ with `npx` on `PATH` (the engine launches via `npx`).
 - Docker Desktop running for the default managed Qdrant and Ollama stack.
   Docker is optional when Qdrant is external and embeddings use either a
@@ -182,8 +187,8 @@ project repo:
   `SocratiCode` is listed and started. Third-party clients require separate
   MCP configuration.
 - **First local index is slow**: a local Ollama setup downloads the embedding
-  model the first time. Cloud and external providers do not. Subsequent runs
-  are fast.
+  model if it is not already available. Cloud and external providers do not.
+  Subsequent runs are fast.
 - **Anything else**: `SocratiCode: Show output / logs` from the
   command palette has the engine output.
 
