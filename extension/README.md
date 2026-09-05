@@ -87,9 +87,11 @@ their own MCP configuration.
    icon) and click *Index this workspace*. A local Ollama setup downloads
    its embedding model on first use if it is not already available; cloud
    and external providers do not. Subsequent updates are incremental.
-4. **Ask anything.** Use the editor's native agent: "where is auth handled?",
-   "what breaks if I change `processOrder`?", "trace the nightly cron
-   job", "what tables does this API touch?".
+4. **Ask anything.** In Microsoft VS Code, use native Agent Chat. In another
+   compatible editor, use that host's available agent or chat interface after
+   verifying the MCP provider. Ask: "where is auth handled?", "what breaks if
+   I change `processOrder`?", "trace the nightly cron job", or "what tables
+   does this API touch?".
 5. **Open the interactive graph.** Command Palette →
    `SocratiCode: Open interactive graph`.
 
@@ -147,10 +149,12 @@ independent client.
 ## Updating
 
 In Microsoft VS Code, use the Extensions view or run
-`Extensions: Check for Extension Updates`. In another editor, use that host's
-extension update flow. Reload the window, start a new native agent session, and
-verify both the installed version and SocratiCode server through the host's MCP
-server list. See the [host integration instructions](https://github.com/giancarloerra/socraticode#plugins-and-host-integrations).
+`Extensions: Check for Extension Updates`, reload the window, start a new native
+Agent Chat, and verify the final version and server with `MCP: List Servers`.
+In another editor, use that host's extension update flow, restart or reload it
+as documented, verify the registered MCP provider through its server list, and
+use its available agent or chat interface. See the
+[host integration instructions](https://github.com/giancarloerra/socraticode#plugins-and-host-integrations).
 
 ## SocratiCode Cloud (private beta)
 
