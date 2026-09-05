@@ -49,7 +49,7 @@
 
 **Code intelligence that belongs to you, AI and host agnostic** — your codebase's understanding lives with the code, not locked to any one assistant, IDE or model. And because SocratiCode pre-computes the hard parts (blast radius, call-flow, dependency traversal), **smaller models can handle architectural complex tasks that would otherwise need top-tier reasoning**, saving even more on token cost.
 
-The first Qdrant‑based MCP/Claude Plugin/Skill that pairs auto‑managed, zero‑config local Docker deployment with **AST‑aware code chunking, hybrid semantic + BM25 (RRF‑fused) code search**, polyglot dependency **graphs** with circular‑dependency visualisation, **symbol‑level Impact Analysis** (blast‑radius & call‑flow tracing across 18 languages), and searchable **infra/API/database artifacts** in a single focused, zero-config and easy to use code intelligence engine.
+The first Qdrant‑based MCP/Claude Plugin/Skill that pairs auto‑managed, zero‑config local Docker deployment with **AST‑aware code chunking, hybrid semantic + BM25 (RRF‑fused) code search**, polyglot dependency **graphs** with circular‑dependency visualisation, **symbol‑level Impact Analysis** (blast‑radius & call‑flow tracing across 19 languages), and searchable **infra/API/database artifacts** in a single focused, zero-config and easy to use code intelligence engine.
 
 > **Benchmarked on VS Code (2.45M lines):** SocratiCode uses **61% less context**, **84% fewer tool calls**, and is **37x faster** than grep‑based exploration — tested live with Claude Opus 4.6. [See the full benchmark →](#real-world-benchmark-vs-code-245m-lines-of-code-with-claude-opus-46)
 
@@ -476,8 +476,8 @@ On VS Code's 2.45M‑line codebase, SocratiCode answers architectural questions 
 - **Multi-provider embeddings** — Switch between Local Ollama (private, GPU access), Docker Ollama (zero-config), OpenAI (`text-embedding-3-small`, fastest), Google Gemini (`gemini-embedding-001`, free tier), LM Studio (local OpenAI-compatible server), or LiteLLM (proxy gateway in front of 100+ providers) with a single environment variable. No provider-specific configuration files.
 - **Private & secure** — Everything runs on your machine — your code never leaves your network. The default Docker setup includes Ollama (embeddings) and Qdrant (vector storage) with no external API calls. No API costs, no token limits. Suitable for air-gapped and on-premises environments. Optional cloud providers (OpenAI, Google Gemini, Qdrant Cloud) are available but never required.
 - **AST-aware chunking** — Files are split at function/class boundaries using AST parsing (ast-grep), not arbitrary line counts. This produces higher-quality search results. Falls back to line-based chunking for unsupported languages.
-- **Polyglot code dependency graph** — Static analysis of import/require/use/include statements using ast-grep for 18+ languages. No external tools like dependency-cruiser required. Detects circular dependencies and generates visual Mermaid diagrams.
-- **Language-agnostic** — Works with every programming language, framework, and file type out of the box. No per-language parsers to install, no grammar files to maintain, no "unsupported language" limitations. If your AI can read it, SocratiCode can index it.
+- **Polyglot code dependency graph** — Static analysis of import/require/use/include statements using ast-grep for 19+ languages. No external tools like dependency-cruiser required. Detects circular dependencies and generates visual Mermaid diagrams.
+- **Language-agnostic** — Works with every [supported file type](#language-support) out of the box. No per-language parsers to install, no grammar files to maintain, no "unsupported language" limitations. GDScript AST features use an optional native binary (`tree-sitter-gdscript`); all other fully-supported languages work out of the box. For non-standard extensions, configure [`EXTRA_EXTENSIONS`](#environment-variables). If your AI can read it, SocratiCode can index it.
 - **Incremental indexing** — After the first full index, only changed files are re-processed. Content hashes are persisted in Qdrant so state survives server restarts.
 - **Batched & resumable indexing** — Files are processed in batches of 50, with progress checkpointed to Qdrant after each batch. If the process crashes or is interrupted, the next run automatically resumes from where it left off — already-indexed files are skipped via hash comparison. This keeps peak memory low and makes indexing reliable even for very large codebases.
 - **Live file watching** — Optionally watch for file changes and keep the index updated in real time (debounced 2s). Watcher also invalidates the code graph cache.
@@ -1127,7 +1127,9 @@ SocratiCode supports languages at three levels:
 
 ### Full Support (indexing + code graph + AST chunking)
 
-JavaScript, TypeScript, TSX, Python, Java, Kotlin, Scala, C, C++, C#, Go, Rust, Ruby, PHP, Swift, Dart, Elixir (including HEEx/EEx), Bash/Shell, HTML, CSS/SCSS, Svelte, Vue
+JavaScript, TypeScript, TSX, Python, Java, Kotlin, Scala, C, C++, C#, Go, Rust, Ruby, PHP, Swift, Dart, Elixir (including HEEx/EEx), Bash/Shell, HTML, CSS/SCSS, Svelte, Vue, GDScript (Godot)
+
+GDScript: `.gd` files use an optional native binary (`tree-sitter-gdscript`) for AST chunking. When the native parser is unavailable, a regex fallback handles import extraction and line-based chunking. `class_name` declarations, `extends`/`preload`/`load` imports, and `res://` paths are resolved. Per-file `project.godot` discovery supports nested and sibling Godot projects. Godot scenes & resources (`.tscn`/`.tres`): text-based Godot resource files are indexed with line-based chunking (no AST grammar). `[ext_resource]` declarations are extracted as dependency edges via a tokenizer that handles arbitrary whitespace, attribute order, escaped quotes, and both `uid="uid://..."` and `path="..."` attributes. When both are present, the UID takes priority (matching Godot's own resolution order). Both `res://` paths and paths relative to the `.tscn`/`.tres` file are supported, per the [TSCN documentation](https://docs.godotengine.org/en/stable/engine_details/file_formats/tscn.html). `res://` paths resolve to `.gd`, `.tscn`, and `.tres` targets in the code graph.
 
 Svelte and Vue: imports extracted from `<script>` blocks (re-parsed as TypeScript) and CSS `@import`/`@require` from `<style>` blocks (any combination of `lang`, `scoped`, `module`, `global` attributes). Path aliases from `tsconfig.json`/`jsconfig.json` `compilerOptions.paths` are resolved (including `extends` chains). SCSS partial resolution (`_` prefix convention) is supported.
 
@@ -1147,7 +1149,7 @@ Lua (require/dofile/loadfile), SASS, LESS, Stylus (CSS `@import`/`@require` extr
 
 JSON, YAML, TOML, XML, INI/CFG, Markdown/MDX, RST, SQL, R, Dockerfile, TXT, and any file matching a supported extension or special filename (Dockerfile, Makefile, Gemfile, Rakefile, etc.)
 
-**60 file extensions** + 8 special filenames supported out of the box.
+**58 file extensions** + 8 special filenames supported out of the box.
 
 Extensionless files (Unix scripts, health probes, sourced libraries) are also indexed via content-based language detection when `INDEX_EXTENSIONLESS` is enabled (the default) — see that environment variable below.
 
