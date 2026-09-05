@@ -26,9 +26,10 @@ Same understanding of your code, every assistant, every tool switch.</p>
 
 > **The big number.** On a 2.45M-line codebase, SocratiCode answers the same architectural question with **61% less context burned**, **84% fewer tool calls**, and **37x faster** than a grep-based AI agent. Same model, dramatically better answers. [Full benchmark on GitHub.](https://github.com/giancarloerra/socraticode#real-world-benchmark-vs-code-245m-lines-of-code-with-claude-opus-46)
 
-This extension auto-registers the SocratiCode MCP server in any
-MCP-compatible chat or agent in your editor, with no `mcp.json` editing
-required.
+On Microsoft VS Code 1.99+ and compatible editors that implement the VS Code
+MCP provider API, this extension registers SocratiCode with the editor's native
+MCP registry. Independent clients such as Cline, Continue, and Roo Code require
+their own MCP configuration.
 
 ## What it does
 
@@ -74,15 +75,20 @@ required.
 
 ## Quick start
 
-1. **Install the extension.** Search **SocratiCode** in your editor's
-   Extensions panel. The MCP server registers automatically.
-2. **Index the workspace.** Open the SocratiCode sidebar (Activity Bar
-   icon) and click *Index this workspace*. The first index downloads
-   the embedding model; subsequent updates are incremental.
-3. **Ask anything.** Use your AI assistant: "where is auth handled?",
+1. **Install the extension.** Search **SocratiCode** in the Extensions panel
+   and install it in the current editor profile from Visual Studio Marketplace
+   or Open VSX.
+2. **Activate and verify it.** Reload the editor window, start a new native
+   Agent Chat, and run `MCP: List Servers`. Confirm that `SocratiCode` is
+   listed and running.
+3. **Index the workspace.** Open the SocratiCode sidebar (Activity Bar
+   icon) and click *Index this workspace*. A local Ollama setup downloads
+   its embedding model on first use; cloud and external providers do not.
+   Subsequent updates are incremental.
+4. **Ask anything.** Use the editor's native agent: "where is auth handled?",
    "what breaks if I change `processOrder`?", "trace the nightly cron
    job", "what tables does this API touch?".
-4. **Open the interactive graph.** Command Palette →
+5. **Open the interactive graph.** Command Palette →
    `SocratiCode: Open interactive graph`.
 
 A walkthrough is shown on first install; re-open it any time via
@@ -90,11 +96,13 @@ A walkthrough is shown on first install; re-open it any time via
 
 ## Requirements
 
-- An editor on the VS Code 1.99+ API (any of the editors listed above).
-- Node.js 18+ on `PATH` (the engine launches via `npx`).
-- Docker Desktop running (for the default local engine), OR a
-  reachable external Qdrant if you'd rather not use Docker (configured
-  via `socraticode.env`, see Settings).
+- Microsoft VS Code 1.99+, or a compatible editor that implements
+  `vscode.lm.registerMcpServerDefinitionProvider`.
+- Node.js 18.17+ with `npx` on `PATH` (the engine launches via `npx`).
+- Docker Desktop running for the default managed Qdrant and Ollama stack.
+  Docker is optional when Qdrant is external and embeddings use either a
+  detected native Ollama instance or a cloud or external provider. Configure
+  these modes through `socraticode.env`; see Settings.
 
 ## Commands
 
@@ -118,31 +126,22 @@ All commands appear under `SocratiCode:` in the Command Palette.
 
 ## Compatibility
 
-**Editors.** This extension installs in any editor that supports the
-VS Code 1.99+ extension API:
+Microsoft VS Code Stable and Insiders implement the MCP provider API used by
+this extension. Open VSX makes the package available to VS Code-derived
+editors, but package installation alone does not prove that a host implements
+that API. If `MCP: List Servers` does not show SocratiCode, configure it through
+that host's own local stdio MCP settings.
 
-- Microsoft VS Code (Stable / Insiders)
-- Cursor
-- VSCodium
-- Gitpod
-- code-server
-- Eclipse Theia-based editors
-- Google Antigravity
-- Particle Workbench
+The extension registers only with the editor's native MCP host. It does not
+write configuration for Cursor Agent, Cline, Continue, Roo Code, or another
+independent client.
 
-**AI surfaces.** The MCP server registered by this extension is
-discovered automatically by any MCP-compatible chat or agent installed
-in your editor:
+## Updating
 
-- GitHub Copilot agent mode
-- Cursor's Agent / Composer
-- The Gemini chat surface in Antigravity
-- [Cline](https://github.com/cline/cline)
-- [Continue](https://www.continue.dev/)
-- [Roo Code](https://roo.tech/)
-- Any other MCP-aware client, including ones not listed here
-
-If your editor or AI surface speaks MCP, SocratiCode shows up.
+Use the Extensions view or run `Extensions: Check for Extension Updates`, then
+reload the window and start a new native Agent Chat. Verify the final version
+under the installed extension and confirm the server again with
+`MCP: List Servers`.
 
 ## SocratiCode Cloud (private beta)
 
@@ -178,11 +177,13 @@ project repo:
   https://docker.com/products/docker-desktop, or set `socraticode.env`
   with `QDRANT_MODE=external` plus `QDRANT_URL` to use an existing
   Qdrant instance.
-- **MCP tools don't appear in your assistant**: restart the chat after
-  install, or run `MCP: List Servers` from the command palette and
-  confirm `SocratiCode` is listed and started.
-- **First index is slow**: the engine downloads the embedding model
-  the first time. Subsequent runs are fast.
+- **MCP tools don't appear in the native agent**: reload the window, start a
+  new chat, then run `MCP: List Servers` from the command palette and confirm
+  `SocratiCode` is listed and started. Third-party clients require separate
+  MCP configuration.
+- **First local index is slow**: a local Ollama setup downloads the embedding
+  model the first time. Cloud and external providers do not. Subsequent runs
+  are fast.
 - **Anything else**: `SocratiCode: Show output / logs` from the
   command palette has the engine output.
 

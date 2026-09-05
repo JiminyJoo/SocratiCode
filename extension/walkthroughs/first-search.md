@@ -4,7 +4,7 @@ Now your codebase is indexed, two things to try.
 
 ## Ask your AI assistant
 
-In Copilot agent mode, Cline, Continue or Roo Code, ask any of:
+In VS Code's native agent mode, ask any of:
 
 - "Where is authentication handled in this project?"
 - "What breaks if I change the function `processOrder`?"

@@ -8,7 +8,7 @@
   <a href="https://github.com/giancarloerra/socraticode/actions/workflows/ci.yml"><img src="https://github.com/giancarloerra/socraticode/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue.svg" alt="License: AGPL-3.0"></a>
   <a href="https://www.npmjs.com/package/socraticode"><img src="https://img.shields.io/npm/v/socraticode.svg" alt="npm version"></a>
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg" alt="Node.js >= 18"></a>
+  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D18.17-brightgreen.svg" alt="Node.js >= 18.17"></a>
   <a href="https://github.com/giancarloerra/socraticode"><img src="https://img.shields.io/github/stars/giancarloerra/socraticode?style=social" alt="GitHub stars"></a>
   <a href="https://mcptoplist.com/server/io.github.giancarloerra%2Fsocraticode"><img src="https://mcptoplist.com/badge/io.github.giancarloerra%2Fsocraticode.svg" alt="MCP Toplist rank"></a>
   <a href="https://discord.gg/dHNMKVY2J2"><img src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
@@ -18,7 +18,7 @@
   <a href="#claude-code-plugin-recommended-for-claude-code-users"><img src="https://img.shields.io/badge/Claude_Code-Install_Plugin-CC785C?style=flat-square&logoColor=white" alt="Install Claude Code Plugin"></a>
   <a href="https://marketplace.visualstudio.com/items?itemName=giancarloerra.socraticode"><img src="https://vsmarketplacebadges.dev/version-short/giancarloerra.socraticode.svg?style=flat-square&label=VS%20Code%20Marketplace&logo=visualstudiocode&color=0098FF" alt="VS Code Marketplace"></a>
   <a href="https://open-vsx.org/extension/giancarloerra/socraticode"><img src="https://img.shields.io/open-vsx/v/giancarloerra/socraticode?style=flat-square&label=Open%20VSX&color=A52A2A" alt="Open VSX"></a>
-  <a href="https://insiders.vscode.dev/redirect/mcp/install?name=socraticode&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22socraticode%22%5D%7D"><img src="https://img.shields.io/badge/VS_Code-Install_MCP_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white" alt="Install in VS Code"></a>
+  <a href="https://vscode.dev/redirect/mcp/install?name=socraticode&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22socraticode%22%5D%7D"><img src="https://img.shields.io/badge/VS_Code-Install_MCP_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white" alt="Install in VS Code"></a>
   <a href="https://insiders.vscode.dev/redirect/mcp/install?name=socraticode&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22socraticode%22%5D%7D&quality=insiders"><img src="https://img.shields.io/badge/VS_Code_Insiders-Install_MCP_Server-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white" alt="Install in VS Code Insiders"></a>
   <a href="cursor://anysphere.cursor-deeplink/mcp/install?name=socraticode&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsInNvY3JhdGljb2RlIl19"><img src="https://img.shields.io/badge/Cursor-Install_MCP_Server-F14C28?style=flat-square&logo=cursor&logoColor=white" alt="Install in Cursor"></a>
 </p>
@@ -41,7 +41,7 @@
 
 > **☁️ SocratiCode Cloud (private beta)** — Hosted, shared team index built on the same engine as the open-source version, plus SSO, audit logs, branch-aware indexing, and VPC / air-gapped deployment options. The open-source core remains free forever. [Request early access →](https://socraticode.cloud)
 
-**One thing, done well: deep codebase intelligence — zero setup, no bloat, fully automatic.** SocratiCode gives AI assistants deep semantic understanding of your codebase — **hybrid search, cross-project search, polyglot code dependency graphs, symbol-level impact analysis and flow, interactive HTML graph explorer for visual navigation, and searchable context artifacts (database schemas, API specs, infra configs, architecture docs)**. Zero configuration — add it to **any MCP host**, or install the **Native Plugin** for Claude Code, Cursor, VS Code Copilot, Codex or Gemini CLI. It manages everything automatically.
+**One thing, done well: deep codebase intelligence — zero setup, no bloat, fully automatic.** SocratiCode gives AI assistants deep semantic understanding of your codebase — **hybrid search, cross-project search, polyglot code dependency graphs, symbol-level impact analysis and flow, interactive HTML graph explorer for visual navigation, and searchable context artifacts (database schemas, API specs, infra configs, architecture docs)**. Zero configuration — add it to an **MCP host that supports local stdio servers**, or use a supported plugin or extension. It manages everything automatically.
 
 **Production-ready**, battle-tested on **enterprise-level** large repositories (up to and over **~40 million lines of code**). **Batched**, automatic **resumable** indexing checkpoints progress — pauses, crashes, restarts, and interruptions don't lose work. The file watcher keeps the **index automatically updated** at every file change and across sessions. **Multi-branch, multi-repo** and **multi-agent ready** — multiple AI agents can work on the same codebase simultaneously, sharing a single index with automatic coordination and zero configuration.
 
@@ -56,7 +56,7 @@ The first Qdrant‑based MCP/Claude Plugin/Skill that pairs auto‑managed, zero
 ## Contents
 
 - [Quick Start](#quick-start)
-- [Plugins](#plugins)
+- [Plugins and host integrations](#plugins-and-host-integrations)
 - [Why SocratiCode](#why-socraticode)
 - [Features](#features)
 - [Prerequisites](#prerequisites)
@@ -79,71 +79,29 @@ The first Qdrant‑based MCP/Claude Plugin/Skill that pairs auto‑managed, zero
 
 ## Quick Start
 
-> **Only [Docker](https://www.docker.com/products/docker-desktop/) (running) required.**
+> **Requirements:** [Node.js 18.17 or newer](https://nodejs.org/) with `npx` on `PATH`, plus [Docker](https://www.docker.com/products/docker-desktop/) running for the default local Qdrant and Ollama stack.
 
-**One-click install** — Claude Code, VS Code and Cursor:
+**Quick install guidance for Claude Code, VS Code, and Cursor:**
 
 [![Install Claude Code Plugin](https://img.shields.io/badge/Claude_Code-Install_Plugin-CC785C?style=flat-square&logoColor=white)](#claude-code-plugin-recommended-for-claude-code-users)
-[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_MCP_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=socraticode&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22socraticode%22%5D%7D) [![Install in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Install_MCP_Server-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=socraticode&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22socraticode%22%5D%7D&quality=insiders) [![Install in Cursor](https://img.shields.io/badge/Cursor-Install_MCP_Server-F14C28?style=flat-square&logo=cursor&logoColor=white)](cursor://anysphere.cursor-deeplink/mcp/install?name=socraticode&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsInNvY3JhdGljb2RlIl19) 
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_MCP_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://vscode.dev/redirect/mcp/install?name=socraticode&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22socraticode%22%5D%7D) [![Install in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-Install_MCP_Server-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=socraticode&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22socraticode%22%5D%7D&quality=insiders) [![Install in Cursor](https://img.shields.io/badge/Cursor-Install_MCP_Server-F14C28?style=flat-square&logo=cursor&logoColor=white)](cursor://anysphere.cursor-deeplink/mcp/install?name=socraticode&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsInNvY3JhdGljb2RlIl19)
 
-**All MCP hosts** — add the following to your `mcpServers` (Claude Desktop, Windsurf, Cline, Roo Code) or `servers` (VS Code project-local `.vscode/mcp.json`) config:
-
-```json
-"socraticode": {
-  "command": "npx",
-  "args": ["-y", "socraticode"]
-}
-```
-
-**Claude Code** — install the plugin (recommended, includes workflow skills for best results):
-
-From your shell:
-
-```bash
-claude plugin marketplace add giancarloerra/socraticode
-claude plugin install socraticode@socraticode
-```
-
-Or from within Claude Code:
-
-```
-/plugin marketplace add giancarloerra/socraticode
-/plugin install socraticode@socraticode
-```
-
-> **Auto-updates:** After installing, enable automatic updates by opening `/plugin` → Marketplaces → select `socraticode` → Enable auto-update.
-
-Or as MCP only (without skills):
-
-```bash
-claude mcp add socraticode -- npx -y socraticode
-```
-
-> **Updating:** `npx` caches the package after the first run. To get the latest version, clear the cache and restart your MCP host: `rm -rf ~/.npm/_npx && claude mcp restart socraticode`. Alternatively, use `npx -y socraticode@latest` in your config to always check for updates on startup (slightly slower).
-
-**OpenCode** — add to your `opencode.json` (or `opencode.jsonc`):
+**MCP hosts with a JSON `mcpServers` object** can use this complete configuration:
 
 ```json
 {
-  "mcp": {
+  "mcpServers": {
     "socraticode": {
-      "type": "local",
-      "command": ["npx", "-y", "socraticode"],
-      "enabled": true
+      "command": "npx",
+      "args": ["-y", "socraticode"]
     }
   }
 }
 ```
 
-**OpenAI Codex CLI** — add to `~/.codex/config.toml`:
+Configuration schemas are host-specific. Continue, VS Code, Zed, OpenCode, Gemini CLI, Cline, and Roo Code have dedicated examples in [Plugins and host integrations](#plugins-and-host-integrations).
 
-```toml
-[mcp_servers.socraticode]
-command = "npx"
-args = ["-y", "socraticode"]
-```
-
-Restart your host. On first use SocratiCode automatically pulls Docker images, starts its own Qdrant and Ollama containers, and downloads the embedding model — one-time setup, ~5 minutes depending on your connection. After that, it starts in seconds.
+Restart your host. With the default local configuration, first use pulls the required Docker images and starts managed Qdrant. `OLLAMA_MODE=auto` reuses a detected native Ollama instance or starts managed Ollama, then downloads the local embedding model if it is not already available. Cloud and external embedding providers do not download a local model. Initial setup usually takes about five minutes, depending on the connection; later starts take seconds.
 
 **First time on a project** — ask your AI: **"Index this codebase"**. Indexing runs in the background; ask **"What is the codebase index status?"** to monitor progress. Depending on codebase size and whether you're using GPU-accelerated Ollama or cloud embeddings, first-time indexing can take anywhere from a few seconds to a few minutes (it takes under 10 minutes to first-index +3 million lines of code on a Macbook Pro M4). Once complete it doesn't need to be run again, you can search, explore the dependency graph, and query context artifacts.
 
@@ -157,45 +115,327 @@ Restart your host. On first use SocratiCode automatically pulls Docker images, s
 
 > **Advanced**: cloud embeddings (OpenAI / Google), external Qdrant, remote Ollama, native Ollama, and dozens of tuning options are all available. See [Configuration](#configuration) below.
 
-## Plugins
+## Plugins and host integrations
 
-SocratiCode is available as a native plugin on multiple AI coding platforms. Plugins bundle the MCP server with workflow skills and agent instructions — one install gives you everything.
+SocratiCode can be installed as a native agent plugin, a VS Code editor extension, a Gemini CLI extension, or a directly configured local stdio MCP server. These are separate integration types and use different configuration and update paths.
 
-| Platform | Install method |
-|:---------|:---------------|
-| Claude Code | `claude plugin marketplace add giancarloerra/socraticode && claude plugin install socraticode@socraticode` — [full instructions](#claude-code-plugin-recommended-for-claude-code-users) |
-| **VS Code / Cursor / VSCodium / Gitpod / code-server / Theia / Antigravity / Particle Workbench** (extension) | Search **SocratiCode** in the Extensions panel (VS Code Marketplace or Open VSX). The extension auto-registers the MCP server in Copilot agent mode, Cline, Continue and Roo Code, and adds a sidebar, interactive graph webview, and onboarding walkthrough. _Source: [`extension/`](./extension)._ |
-| Cursor | `/add-plugin https://github.com/giancarloerra/socraticode` (plugin format with skills). Also listed in the Cursor Marketplace at [cursor.com/marketplace](https://cursor.com/marketplace). |
-| VS Code Copilot | Command Palette → `Chat: Install Plugin From Source` → `https://github.com/giancarloerra/socraticode` (plugin format with skills) |
-| Zed | Add as a custom MCP server in Zed settings — [config example](#zed) |
-| Gemini CLI | `gemini extensions install https://github.com/giancarloerra/socraticode` |
-| OpenAI Codex | No public plugin directory yet — use the [MCP config](#quick-start) or see **Codex local install** below |
+Every path below requires Node.js 18.17 or newer with `npx` on `PATH`. The default local stack also requires Docker to be running. Docker is optional when Qdrant is external and embeddings use either a detected native Ollama instance or a cloud or external provider.
 
-> **Extension vs plugin (what to install in VS Code / Cursor):**
->
-> - The **extension** (Marketplace / Open VSX listing) is a regular VS Code-style extension. It auto-registers the MCP server in Copilot agent mode, Cline, Continue, Roo Code, plus adds a sidebar, status-bar item, interactive graph webview, walkthrough and palette commands. Best for most users.
-> - The **plugins** (`/add-plugin` for Cursor, `Chat: Install Plugin From Source` for VS Code Copilot) bundle the MCP server **plus skills + agent instructions** that teach the AI to use SocratiCode tools effectively. Best when you want the agent to be opinionated about using SocratiCode.
-> - You can install both. The extension only registers the MCP server once, so they don't conflict.
-> - **VS Code Copilot note**: the chat plugins feature is in preview. Enable it with `chat.plugins.enabled: true` in your VS Code settings.
+| Host | Recommended integration | Scope |
+|:-----|:------------------------|:------|
+| Claude Code | Native plugin | User |
+| OpenAI Codex | Native plugin | User |
+| VS Code | Agent Plugin or editor extension | Current VS Code profile |
+| Cursor | Local Cursor plugin or direct MCP | User or project |
+| Gemini CLI | Gemini extension | User |
+| Continue | Direct MCP | Project or user config |
+| Cline | Direct MCP | Project or user config |
+| Roo Code | Direct MCP | Project or user config |
+| Zed | Direct MCP | User or project settings |
+| OpenCode | Direct MCP | Project or user config |
 
-> **Codex local plugin install**: Clone the repo and register it in your personal plugin marketplace:
-> ```bash
-> git clone https://github.com/giancarloerra/socraticode.git ~/.agents/plugins/socraticode
-> ```
-> Then add it to `~/.agents/plugins/marketplace.json`:
-> ```json
-> {
->   "plugins": [
->     {
->       "name": "socraticode",
->       "path": "~/.agents/plugins/socraticode"
->     }
->   ]
-> }
-> ```
-> Codex will discover the plugin from `.codex-plugin/plugin.json` on next launch.
+### Claude Code plugin (recommended for Claude Code users)
 
-> **All other MCP hosts** (Claude Desktop, Windsurf, Cline, Roo Code, OpenCode): Use the [MCP config](#quick-start) — works with any host that supports the MCP protocol.
+The native plugin bundles the MCP server, workflow skills, and agent instructions. Install it for the current user:
+
+```bash
+claude plugin marketplace add giancarloerra/socraticode
+claude plugin install --scope user socraticode@socraticode
+claude plugin list
+```
+
+Start a new Claude Code session after installation. Existing sessions do not load a newly installed plugin. To enable automatic updates, open `/plugin`, select **Marketplaces**, select `socraticode`, and enable auto-update. To update manually:
+
+```bash
+claude plugin marketplace update socraticode
+claude plugin update --scope user socraticode@socraticode
+```
+
+Run `/reload-plugins` or start a new session after updating. If SocratiCode was previously added as a standalone MCP server, remove that duplicate with `claude mcp remove socraticode`; the plugin already provides the server.
+
+For custom providers or external Qdrant, put inherited variables in Claude Code's user settings and restart the session:
+
+```json
+{
+  "env": {
+    "EMBEDDING_PROVIDER": "openai",
+    "OPENAI_API_KEY": "<your key>"
+  }
+}
+```
+
+Keep this user-scoped file private, or provide secrets through the process environment. Never commit secret values.
+
+See the [Claude Code plugin documentation](https://code.claude.com/docs/en/discover-plugins).
+
+#### Claude Code MCP-only installation
+
+For a user-scoped installation without the bundled skills:
+
+```bash
+claude mcp add --scope user socraticode -- npx -y socraticode
+claude mcp list
+```
+
+Start a new session, or run `/mcp` and select **Reconnect**. For an immediate package update, replace the configuration with an explicit latest-version command and reconnect:
+
+```bash
+claude mcp remove --scope user socraticode
+claude mcp add --scope user socraticode -- npx -y socraticode@latest
+```
+
+`claude mcp add` defaults to project-local scope when `--scope user` is omitted. See the [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
+
+### OpenAI Codex plugin
+
+The Codex plugin bundles SocratiCode's MCP server, skills, and instructions. Add the Git marketplace and install the plugin for the current user:
+
+```bash
+codex plugin marketplace add giancarloerra/socraticode --ref main
+codex plugin add socraticode@socraticode
+codex plugin list --available --json
+```
+
+Start a new Codex task or CLI session after installation. Reopening an existing task does not load newly installed skills or MCP tools. Update and verify with:
+
+```bash
+codex plugin marketplace upgrade socraticode
+codex plugin add socraticode@socraticode
+codex plugin list --available --json
+```
+
+Codex has a public plugin directory, but SocratiCode is not currently published there. Plugins are supported in the ChatGPT desktop Codex environment and Codex CLI. The Codex IDE extension supports shared MCP configuration, not plugin discovery. See the [OpenAI plugin documentation](https://learn.chatgpt.com/docs/plugins).
+
+#### OpenAI Codex MCP-only installation
+
+`codex mcp add` writes the user configuration in `~/.codex/config.toml`:
+
+```bash
+codex mcp add socraticode -- npx -y socraticode
+codex mcp list
+```
+
+Start a new task or CLI session after installation. For an immediate package update:
+
+```bash
+codex mcp remove socraticode
+codex mcp add socraticode -- npx -y socraticode@latest
+codex mcp list
+```
+
+The equivalent TOML is:
+
+```toml
+[mcp_servers.socraticode]
+command = "npx"
+args = ["-y", "socraticode"]
+```
+
+Both inline `env = { ... }` and a nested `[mcp_servers.socraticode.env]` table are valid. The CLI `--env KEY=value` option is usually clearer. See the [OpenAI Codex MCP documentation](https://learn.chatgpt.com/docs/extend/mcp?surface=cli).
+
+### VS Code Agent Plugin
+
+This plugin bundles the MCP server, skills, and agent instructions for VS Code's native agent. It is separate from the SocratiCode editor extension.
+
+1. Add this complete setting to the current VS Code profile before installation:
+
+   ```json
+   {
+     "chat.plugins.enabled": true
+   }
+   ```
+
+2. Run **Chat: Install Plugin From Source** from the Command Palette and enter `https://github.com/giancarloerra/socraticode`.
+3. Start a new Chat session.
+4. Verify SocratiCode under **Agent Plugins - Installed**, then run **MCP: List Servers** and confirm that its server is running.
+
+Run **Extensions: Check for Extension Updates** to refresh installed agent plugins, then start a new Chat session. See [VS Code Agent Plugins](https://code.visualstudio.com/docs/agent-customization/agent-plugins).
+
+### VS Code editor extension
+
+The separately published editor extension adds the SocratiCode sidebar, status item, commands, walkthrough, and interactive graph webview. Install **SocratiCode** from the [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=giancarloerra.socraticode) in the current VS Code profile.
+
+On Microsoft VS Code 1.99+ and compatible editors that implement the VS Code MCP provider API, the extension registers SocratiCode with the editor's native MCP registry. It does not configure independent clients such as Cline, Continue, or Roo Code.
+
+Reload the window and start a new Chat session after installation. Run **MCP: List Servers** to confirm that `SocratiCode` is running, and open the SocratiCode sidebar to verify the editor UI. Update it through the Extensions view or **Extensions: Check for Extension Updates**.
+
+The [Open VSX package](https://open-vsx.org/extension/giancarloerra/socraticode) can be installed in VS Code-derived editors, but native MCP registration requires that editor to implement `vscode.lm.registerMcpServerDefinitionProvider`. See the [VS Code MCP extension API](https://code.visualstudio.com/api/extension-guides/ai/mcp).
+
+#### VS Code direct MCP installation
+
+Use the Stable or Insiders badge above, choose user or workspace scope in VS Code, then start a new Chat session. A project-scoped `.vscode/mcp.json` uses this complete object:
+
+```json
+{
+  "servers": {
+    "socraticode": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "socraticode"]
+    }
+  }
+}
+```
+
+Verify with **MCP: List Servers**. To update immediately, change the package argument to `socraticode@latest`, restart the server from that command, and start a new Chat session.
+
+### Cursor
+
+The repository includes a Cursor-format plugin with the MCP server, skills, and instructions. SocratiCode is not currently published in the Cursor Marketplace, so use Cursor's documented user-scoped local-plugin directory:
+
+```bash
+mkdir -p ~/.cursor/plugins/local
+git clone https://github.com/giancarloerra/socraticode.git ~/.cursor/plugins/local/socraticode
+```
+
+Restart Cursor or run **Developer: Reload Window**, then verify the plugin under **Customize**. Update it with:
+
+```bash
+git -C ~/.cursor/plugins/local/socraticode pull --ff-only
+```
+
+Reload Cursor after updating. See [Cursor plugins](https://prod.cursor.com/docs/plugins).
+
+For direct MCP configuration, use the Cursor badge above and select the intended user or project scope in Cursor. Start a new Agent chat, then verify `socraticode` under **Cursor Settings → Tools & MCP**. Reopen the installer with `socraticode@latest` as the package argument when an immediate update is required. See [Cursor MCP install links](https://prod.cursor.com/docs/mcp/install-links).
+
+The SocratiCode package on Open VSX is a VS Code-style editor extension, not a Cursor plugin. Installing that extension does not establish that Cursor implements VS Code's native MCP provider API. Use the local plugin or direct MCP path when MCP availability is required.
+
+### Gemini CLI extension
+
+Install the user-scoped Gemini extension with automatic updates, verify it, then restart any active Gemini CLI session:
+
+```bash
+gemini extensions install https://github.com/giancarloerra/socraticode --auto-update
+gemini extensions list
+```
+
+If it was installed without `--auto-update`, update it manually and restart Gemini:
+
+```bash
+gemini extensions update socraticode
+gemini extensions list
+```
+
+Gemini limits which inherited environment variables are passed to extension MCP servers. For advanced configuration, define a server with the same name in user scope (`~/.gemini/settings.json`) or workspace scope (`.gemini/settings.json`). That definition overrides the extension server and explicitly forwards only the variables named in `env`:
+
+```json
+{
+  "mcpServers": {
+    "socraticode": {
+      "command": "npx",
+      "args": ["-y", "socraticode"],
+      "env": {
+        "EMBEDDING_PROVIDER": "openai",
+        "OPENAI_API_KEY": "${OPENAI_API_KEY}",
+        "QDRANT_MODE": "external",
+        "QDRANT_URL": "${QDRANT_URL}",
+        "QDRANT_API_KEY": "${QDRANT_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+Keep secret values in the process environment rather than committing them. Restart Gemini and run `gemini mcp list` to verify the overridden server. See the [Gemini extension reference](https://geminicli.com/docs/extensions/reference/) and [Gemini MCP configuration](https://geminicli.com/docs/tools/mcp-server/).
+
+### Continue
+
+Continue uses a YAML `mcpServers` list. For project scope, create `.continue/mcpServers/socraticode.yaml`:
+
+```yaml
+name: SocratiCode MCP
+version: 1.0.0
+schema: v1
+mcpServers:
+  - name: SocratiCode
+    type: stdio
+    command: npx
+    args:
+      - "-y"
+      - socraticode
+```
+
+Continue refreshes saved configuration automatically. Open a new Continue Agent session and confirm the SocratiCode tools are listed. For user scope, add the same `mcpServers` list to `~/.continue/config.yaml`. To update immediately, change `socraticode` to `socraticode@latest` and save the file. Continue can also import complete JSON MCP files placed in `.continue/mcpServers/`. See [Continue MCP configuration](https://docs.continue.dev/customize/deep-dives/mcp) and the [Continue YAML reference](https://docs.continue.dev/reference).
+
+### Cline
+
+For project scope, save this complete object as `.cline/mcp.json`. For user scope, add the same server to `~/.cline/data/settings/cline_mcp_settings.json` through Cline's MCP settings interface:
+
+```json
+{
+  "mcpServers": {
+    "socraticode": {
+      "command": "npx",
+      "args": ["-y", "socraticode"],
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+Start a new Cline task and verify that `socraticode` and its tools appear in the MCP Servers view. To update immediately, change the package argument to `socraticode@latest` and reconnect the server. See the [Cline MCP documentation](https://docs.cline.bot/mcp/mcp-overview).
+
+### Roo Code
+
+For project scope, save this complete object as `.roo/mcp.json`. For user scope, open Roo Code's MCP Servers view and select **Edit Global MCP**:
+
+```json
+{
+  "mcpServers": {
+    "socraticode": {
+      "command": "npx",
+      "args": ["-y", "socraticode"],
+      "disabled": false
+    }
+  }
+}
+```
+
+Start a new Roo Code task and verify that `socraticode` is connected in the MCP Servers view. To update immediately, change the package argument to `socraticode@latest` and restart the server. Project configuration takes precedence over a global server with the same name. See [Using MCP in Roo Code](https://github.com/RooCodeInc/Roo-Code-Docs/blob/main/docs/features/mcp/using-mcp-in-roo.mdx).
+
+### Zed
+
+Open **Settings → AI → MCP Servers → Add Server → Add Local Server**. The UI writes user-scoped settings. Use this complete server definition, either there or in project-scoped `.zed/settings.json`:
+
+```json
+{
+  "context_servers": {
+    "socraticode": {
+      "command": "npx",
+      "args": ["-y", "socraticode"],
+      "env": {}
+    }
+  }
+}
+```
+
+Verify that the indicator beside SocratiCode is green and its tooltip says **Server is active**, then start a new Agent conversation. To update immediately, change the package argument to `socraticode@latest` and restart the server from the MCP Servers page.
+
+Zed uses `~/.config/zed/AGENTS.md` for personal instructions. For project instructions it uses the first matching supported file, which can be `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, or another supported compatibility file. Zed Rules were replaced by Skills and Instructions. See [Zed MCP servers](https://zed.dev/docs/ai/mcp) and [Zed Instructions](https://zed.dev/docs/ai/instructions).
+
+### OpenCode
+
+Use project-root `opencode.json` or `opencode.jsonc` for project scope. Use `~/.config/opencode/opencode.json` or `opencode.jsonc` for user scope:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "socraticode": {
+      "type": "local",
+      "command": ["npx", "-y", "socraticode"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Restart OpenCode and verify the server with `opencode mcp list`. To update immediately, change `socraticode` to `socraticode@latest` and restart OpenCode. This is the current OpenCode 1.x schema. See [OpenCode MCP servers](https://opencode.ai/docs/mcp-servers/) and [OpenCode configuration](https://opencode.ai/docs/config/).
+
+### Other local stdio MCP hosts
+
+The complete JSON object in [Quick Start](#quick-start) applies only to hosts whose documentation specifies an `mcpServers` object. Add it at the user or project scope documented by that host, restart the MCP server or start a new session, and verify SocratiCode in the host's MCP server and tool list. To update immediately, change the final package argument to `socraticode@latest`. Hosts that support only remote HTTP MCP servers cannot launch SocratiCode directly.
 
 ## Why SocratiCode
 
@@ -266,7 +506,7 @@ On VS Code's 2.45M‑line codebase, SocratiCode answers architectural questions 
 | Dependency | Purpose | Install |
 |------------|---------|---------|
 | [Docker](https://www.docker.com/products/docker-desktop/) | Runs Qdrant (vector DB) and by default Ollama (embeddings) | [docker.com](https://www.docker.com/products/docker-desktop/) |
-| Node.js 18+ | Runs the MCP server | [nodejs.org](https://nodejs.org/) |
+| Node.js 18.17+ with `npx` on `PATH` | Runs the MCP server | [nodejs.org](https://nodejs.org/) |
 
 Docker must be **running** when you use the server in the default `managed` mode. 
 
@@ -354,7 +594,7 @@ For best results, add instructions like the following to your AI assistant's pro
 | Claude Code | `CLAUDE.md` at project root (auto-loaded). Plugin users get this via skills automatically. |
 | Cursor | `AGENTS.md` at project root, or `.cursor/rules/socraticode.mdc` for a dedicated rule file |
 | VS Code Copilot | `.github/copilot-instructions.md`, or a custom instructions file in your VS Code User prompts folder |
-| Zed | `AGENTS.md` at project root (Zed auto-reads it), or use the Rules Library to create a default rule |
+| Zed | `AGENTS.md` at project root, or `~/.config/zed/AGENTS.md` for personal instructions. Zed uses the first matching supported project instruction file. |
 | Windsurf | `.windsurfrules` at project root |
 | Claude Desktop / Cline / Roo Code | Add directly to your system prompt configuration |
 
@@ -450,119 +690,12 @@ before reading any files directly.
 > **Why semantic search first?** A single `codebase_search` call returns ranked, deduplicated snippets from across the entire codebase in milliseconds. This gives you a broad map at negligible token cost — far cheaper than opening files speculatively. Once you know which files matter, targeted reading is both faster and more accurate. That said, grep remains the right tool when you have an exact string or pattern — use whichever fits the query.
 
 > **Keep the connection alive during indexing.** Indexing runs in the background — the MCP server continues working even when not actively responding to tool calls. However, some MCP hosts might disconnect an idle MCP connection after a period of inactivity, which might cut off the background process. Instruct your AI to call `codebase_status` roughly every 60 seconds after starting `codebase_index` until it completes. This keeps the host connection active and provides real-time progress.
+
 ## Configuration
 
 ### Install
 
-#### Claude Code plugin (recommended for Claude Code users)
-
-The SocratiCode plugin bundles both the MCP server and workflow skills that teach Claude how to use the tools effectively. One install gives you everything:
-
-From your shell:
-
-```bash
-claude plugin marketplace add giancarloerra/socraticode
-claude plugin install socraticode@socraticode
-```
-
-Or from within Claude Code:
-
-```
-/plugin marketplace add giancarloerra/socraticode
-/plugin install socraticode@socraticode
-```
-
-The plugin includes:
-- **MCP server** — all 21 SocratiCode tools (search, graph, context artifacts, etc.)
-- **Exploration skill** — teaches Claude the search-before-reading workflow
-- **Management skill** — guides setup, indexing, watching, and troubleshooting
-- **Explorer agent** — delegatable subagent for deep codebase analysis
-
-> If you previously installed SocratiCode as a standalone MCP (`claude mcp add socraticode`), remove it after installing the plugin to avoid duplicates: `claude mcp remove socraticode`
-
-**Auto-updates:** Third-party plugins don't auto-update by default. To enable automatic updates, open `/plugin` → Marketplaces → select `socraticode` → Enable auto-update. To update manually:
-
-From your shell:
-
-```bash
-claude plugin marketplace update socraticode
-claude plugin update socraticode@socraticode
-```
-
-Or from within Claude Code:
-
-```
-/plugin marketplace update socraticode
-/plugin update socraticode@socraticode
-```
-
-**Configuring environment variables:** SocratiCode works with zero config for most users (local Ollama + managed Qdrant). If you need cloud embeddings, a remote Qdrant, or other customisation:
-
-1. **Claude Code settings** (recommended) — add to `~/.claude/settings.json`:
-   ```json
-   {
-     "env": {
-       "EMBEDDING_PROVIDER": "openai",
-       "OPENAI_API_KEY": "sk-..."
-     }
-   }
-   ```
-   This works in all environments — CLI, VS Code, and JetBrains.
-
-2. **Shell profile** — set vars in `~/.zshrc` or `~/.bashrc`:
-   ```bash
-   export EMBEDDING_PROVIDER=openai
-   export OPENAI_API_KEY=sk-...
-   ```
-   Works when Claude Code is launched from a terminal. Note: IDE-launched sessions (e.g. VS Code opened from Finder/Dock) may not inherit shell profile variables — use option 1 instead.
-
-Restart Claude Code after changing variables. See [Environment Variables](#environment-variables) for all options.
-
-#### npx (recommended for all other MCP hosts — no installation)
-
-Requires Node.js 18+ and Docker (running). Already covered in [Quick Start](#quick-start) above, add the following to your `mcpServers` (Claude Desktop, Windsurf, Cline, Roo Code) or `servers` (VS Code project-local `.vscode/mcp.json`) config:
-
-```json
-    "socraticode": {
-      "command": "npx",
-      "args": ["-y", "socraticode"]
-    }
-```
-
-#### Zed
-
-Add SocratiCode as a custom MCP server in Zed's settings (`Zed > Settings > Settings` or `cmd+,`). Under `context_servers`, add:
-
-```json
-{
-  "context_servers": {
-    "socraticode": {
-      "command": "npx",
-      "args": ["-y", "socraticode"],
-      "env": {}
-    }
-  }
-}
-```
-
-To pass environment variables (e.g. for cloud embeddings or branch-aware indexing), add them to the `env` object:
-
-```json
-{
-  "context_servers": {
-    "socraticode": {
-      "command": "npx",
-      "args": ["-y", "socraticode"],
-      "env": {
-        "EMBEDDING_PROVIDER": "openai",
-        "OPENAI_API_KEY": "sk-..."
-      }
-    }
-  }
-}
-```
-
-Zed auto-reads `AGENTS.md` from the project root for agent instructions. Copy the [Agent Instructions](#agent-instructions) block into your project's `AGENTS.md` to ensure the agent uses SocratiCode tools effectively. You can also add them as a default rule in Zed's Rules Library (`agent: open rules library`).
+Use the host-specific steps in [Plugins and host integrations](#plugins-and-host-integrations). They cover installation scope, activation, verification, updates, and each host's actual configuration schema.
 
 #### From source (for contributors)
 
@@ -573,17 +706,15 @@ npm install
 npm run build
 ```
 
-Then use `node /absolute/path/to/socraticode/dist/index.js` in place of `npx -y socraticode` in the config examples below.
+Register `node /absolute/path/to/socraticode/dist/index.js` in the user or project scope supported by your MCP host, then restart the server or start a new session. Verify SocratiCode in the host's MCP server list. To update, run `git pull --ff-only`, `npm install`, and `npm run build` in the clone, then restart the MCP server and verify it again.
 
 ### MCP host config variants
 
-> All `env` options below apply equally to the `npx` install. Just add the `"env"` block to the npx config shown above.
-
-Add to your MCP settings - `mcpServers` (Claude Desktop, Windsurf, Cline, Roo Code) or `servers` (VS Code project-local `.vscode/mcp.json`):
+The examples below use the conventional JSON `mcpServers` shape to show SocratiCode settings. Apply the same command and environment values through the host-specific schema documented in [Plugins and host integrations](#plugins-and-host-integrations). Continue, Gemini CLI, VS Code, Zed, and OpenCode use different configuration paths or wrappers.
 
 #### Default (zero config, from source)
 
-> Using **npx**? Your config is already in [Quick Start](#quick-start). Add any `"env"` block from the examples below as needed.
+> Using **npx**? Replace the `node` command and source path below with `"command": "npx"` and `"args": ["-y", "socraticode"]`.
 
 ```json
 {
@@ -1145,27 +1276,38 @@ Without artifacts, the agent only sees source code. With artifacts, it has the f
 
 ## Environment Variables
 
-SocratiCode reads configuration from environment variables. The way you pass them depends on your MCP host — the key name and file format differ across the three main config flavours. If env vars appear to be ignored, check the host's config format first — most "it's not picking up my settings" issues are a mismatched key.
+SocratiCode reads configuration from environment variables. The key name and file format depend on the MCP host. If variables appear to be ignored, check the host's documented schema and installation scope first.
 
 ### Passing env vars by host
 
 | Host | Config file | Env-var syntax |
 |------|-------------|---------|
-| Claude Code / Claude Desktop / Windsurf / Cline / Roo Code / Cursor / VS Code Copilot | MCP JSON (`mcpServers` or `servers`) | `"env": { "KEY": "value" }` |
-| **OpenCode** | `opencode.json` / `opencode.jsonc` ([schema](https://opencode.ai/config.json)) | **`"environment": { "KEY": "value" }`** — *not* `"env"`, which is silently ignored |
-| **OpenAI Codex CLI** | `~/.codex/config.toml` ([reference](https://developers.openai.com/codex/config-reference/)) | **Nested TOML table** — a `[mcp_servers.NAME.env]` block with `KEY = "value"` lines. Inline `env = { ... }` is *not* the Codex form. |
+| Claude Code native plugin | `~/.claude/settings.json` | Top-level `"env": { "KEY": "value" }` |
+| Claude Code MCP-only | User or project MCP configuration | `claude mcp add --env KEY=value ...` or an `env` object in the stored server definition |
+| Claude Desktop, Windsurf, Cursor, Cline, and Roo Code | Host MCP JSON | `"env": { "KEY": "value" }` inside the server definition |
+| VS Code direct MCP | `.vscode/mcp.json` or user MCP configuration | `"env": { "KEY": "value" }` inside the `servers` entry |
+| VS Code editor extension | VS Code settings | `"socraticode.env": { "KEY": "value" }` |
+| Continue | YAML config | `env:` map inside the `mcpServers` list item |
+| Zed | `context_servers` JSON | `"env": { "KEY": "value" }` |
+| Gemini CLI extension override | `~/.gemini/settings.json` or `.gemini/settings.json` | Explicit `"env"` entries; the extension does not inherit every process variable |
+| OpenCode | `opencode.json` / `opencode.jsonc` ([schema](https://opencode.ai/config.json)) | `"environment": { "KEY": "value" }`, not `"env"` |
+| OpenAI Codex CLI | `~/.codex/config.toml` | `codex mcp add --env KEY=value`, inline TOML `env = { ... }`, or `[mcp_servers.NAME.env]` |
 
 Worked examples with a few env vars set:
 
-**Standard MCP JSON** — Claude Code, Claude Desktop, Windsurf, Cline, Roo Code, Cursor, VS Code Copilot:
+**MCP JSON hosts** such as Claude Desktop, Windsurf, Cline, Roo Code, and Cursor:
 
 ```json
-"socraticode": {
-  "command": "npx",
-  "args": ["-y", "socraticode"],
-  "env": {
-    "QDRANT_MODE": "external",
-    "QDRANT_URL": "https://xyz.qdrant.io"
+{
+  "mcpServers": {
+    "socraticode": {
+      "command": "npx",
+      "args": ["-y", "socraticode"],
+      "env": {
+        "QDRANT_MODE": "external",
+        "QDRANT_URL": "https://xyz.qdrant.io"
+      }
+    }
   }
 }
 ```
@@ -1189,7 +1331,7 @@ Worked examples with a few env vars set:
 }
 ```
 
-**OpenAI Codex CLI** — env vars go in a separate `[mcp_servers.NAME.env]` table:
+**OpenAI Codex CLI** with the nested-table form:
 
 ```toml
 [mcp_servers.socraticode]
@@ -1200,6 +1342,8 @@ args = ["-y", "socraticode"]
 QDRANT_MODE = "external"
 QDRANT_URL = "https://xyz.qdrant.io"
 ```
+
+The equivalent CLI form is `codex mcp add socraticode --env QDRANT_MODE=external --env QDRANT_URL=https://xyz.qdrant.io -- npx -y socraticode`. Inline `env = { ... }` is also valid TOML.
 
 The rest of this section documents the variables themselves. Pass them using whichever syntax matches your host.
 
