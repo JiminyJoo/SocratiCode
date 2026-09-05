@@ -87,6 +87,26 @@ function safeFindAll(node: any, kind: string): any[] {
 }
 
 /**
+ * Several kinds in one traversal. `findAll` walks the whole tree per call, so
+ * asking for n kinds separately reads the file n times.
+ *
+ * The failure mode differs from n calls to {@link safeFindAll}, deliberately:
+ * ast-grep throws on a kind the grammar does not define, so one kind absent
+ * from the grammar loses the whole set here, where separate calls would lose
+ * only that kind. Losing the set is the louder failure, and the caller's tests
+ * name every kind it asks for — a grammar that dropped one would turn a test
+ * red instead of quietly returning fewer symbols.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+function safeFindAllAny(node: any, kinds: string[]): any[] {
+  try {
+    return node.findAll({ rule: { any: kinds.map((kind) => ({ kind })) } });
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Single-node counterpart of {@link safeFindAll}. ast-grep REJECTS a kind the
  * grammar does not define — it throws rather than returning null — so a direct
  * `node.find({rule:{kind}})` written with a `?? find(otherKind)` fallback never
@@ -1720,8 +1740,11 @@ function extractFromRust(
   moduleSym: SymbolNode,
 ): ExtractedSymbols {
   const root = parse("rust" as unknown as Lang, source).root();
-  const symbols: SymbolNode[] = [moduleSym];
   const scopes: ScopeFrame[] = [];
+  // Collected with the byte offset each declaration starts at, because that is
+  // the only key that orders two declarations sharing a line. See the sort at
+  // the end of this function.
+  const declared: Array<{ sym: SymbolNode; offset: number }> = [];
 
   for (const fn of safeFindAll(root, "function_item")) {
     const nameNode = safeFind(fn, "identifier");
@@ -1734,8 +1757,81 @@ function extractFromRust(
       id: makeId(file, name, startLine),
       name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
     };
-    symbols.push(sym);
+    declared.push({ sym, offset: r.start.index });
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
+  }
+
+  // Everything a Rust file declares that is not a function. Only `function_item`
+  // was read, so every type a crate exposes was absent from the symbol graph:
+  // `codebase_symbol` could not find a struct, an enum or a trait by name, and
+  // resolution — which matches a callee name against the symbols of the files
+  // the file graph says are imported — had nothing to match a type against.
+  //
+  // The name comes from the `name` field, which the grammar gives each of
+  // these: a `type_identifier` for the type-like ones, an `identifier` for the
+  // value-like ones. Searching for a bare `identifier` instead would take the
+  // wrong child — a struct's first `identifier` is its first field.
+  //
+  // `impl_item` and `use_declaration` are not in the table, but for different
+  // reasons, and only one of them means "not read". `safeFindAll` walks the
+  // whole tree, so what an impl *contains* is read: its methods as
+  // `function_item`, and an associated `type` or `const` through this table —
+  // under a bare name, without the implementing type, the way a method's name
+  // is already bare. Two impls of one trait therefore yield two symbols of the
+  // same associated name; the trait's own `type Item;` yields none, being an
+  // `associated_type` rather than a `type_item`. Both are stated in the pull
+  // request as limits rather than fixed here: qualifying a name is a change to
+  // how every language in this file names a member.
+  //
+  // A `use` is genuinely not an item: what it names is declared elsewhere, and
+  // the file graph already carries that edge.
+  //
+  // `isExported` is left unset, as it already is for `fn` above. The resolver
+  // admits a symbol unless that flag is explicitly `false`, so writing `pub`
+  // into it would silently drop every private item from resolution — a change
+  // of behaviour rather than an extraction fix.
+  //
+  // The kinds are the ones this file already gives these shapes elsewhere,
+  // checked by running those extractors rather than by reading them: C++ and C#
+  // yield `struct` for a struct, Scala and PHP yield `trait` for a trait.
+  // (`extractFromSwift` reads as a fifth precedent and is not one — its
+  // `struct` branch keys on `struct_declaration`, which the packaged grammar
+  // never produces, so a Swift struct comes out `class`.) A `union` has no
+  // precedent here; it is a record like a struct and is filed as one.
+  const RUST_ITEM_KINDS = new Map<string, SymbolNode["kind"]>([
+    ["struct_item", "struct"],
+    ["union_item", "struct"],
+    ["enum_item", "enum"],
+    ["trait_item", "trait"],
+    ["type_item", "type"],
+    ["const_item", "variable"],
+    ["static_item", "variable"],
+  ]);
+  // One pass, not one per kind: `findAll` walks the whole tree each time it is
+  // called, so seven calls read the file seven times. Measured on ripgrep's
+  // `crates/core/flags/defs.rs`, seven passes cost +51% over `main` on this
+  // function and one costs +18%.
+  for (const item of safeFindAllAny(root, [...RUST_ITEM_KINDS.keys()])) {
+    const symbolKind = RUST_ITEM_KINDS.get(item.kind());
+    if (!symbolKind) continue;
+    const nameNode = item.field("name");
+    if (!nameNode) continue;
+    const name = nameNode.text();
+    const r = item.range();
+    const startLine = r.start.line + 1;
+    declared.push({
+      sym: {
+        id: makeId(file, name, startLine),
+        name,
+        qualifiedName: name,
+        kind: symbolKind,
+        file,
+        line: startLine,
+        endLine: r.end.line + 1,
+        language,
+      },
+      offset: r.start.index,
+    });
   }
 
   const rawCalls: ExtractedSymbols["rawCalls"] = [];
@@ -1763,6 +1859,25 @@ function extractFromRust(
       callSite: { file, line: callLine },
     });
   }
+
+  // In declaration order, because a reader is shown a prefix of this list and
+  // not all of it: `listSymbols` cuts at its limit in payload order. Collected
+  // in two passes — functions, then everything else — the items would all sit
+  // after the functions, and on ripgrep 14.1.1's `crates/core/flags/defs.rs`
+  // (982 symbols, limit 200) not one of them appeared.
+  //
+  // The key is the byte offset the declaration starts at, not the line and not
+  // the name. Rust puts no weight on line breaks, so `const A: u8 = 1; const
+  // B: u8 = 2;` is two declarations on one line; ordering those by name would
+  // put a later declaration first, and at the limit boundary that is a listing
+  // that drops the earlier one. An offset is unique per declaration, so the
+  // order is total and is the source's own.
+  //
+  // `<module>` is prepended rather than sorted: it is synthetic, it has no
+  // offset of its own, and it belongs at the head.
+  declared.sort((a, b) => a.offset - b.offset);
+  const symbols: SymbolNode[] = [moduleSym, ...declared.map((d) => d.sym)];
+
   return { symbols, rawCalls };
 }
 

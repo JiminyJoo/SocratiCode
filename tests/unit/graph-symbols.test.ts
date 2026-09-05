@@ -4,6 +4,7 @@
 import { Lang } from "@ast-grep/napi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { ensureDynamicLanguages } from "../../src/services/code-graph.js";
+import { listSymbols } from "../../src/services/graph-impact.js";
 import {
   extractSymbolsAndCalls,
   rawCallsToUnresolvedEdges,
@@ -218,6 +219,142 @@ impl S {
       expect(names).toContain("foo");
       expect(names).toContain("bar");
       expect(out.symbols.some((s) => s.name === "<module>")).toBe(true);
+      // The fixture above already declared `struct S`, and nothing asserted it:
+      // only `function_item` was read, so every type a crate exposes was
+      // invisible to symbol lookup.
+      expect(names).toContain("S");
+    });
+
+    it("extracts the items that are not functions, each under its own kind", () => {
+      const src = `
+pub struct Config { pub a: u32 }
+pub union Either { a: u32, b: f32 }
+pub enum Mode { One, Two }
+pub trait Speaks { fn say(&self); }
+pub type Alias = Config;
+pub const LIMIT: u32 = 3;
+pub static NAME: &str = "x";
+pub fn build() -> Config { Config { a: 0 } }
+`;
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      const byName = new Map(out.symbols.map((s) => [s.name, s.kind]));
+      // The kinds this file already gives these shapes: `struct` as C++, C# and
+      // Swift give it, `trait` as Scala and PHP give it.
+      expect(byName.get("Config")).toBe("struct");
+      expect(byName.get("Either")).toBe("struct");
+      expect(byName.get("Mode")).toBe("enum");
+      expect(byName.get("Speaks")).toBe("trait");
+      expect(byName.get("Alias")).toBe("type");
+      expect(byName.get("LIMIT")).toBe("variable");
+      expect(byName.get("NAME")).toBe("variable");
+      // The function was already read; the point is that it still is.
+      expect(byName.get("build")).toBe("function");
+    });
+
+    it("gives a Rust item the line it is declared on", () => {
+      // A symbol whose position is wrong is worse than one that is missing: the
+      // id is built from the line, so two items would collide or a lookup would
+      // send the reader to the wrong place.
+      const src = "\n\npub enum Mode { One }\n";
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      const mode = out.symbols.find((s) => s.name === "Mode");
+      expect(mode?.line).toBe(3);
+      expect(mode?.endLine).toBe(3);
+    });
+
+    it("reads both declarations of one name under opposite cfgs", () => {
+      // The graph has no feature resolution, so both are read — the same rule
+      // the file graph already follows for `mod` under `#[cfg]`. On separate
+      // lines their ids differ, because `makeId` carries the line. Two items of
+      // one name on the *same* line would share an id; that is a property of
+      // `makeId`, not of this extractor, and the pull request says so.
+      const src = `
+#[cfg(unix)] pub struct Sys { pub a: u32 }
+#[cfg(windows)] pub struct Sys { pub b: u32 }
+`;
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      const sys = out.symbols.filter((s) => s.name === "Sys");
+      expect(sys).toHaveLength(2);
+      expect(new Set(sys.map((s) => s.id)).size).toBe(2);
+      expect(sys.map((s) => s.line).sort()).toEqual([2, 3]);
+    });
+
+    it("returns the symbols in declaration order", () => {
+      // A reader is shown a prefix of this list, not all of it: `listSymbols`
+      // cuts at its limit in payload order. Collected in two passes the items
+      // would all sit behind the functions, and on ripgrep's
+      // `crates/core/flags/defs.rs` not one appeared under a limit of 200.
+      const src = `
+pub const FIRST: u32 = 1;
+pub fn second() {}
+pub struct Third;
+pub fn fourth() {}
+pub enum Fifth { A }
+`;
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      expect(out.symbols.map((s) => s.name)).toEqual([
+        "<module>",
+        "FIRST",
+        "second",
+        "Third",
+        "fourth",
+        "Fifth",
+      ]);
+    });
+
+    it("keeps source order for declarations sharing a line, through a limited listing", () => {
+      // Rust puts no weight on line breaks, so several items can share a line.
+      // Ordering those by name would put a later declaration before an earlier
+      // one, and `listSymbols` cuts at its limit in payload order — so at the
+      // boundary the earlier declaration is the one that disappears. The key is
+      // the byte offset, which no two declarations share.
+      const src = "pub const ZULU: u8 = 1; pub struct Alpha; pub const Mike: u8 = 2;\n";
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      expect(out.symbols.map((s) => s.name)).toEqual(["<module>", "ZULU", "Alpha", "Mike"]);
+      expect(out.symbols[0].name).toBe("<module>");
+
+      // And through the reader that does the cutting. A limit of 1 must show
+      // the first declaration of the line, not the alphabetically first.
+      const payload = {
+        file: "crates/x/src/lib.rs",
+        language: "rust",
+        contentHash: "",
+        symbols: out.symbols,
+        outgoingCalls: [],
+      };
+      const release = Object.assign(() => {}, { token: Symbol("reader") });
+      const cache = {
+        acquireReader: () => release,
+        getFilePayload: async () => payload,
+      } as unknown as Parameters<typeof listSymbols>[0];
+
+      return listSymbols(cache, { file: "crates/x/src/lib.rs", limit: 1 }).then((shown) => {
+        expect(shown.map((s) => s.name)).toEqual(["ZULU"]);
+      });
+    });
+
+    it("reads an associated type and const inside an impl, under a bare name", () => {
+      // `safeFindAll` walks the whole tree, so an impl's contents are read.
+      // The name carries no owner, the way a method's name already does not —
+      // two impls of one trait therefore give two symbols of the same name.
+      // Documented rather than changed: qualifying a name is a change to how
+      // every language in this file names a member.
+      const src = `
+pub trait Conv { type Out; }
+pub struct A;
+pub struct B;
+impl Conv for A { type Out = u32; }
+impl Conv for B { type Out = u64; }
+impl A { pub const MAX: u32 = 9; }
+`;
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      const outs = out.symbols.filter((s) => s.name === "Out");
+      expect(outs).toHaveLength(2);
+      expect(outs.every((s) => s.kind === "type")).toBe(true);
+      expect(out.symbols.some((s) => s.name === "MAX" && s.kind === "variable")).toBe(true);
+      // The trait's own declaration is an `associated_type`, not a `type_item`,
+      // so the declaration a reader looks for is the one that is missing.
+      expect(out.symbols.filter((s) => s.name === "Out").every((s) => s.line > 4)).toBe(true);
     });
   });
 
