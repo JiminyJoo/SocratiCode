@@ -78,9 +78,11 @@ their own MCP configuration.
 1. **Install the extension.** Search **SocratiCode** in the Extensions panel
    and install it in the current editor profile from Visual Studio Marketplace
    or Open VSX.
-2. **Activate and verify it.** Reload the editor window, start a new native
-   Agent Chat, and run `MCP: List Servers`. Confirm that `SocratiCode` is
-   listed and running.
+2. **Activate and verify it.** In Microsoft VS Code, reload the window, start a
+   new native Agent Chat, and run `MCP: List Servers`. Confirm that
+   `SocratiCode` is listed and running. In another compatible editor, follow
+   that host's [integration instructions](https://github.com/giancarloerra/socraticode#plugins-and-host-integrations)
+   and verify through its own MCP server list.
 3. **Index the workspace.** Open the SocratiCode sidebar (Activity Bar
    icon) and click *Index this workspace*. A local Ollama setup downloads
    its embedding model on first use if it is not already available; cloud
@@ -104,7 +106,7 @@ A walkthrough is shown on first install; re-open it any time via
   sign in with the account that has access and keep GitHub Copilot Chat current.
   Organization policy can disable agents or restrict model access.
 - Node.js 18.17+ with `npx` on `PATH` (the engine launches via `npx`).
-- Docker Desktop running for the default managed Qdrant and Ollama stack.
+- Docker running for the default managed Qdrant and Ollama stack.
   Docker is optional when Qdrant is external and embeddings use either a
   detected native Ollama instance or a cloud or external provider. Configure
   these modes through `socraticode.env`; see Settings.
@@ -134,8 +136,9 @@ All commands appear under `SocratiCode:` in the Command Palette.
 Microsoft VS Code Stable and Insiders implement the MCP provider API used by
 this extension. Open VSX makes the package available to VS Code-derived
 editors, but package installation alone does not prove that a host implements
-that API. If `MCP: List Servers` does not show SocratiCode, configure it through
-that host's own local stdio MCP settings.
+that API. In Microsoft VS Code, verify registration with `MCP: List Servers`.
+In another editor, use its own MCP server list. If SocratiCode is unavailable,
+configure it through that host's local stdio MCP settings.
 
 The extension registers only with the editor's native MCP host. It does not
 write configuration for Cursor Agent, Cline, Continue, Roo Code, or another
@@ -143,10 +146,11 @@ independent client.
 
 ## Updating
 
-Use the Extensions view or run `Extensions: Check for Extension Updates`, then
-reload the window and start a new native Agent Chat. Verify the final version
-under the installed extension and confirm the server again with
-`MCP: List Servers`.
+In Microsoft VS Code, use the Extensions view or run
+`Extensions: Check for Extension Updates`. In another editor, use that host's
+extension update flow. Reload the window, start a new native agent session, and
+verify both the installed version and SocratiCode server through the host's MCP
+server list. See the [host integration instructions](https://github.com/giancarloerra/socraticode#plugins-and-host-integrations).
 
 ## SocratiCode Cloud (private beta)
 
@@ -178,14 +182,15 @@ project repo:
 
 ## Troubleshooting
 
-- **"Cannot find Docker"**: install Docker Desktop from
-  https://docker.com/products/docker-desktop, or set `socraticode.env`
-  with `QDRANT_MODE=external` plus `QDRANT_URL` to use an existing
-  Qdrant instance.
-- **MCP tools don't appear in the native agent**: reload the window, start a
-  new chat, then run `MCP: List Servers` from the command palette and confirm
-  `SocratiCode` is listed and started. Third-party clients require separate
-  MCP configuration.
+- **"Cannot find Docker"**: install and start
+  [Docker](https://docker.com/products/docker-desktop/). Docker-free operation
+  requires external Qdrant plus either a detected native Ollama instance or a
+  cloud or external embedding provider; configure those modes through
+  `socraticode.env`.
+- **MCP tools don't appear in the native agent**: reload the window and start a
+  new chat. In Microsoft VS Code, run `MCP: List Servers` and confirm that
+  `SocratiCode` is listed and started. In another editor, use its MCP server
+  list or follow the [host integration instructions](https://github.com/giancarloerra/socraticode#plugins-and-host-integrations).
 - **First local index is slow**: a local Ollama setup downloads the embedding
   model if it is not already available. Cloud and external providers do not.
   Subsequent runs are fast.
