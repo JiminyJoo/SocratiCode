@@ -4,6 +4,7 @@
 import { Lang } from "@ast-grep/napi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { ensureDynamicLanguages } from "../../src/services/code-graph.js";
+import { listSymbols } from "../../src/services/graph-impact.js";
 import {
   extractSymbolsAndCalls,
   rawCallsToUnresolvedEdges,
@@ -299,6 +300,37 @@ pub enum Fifth { A }
         "fourth",
         "Fifth",
       ]);
+    });
+
+    it("keeps source order for declarations sharing a line, through a limited listing", () => {
+      // Rust puts no weight on line breaks, so several items can share a line.
+      // Ordering those by name would put a later declaration before an earlier
+      // one, and `listSymbols` cuts at its limit in payload order — so at the
+      // boundary the earlier declaration is the one that disappears. The key is
+      // the byte offset, which no two declarations share.
+      const src = "pub const ZULU: u8 = 1; pub struct Alpha; pub const Mike: u8 = 2;\n";
+      const out = extractSymbolsAndCalls(src, "rust" as unknown as Lang, ".rs", "crates/x/src/lib.rs");
+      expect(out.symbols.map((s) => s.name)).toEqual(["<module>", "ZULU", "Alpha", "Mike"]);
+      expect(out.symbols[0].name).toBe("<module>");
+
+      // And through the reader that does the cutting. A limit of 1 must show
+      // the first declaration of the line, not the alphabetically first.
+      const payload = {
+        file: "crates/x/src/lib.rs",
+        language: "rust",
+        contentHash: "",
+        symbols: out.symbols,
+        outgoingCalls: [],
+      };
+      const release = Object.assign(() => {}, { token: Symbol("reader") });
+      const cache = {
+        acquireReader: () => release,
+        getFilePayload: async () => payload,
+      } as unknown as Parameters<typeof listSymbols>[0];
+
+      return listSymbols(cache, { file: "crates/x/src/lib.rs", limit: 1 }).then((shown) => {
+        expect(shown.map((s) => s.name)).toEqual(["ZULU"]);
+      });
     });
 
     it("reads an associated type and const inside an impl, under a bare name", () => {

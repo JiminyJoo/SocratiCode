@@ -1740,8 +1740,11 @@ function extractFromRust(
   moduleSym: SymbolNode,
 ): ExtractedSymbols {
   const root = parse("rust" as unknown as Lang, source).root();
-  const symbols: SymbolNode[] = [moduleSym];
   const scopes: ScopeFrame[] = [];
+  // Collected with the byte offset each declaration starts at, because that is
+  // the only key that orders two declarations sharing a line. See the sort at
+  // the end of this function.
+  const declared: Array<{ sym: SymbolNode; offset: number }> = [];
 
   for (const fn of safeFindAll(root, "function_item")) {
     const nameNode = safeFind(fn, "identifier");
@@ -1754,7 +1757,7 @@ function extractFromRust(
       id: makeId(file, name, startLine),
       name, qualifiedName: name, kind: "function", file, line: startLine, endLine, language,
     };
-    symbols.push(sym);
+    declared.push({ sym, offset: r.start.index });
     scopes.push({ name, startLine, endLine, symbolId: sym.id });
   }
 
@@ -1816,15 +1819,18 @@ function extractFromRust(
     const name = nameNode.text();
     const r = item.range();
     const startLine = r.start.line + 1;
-    symbols.push({
-      id: makeId(file, name, startLine),
-      name,
-      qualifiedName: name,
-      kind: symbolKind,
-      file,
-      line: startLine,
-      endLine: r.end.line + 1,
-      language,
+    declared.push({
+      sym: {
+        id: makeId(file, name, startLine),
+        name,
+        qualifiedName: name,
+        kind: symbolKind,
+        file,
+        line: startLine,
+        endLine: r.end.line + 1,
+        language,
+      },
+      offset: r.start.index,
     });
   }
 
@@ -1858,13 +1864,19 @@ function extractFromRust(
   // not all of it: `listSymbols` cuts at its limit in payload order. Collected
   // in two passes — functions, then everything else — the items would all sit
   // after the functions, and on ripgrep 14.1.1's `crates/core/flags/defs.rs`
-  // (982 symbols, limit 200) not one of them appeared. Sorting by line
-  // also stops the listing from jumping backwards, which is how it read before.
-  // Name breaks a tie, so two items declared on one line keep a fixed order.
-  // That tie-break can move `<module>` off the head of the list — an item named
-  // `_HIDDEN` on line 1 sorts before it — which is harmless: every consumer
-  // that wants the module symbol looks it up by name, none by position.
-  symbols.sort((a, b) => a.line - b.line || a.name.localeCompare(b.name));
+  // (982 symbols, limit 200) not one of them appeared.
+  //
+  // The key is the byte offset the declaration starts at, not the line and not
+  // the name. Rust puts no weight on line breaks, so `const A: u8 = 1; const
+  // B: u8 = 2;` is two declarations on one line; ordering those by name would
+  // put a later declaration first, and at the limit boundary that is a listing
+  // that drops the earlier one. An offset is unique per declaration, so the
+  // order is total and is the source's own.
+  //
+  // `<module>` is prepended rather than sorted: it is synthetic, it has no
+  // offset of its own, and it belongs at the head.
+  declared.sort((a, b) => a.offset - b.offset);
+  const symbols: SymbolNode[] = [moduleSym, ...declared.map((d) => d.sym)];
 
   return { symbols, rawCalls };
 }
