@@ -2271,7 +2271,27 @@ function extractFromSwift(
   const symbols: SymbolNode[] = [moduleSym];
   const scopes: ScopeFrame[] = [];
 
-  for (const k of ["class_declaration", "struct_declaration", "protocol_declaration", "enum_declaration"]) {
+  // The node kind does not say which form this is. The packaged Swift grammar
+  // files a `class`, a `struct`, an `enum`, an `actor` and an `extension` all
+  // under `class_declaration`, and defines no `struct_declaration` or
+  // `enum_declaration` at all — asking for those threw, `safeFindAll` returned
+  // empty, and the `struct` and `enum` branches below were unreachable, so every
+  // Swift struct and enum was extracted as a `class`.
+  //
+  // What distinguishes them is the declaration keyword, and it is not reliably
+  // the first child: `public struct P` puts a `modifiers` node first, and
+  // `indirect enum E` an `indirect`. So the keyword is searched for among the
+  // direct children rather than read off the head — `children()` does not
+  // descend, so a nested `struct` inside a body cannot be mistaken for it.
+  //
+  // Only `struct` and `enum` are named. `class`, `actor` and `extension` keep
+  // the `class` they already had; naming them is a separate question about what
+  // those forms should be called, not this fix.
+  const SWIFT_FORM_KINDS = new Map<string, SymbolNode["kind"]>([
+    ["struct", "struct"],
+    ["enum", "enum"],
+  ]);
+  for (const k of ["class_declaration", "protocol_declaration"]) {
     for (const cls of safeFindAll(root, k)) {
       const nameNode = safeFind(cls, "type_identifier")
         ?? safeFind(cls, "identifier");
@@ -2280,12 +2300,14 @@ function extractFromSwift(
       const r = cls.range();
       const startLine = r.start.line + 1;
       const endLine = r.end.line + 1;
+      // biome-ignore lint/suspicious/noExplicitAny: ast-grep node type leaks through
+      const keyword = cls.children().find((c: any) => SWIFT_FORM_KINDS.has(c.kind()));
       const sym: SymbolNode = {
         id: makeId(file, name, startLine),
         name, qualifiedName: name,
-        kind: k.includes("struct") ? "struct"
-          : k.includes("protocol") ? "interface"
-          : k.includes("enum") ? "enum" : "class",
+        kind: k === "protocol_declaration"
+          ? "interface"
+          : (keyword && SWIFT_FORM_KINDS.get(keyword.kind())) ?? "class",
         file, line: startLine, endLine, language,
       };
       symbols.push(sym);

@@ -573,6 +573,62 @@ class Foo {
       expect(names).toContain("greet");
       expect(names).toContain("Foo");
       expect(names).toContain("bar");
+      // The fixture above already declared a class and asserted only its name.
+      expect(out.symbols.find((s) => s.name === "Foo")?.kind).toBe("class");
+    });
+
+    it("takes the kind from the declaration keyword, not from the node kind", () => {
+      // The grammar files class, struct, enum, actor and extension all under
+      // `class_declaration`, so the node kind cannot tell them apart.
+      const src = `
+class C { var a: Int = 0 }
+struct S { var a: Int }
+enum E { case one }
+protocol P { func f() }
+actor A { var a: Int = 0 }
+`;
+      const out = extractSymbolsAndCalls(src, "swift" as unknown as Lang, ".swift", "App.swift");
+      const byName = new Map(out.symbols.map((s) => [s.name, s.kind]));
+      expect(byName.get("C")).toBe("class");
+      expect(byName.get("S")).toBe("struct");
+      expect(byName.get("E")).toBe("enum");
+      expect(byName.get("P")).toBe("interface");
+      // An actor keeps the `class` it already had: naming that form is a
+      // separate question from reading the keyword.
+      expect(byName.get("A")).toBe("class");
+    });
+
+    it("finds the keyword when a modifier precedes it", () => {
+      // `public struct P` puts a `modifiers` node first and `indirect enum E`
+      // an `indirect`, so the keyword is not reliably the first child — and
+      // reading the head instead would misfile the commonest declaration in
+      // real Swift.
+      const src = `
+public struct PS { var a: Int }
+final class FC { var a: Int = 0 }
+indirect enum IE { case one(IE) }
+`;
+      const out = extractSymbolsAndCalls(src, "swift" as unknown as Lang, ".swift", "App.swift");
+      const byName = new Map(out.symbols.map((s) => [s.name, s.kind]));
+      expect(byName.get("PS")).toBe("struct");
+      expect(byName.get("FC")).toBe("class");
+      expect(byName.get("IE")).toBe("enum");
+    });
+
+    it("does not take a nested declaration's keyword for the outer one", () => {
+      // The keyword is searched among direct children only, so a `struct`
+      // inside an extension's body cannot rename the extension.
+      const src = `
+extension C {
+    struct Inner { var a: Int }
+    func g() {}
+}
+`;
+      const out = extractSymbolsAndCalls(src, "swift" as unknown as Lang, ".swift", "App.swift");
+      const byName = new Map(out.symbols.map((s) => [s.name, s.kind]));
+      expect(byName.get("C")).toBe("class");
+      expect(byName.get("Inner")).toBe("struct");
+      expect(byName.get("g")).toBe("function");
     });
   });
 
