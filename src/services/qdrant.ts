@@ -121,54 +121,73 @@ export function getClient(): QdrantClient {
   return client;
 }
 
-/** Create a collection if it doesn't exist */
-export async function ensureCollection(name: string): Promise<void> {
+/** In-flight code-collection initialization, keyed by collection name. */
+const collectionEnsureInFlight = new Map<string, Promise<void>>();
+
+/** Create a collection if needed and ensure its required payload indexes. */
+async function ensureCollectionOnce(name: string): Promise<void> {
   const qdrant = getClient();
   const collections = await qdrant.getCollections();
   const exists = collections.collections.some((c) => c.name === name);
 
   if (!exists) {
     const { embeddingDimensions } = getEmbeddingConfig();
-    await qdrant.createCollection(name, {
-      vectors: {
-        dense: {
-          size: embeddingDimensions,
-          distance: "Cosine",
+    try {
+      await qdrant.createCollection(name, {
+        vectors: {
+          dense: {
+            size: embeddingDimensions,
+            distance: "Cosine",
+          },
         },
-      },
-      sparse_vectors: {
-        bm25: {
-          modifier: "idf",
+        sparse_vectors: {
+          bm25: {
+            modifier: "idf",
+          },
         },
-      },
-      optimizers_config: {
-        default_segment_number: 2,
-      },
-      on_disk_payload: true,
-    });
+        optimizers_config: {
+          default_segment_number: 2,
+        },
+        on_disk_payload: true,
+      });
+    } catch (err) {
+      // Another process may create the same collection after our membership
+      // check. That is the desired end state; every other failure must surface.
+      if (!isAlreadyExistsError(err)) throw err;
+    }
+  }
 
-    // Create payload indexes for faster filtering
-    await qdrant.createPayloadIndex(name, {
-      field_name: "filePath",
-      field_schema: "keyword",
-    });
-    await qdrant.createPayloadIndex(name, {
-      field_name: "relativePath",
-      field_schema: "keyword",
-    });
-    await qdrant.createPayloadIndex(name, {
-      field_name: "language",
-      field_schema: "keyword",
-    });
-    await qdrant.createPayloadIndex(name, {
-      field_name: "contentHash",
-      field_schema: "keyword",
-    });
+  // A previous or concurrent attempt may have created the collection without
+  // completing all indexes. Ensure every required index on every initialization.
+  await Promise.all([
+    createPayloadIndexIfMissing(name, "filePath"),
+    createPayloadIndexIfMissing(name, "relativePath"),
+    createPayloadIndexIfMissing(name, "language"),
+    createPayloadIndexIfMissing(name, "contentHash"),
+  ]);
+}
+
+/**
+ * Ensure a code collection is ready, sharing one attempt between concurrent
+ * callers in this process. Failed attempts are removed so a later call retries.
+ */
+export async function ensureCollection(name: string): Promise<void> {
+  const current = collectionEnsureInFlight.get(name);
+  if (current) return current;
+
+  const attempt = ensureCollectionOnce(name);
+  collectionEnsureInFlight.set(name, attempt);
+  try {
+    await attempt;
+  } finally {
+    if (collectionEnsureInFlight.get(name) === attempt) {
+      collectionEnsureInFlight.delete(name);
+    }
   }
 }
 
 /** True when an error means "someone else already created it" — safe to ignore. */
-function isAlreadyExistsError(err: unknown): boolean {
+export function isAlreadyExistsError(err: unknown): boolean {
   const status =
     (err as { status?: number })?.status ?? (err as { statusCode?: number })?.statusCode;
   const message = err instanceof Error ? err.message : String(err);
