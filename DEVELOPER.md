@@ -168,7 +168,7 @@ npm run release:dry
 This will automatically:
 1. Determine the version bump from your commits
 2. Update `CHANGELOG.md` with all `feat:`, `fix:`, etc. entries
-3. Bump the version in `package.json`
+3. Bump the version in `package.json`, plugin manifests, Gemini extension manifest, and VS Code extension package files
 4. Create a git commit and tag (`v1.1.0`)
 5. Push to GitHub and create a GitHub Release
 
@@ -178,7 +178,7 @@ This will automatically:
 
 ```
 src/
-├── index.ts                 # MCP server entry point — registers all 21 tools
+├── index.ts                 # MCP server entry point; registers all SocratiCode tools
 ├── config.ts                # Project ID generation (SHA-256), collection naming, linked projects, branch detection
 ├── constants.ts             # All constants: ports, container names, models, chunk sizes, extensions
 ├── types.ts                 # TypeScript interfaces and types
@@ -1503,13 +1503,14 @@ Edit `DEFAULT_IGNORE_PATTERNS` in `src/services/ignore.ts`.
 
 ## VS Code / Open VSX Extension
 
-The repo also ships a regular VS Code extension that auto-registers the
-SocratiCode MCP server in any MCP-aware host (Copilot agent mode, Cline,
-Continue, Roo Code) and adds native UI: sidebar, status bar, interactive
-graph webview, walkthrough, and palette commands. The same `.vsix` is
-published to both VS Code Marketplace and Open VSX, so it installs in
-Cursor, VSCodium, Gitpod, code-server, Theia, Antigravity, and Particle
-Workbench in addition to stock VS Code.
+The repo also ships a regular VS Code extension that registers the
+SocratiCode MCP server with the editor's native MCP registry through
+`vscode.lm.registerMcpServerDefinitionProvider`. It also adds native UI:
+sidebar, status bar, interactive graph webview, walkthrough, and palette
+commands. The same `.vsix` is published to both VS Code Marketplace and
+Open VSX. A VS Code-derived editor must implement the MCP provider API for
+native MCP registration to work. Independent clients such as Cline,
+Continue, and Roo Code require their own MCP configuration.
 
 Source: [`extension/`](./extension)
 
@@ -1592,12 +1593,11 @@ npm run publish:all
 
 ### Versioning
 
-The extension's version tracks the engine version. The
-`scripts/bump-plugin-versions.mjs` `release-it` hook bumps
-`extension/package.json` along with every plugin manifest, so an engine
-release `vX.Y.Z` automatically bumps the extension to `X.Y.Z`. Patch
-drift is allowed for extension-only hotfixes (e.g. release the engine
-at `1.7.2` but ship the extension at `1.7.3` for a UI bug fix).
+The shipped integrations track the engine version. The
+`scripts/bump-plugin-versions.mjs` `release-it` hook updates every plugin
+manifest, `gemini-extension.json`, `extension/package.json`, and both version
+fields in `extension/package-lock.json`. An engine release `vX.Y.Z` therefore
+publishes matching integration metadata.
 
 ### What the extension does NOT do
 

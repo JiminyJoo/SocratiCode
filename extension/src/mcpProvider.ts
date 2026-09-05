@@ -6,13 +6,13 @@ import { log } from "./output.js";
 import { getSettings } from "./settings.js";
 
 /**
- * Registers the SocratiCode MCP server with VS Code's MCP host (Copilot
- * agent mode, Cline, Continue, Roo Code, ...) via the
+ * Registers the SocratiCode MCP server with VS Code's native MCP host via the
  * `vscode.lm.registerMcpServerDefinitionProvider` API (VS Code 1.99+).
  *
  * This is the single most important thing the extension does. Once this
- * provider is registered, every MCP-aware chat / agent in the editor sees
- * SocratiCode's tools without the user editing any `.vscode/mcp.json`.
+ * provider is registered, VS Code's native agent sees SocratiCode's tools
+ * without the user editing any `.vscode/mcp.json`. Independent clients use
+ * their own MCP configuration.
  *
  * The provider returns a single stdio definition that launches the engine
  * via `npx -y socraticode` (overridable via `socraticode.command` /
